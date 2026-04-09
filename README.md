@@ -1,20 +1,16 @@
 # Stenographer 🤖
 
-> MCP court reporter — queryable conversation index for AI agents
+> MCP court reporter with GraphRAG — queryable conversation index for AI agents
 
-**Version:** 0.1.0-alpha.1
+**Version:** 0.1.0-alpha.2
 
 Stenographer is an MCP server that watches your conversation logs and builds a queryable index. Think of it as a court reporter sitting in the room — it doesn't participate, but it's always listening and ready to answer questions.
 
-## Why
+## What's New in 0.1.0-alpha.2
 
-AI agents need memory at multiple timescales:
-
-- **Right now** — "What are we working on? What did we decide?"
-- **This session** — "Fit everything in the context window"
-- **Across sessions** — "What do we know from all our conversations?"
-
-Stenographer handles **right now** — fast, in-flight queries via MCP.
+- **GraphRAG Search** — Hybrid vector similarity + graph traversal
+- **Local Embeddings** — ONNX-based (all-MiniLM-L6-v2), no API keys
+- **Contextual Ranking** — Merges vector and graph results with weighted scoring
 
 ## The Stack
 
@@ -39,12 +35,6 @@ npm install @stenographer/core
 npx stenographer start ./conversation.jsonl
 ```
 
-Stenographer will:
-1. Tail the JSONL file in real-time
-2. Extract entities, decisions, and corrections
-3. Score message importance
-4. Expose MCP tools for queries
-
 ## MCP Tools
 
 | Tool | Description |
@@ -53,24 +43,33 @@ Stenographer will:
 | `get_entities` | Get all extracted entities |
 | `get_decisions` | Get active decisions |
 | `get_corrections` | Get all corrections/tombstones |
-| `search_conversation` | Semantic search (coming soon) |
+| **`search_conversation`** | **GraphRAG semantic search** |
 | `get_context_frame` | Build token-budgeted context |
 | `get_status` | Get statistics |
 
-## Usage in Code
+## GraphRAG Search
+
+The `search_conversation` tool performs **hybrid retrieval**:
+
+1. **Vector Search** — Semantic similarity on message embeddings
+2. **Entity Extraction** — Find relevant entities from query
+3. **Graph Traversal** — Expand to related entities (configurable depth)
+4. **Merge & Re-rank** — Weighted combination of vector + graph scores
+5. **Context Enrichment** — Add neighboring messages as context
 
 ```typescript
-import { StenographerServer } from '@stenographer/core';
-
-const server = new StenographerServer({
-  logPath: './conversation.jsonl',
-  statePath: './stenographer.db',
-  mode: 'live',
-});
-
-await server.start();
-// MCP server is now running and queryable
+// Example: Semantic search via MCP
+{
+  "name": "search_conversation",
+  "arguments": {
+    "query": "what database did we decide to use",
+    "k": 5,
+    "graph_depth": 2
+  }
+}
 ```
+
+Returns ranked results with scores, types (message/entity/path), and context.
 
 ## Architecture
 
@@ -85,16 +84,27 @@ await server.start();
 │              Watches file, parses messages                  │
 └─────────────────────────┬───────────────────────────────────┘
                           │
-                          ▼
+          ┌───────────────┴───────────────┐
+          ▼                               ▼
+┌─────────────────────┐         ┌─────────────────────────┐
+│ Importance Detector │         │  Local Embedder         │
+│  3-signal scoring   │         │  (all-MiniLM-L6-v2)    │
+└─────────┬───────────┘         └───────────┬─────────────┘
+          │                                 │
+          ▼                                 ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                  Importance Detector                        │
-│        Three-signal scoring (state, reference, trajectory) │
-└─────────────────────────┬───────────────────────────────────┘
-                          │
-                          ▼
-┌─────────────────────────────────────────────────────────────┐
-│                      State Store                            │
-│            SQLite: messages, entities, decisions           │
+│                   GraphRAG Retriever                        │
+│  ┌──────────────┐  ┌─────────────┐  ┌──────────────────┐   │
+│  │Vector Index │  │Entity Index│  │Relation Index    │   │
+│  │(in-memory)  │  │(entities) │  │(graph edges)     │   │
+│  └──────┬───────┘  └─────┬──────┘  └────────┬─────────┘   │
+│         │                │                  │              │
+│         └────────────────┼──────────────────┘              │
+│                          ▼                                 │
+│              ┌────────────────────────┐                     │
+│              │  Hybrid Search Engine │                     │
+│              │  (merge + re-rank)    │                     │
+│              └────────────────────────┘                     │
 └─────────────────────────┬───────────────────────────────────┘
                           │
                           ▼
@@ -102,6 +112,16 @@ await server.start();
 │                     MCP Server                               │
 │              Queryable tools for the LLM                     │
 └─────────────────────────────────────────────────────────────┘
+```
+
+## Neo4j Integration (Coming Soon)
+
+Future versions will support Neo4j for persistent graph storage:
+
+```typescript
+// Cypher queries for Neo4j integration
+const vectorCypher = buildVectorCypher(embedding, 'message_embeddings', 5);
+const graphCypher = buildGraphCypher(['entity1', 'entity2'], 2);
 ```
 
 ## Development
@@ -119,4 +139,6 @@ Built from @johnnyclem's tools:
 - [short-hand](https://github.com/johnnyclem/short-hand) — Context compaction
 - [agentvault](https://github.com/johnnyclem/agentvault) — Wiki + deployment
 
-Inspired by Andrej Karpathy's LLM Wiki pattern.
+Inspired by:
+- [Neo4j GraphRAG Python](https://github.com/neo4j/neo4j-graphrag-python)
+- Andrej Karpathy's LLM Wiki pattern

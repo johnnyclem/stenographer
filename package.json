@@ -1,7 +1,7 @@
 {
   "name": "@stenographer/core",
-  "version": "0.1.0-alpha.1",
-  "description": "MCP court reporter — queryable conversation index for AI agents",
+  "version": "0.1.0-alpha.2",
+  "description": "MCP court reporter — queryable conversation index with GraphRAG",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

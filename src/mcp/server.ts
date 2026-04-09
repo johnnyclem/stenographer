@@ -1,15 +1,16 @@
 /**
  * Stenographer — MCP Server
- * Exposes conversation index as MCP tools
+ * Exposes conversation index as MCP tools with GraphRAG search
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import type { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { Tailer } from './indexer/tailer.js';
-import { StateStore } from './store/index.js';
-import { ImportanceDetector } from './indexer/importance.js';
-import type { StenographerConfig, ConversationMessage } from './types.js';
+import { Tailer } from '../indexer/tailer.js';
+import { StateStore } from '../store/index.js';
+import { ImportanceDetector } from '../indexer/importance.js';
+import { GraphRAGRetriever } from '../indexer/graphrag.js';
+import type { StenographerConfig, ConversationMessage } from '../types.js';
 
 // ─────────────────────────────────────────────────────────────
 // MCP Server Implementation
@@ -20,6 +21,7 @@ export class StenographerServer {
   private tailer: Tailer;
   private store: StateStore;
   private detector: ImportanceDetector;
+  private retriever: GraphRAGRetriever;
   private sessionId: string;
 
   constructor(config: StenographerConfig) {
@@ -27,17 +29,18 @@ export class StenographerServer {
     this.store = new StateStore(config.statePath || './stenographer.db');
     this.tailer = new Tailer(config.logPath, this.sessionId);
     this.detector = new ImportanceDetector();
+    this.retriever = new GraphRAGRetriever();
 
     // Set up message handler
-    this.tailer.on('message', (msg: ConversationMessage) => {
-      this.indexMessage(msg);
+    this.tailer.on('message', async (msg: ConversationMessage) => {
+      await this.indexMessage(msg);
     });
 
     // Create MCP server
     this.server = new Server(
       {
         name: 'stenographer',
-        version: '0.1.0',
+        version: '0.1.0-alpha.2',
       },
       {
         capabilities: {
@@ -58,13 +61,28 @@ export class StenographerServer {
     this.store.close();
   }
 
-  private indexMessage(msg: ConversationMessage): void {
+  private async indexMessage(msg: ConversationMessage): Promise<void> {
     // Score importance
     const history = this.store.getMessagesBySession(this.sessionId);
     const score = this.detector.score(msg, history);
 
     // Extract entities
-    const extracted = this.detector.extractStructure(msg);
+    const extracted = this.detector.extractStructure(msg.content);
+
+    // Index in GraphRAG retriever (for semantic search)
+    await this.retriever.indexMessage(msg);
+
+    // Index entities and relations
+    for (const entity of extracted.entities) {
+      this.retriever.indexEntity({
+        id: entity.name,
+        type: entity.type,
+        value: entity.value,
+        firstSeen: msg.timestamp,
+        lastSeen: msg.timestamp,
+        references: 1,
+      });
+    }
 
     // Store in SQLite
     this.store.addMessage({
@@ -73,7 +91,7 @@ export class StenographerServer {
       role: msg.role,
       content: msg.content,
       timestamp: msg.timestamp,
-      embedding: [], // TODO: add embedding generation
+      embedding: [], // TODO: embed and store
       importanceScore: score,
       entityIds: extracted.entities.map((e) => e.name),
     });
@@ -137,12 +155,13 @@ export class StenographerServer {
         },
         {
           name: 'search_conversation',
-          description: 'Search the conversation for messages similar to a query',
+          description: 'Search the conversation semantically using GraphRAG - hybrid vector + graph search',
           inputSchema: {
             type: 'object',
             properties: {
               query: { type: 'string', description: 'Search query' },
               k: { type: 'number', description: 'Number of results', default: 5 },
+              graph_depth: { type: 'number', description: 'Graph traversal depth', default: 2 },
             },
           },
         },
@@ -223,14 +242,26 @@ export class StenographerServer {
           }
 
           case 'search_conversation': {
-            // TODO: Implement semantic search with embeddings
             const query = (args as any).query || '';
             const k = (args as any).k || 5;
+            const graphDepth = (args as any).graph_depth || 2;
+
+            // Use GraphRAG retriever
+            const results = await this.retriever.search({
+              query,
+              k,
+              graphDepth,
+            });
+
             return {
               content: [
                 {
                   type: 'text',
-                  text: `Semantic search not yet implemented. Query: "${query}"`,
+                  text: JSON.stringify({
+                    query,
+                    results,
+                    stats: this.retriever.getStats(),
+                  }, null, 2),
                 },
               ],
             };
@@ -244,7 +275,7 @@ export class StenographerServer {
 
             // Build context frame within budget
             const frame = this.buildContextFrame(messages, decisions, entities, budget);
-            
+
             return {
               content: [
                 {
@@ -257,14 +288,16 @@ export class StenographerServer {
 
           case 'get_status': {
             const stats = this.store.getStats(this.sessionId);
+            const retrieverStats = this.retriever.getStats();
             return {
               content: [
                 {
                   type: 'text',
                   text: JSON.stringify({
                     ...stats,
+                    retriever: retrieverStats,
                     sessionId: this.sessionId,
-                    version: '0.1.0-alpha.1',
+                    version: '0.1.0-alpha.2',
                   }, null, 2),
                 },
               ],
@@ -313,9 +346,9 @@ export class StenographerServer {
     for (const msg of messages.slice(-10)) {
       const msgText = `\n${msg.role}: ${msg.content.slice(0, 200)}`;
       const msgTokens = this.estimateTokens(msgText);
-      
+
       if (currentTokens + msgTokens > budget) break;
-      
+
       recentMessages.unshift(msgText);
       currentTokens += msgTokens;
     }
@@ -341,9 +374,10 @@ export async function runCLI(args: string[]): Promise<void> {
   const logPath = args[0] || './conversation.jsonl';
   const statePath = args[1] || './stenographer.db';
 
-  console.log(`🤖 Starting Stenographer v0.1.0-alpha.1`);
+  console.log(`🤖 Starting Stenographer v0.1.0-alpha.2`);
   console.log(`📄 Watching: ${logPath}`);
   console.log(`💾 State: ${statePath}`);
+  console.log(`🔍 GraphRAG: Enabled (hybrid vector + graph search)`);
 
   const server = new StenographerServer({
     logPath,
