@@ -1,133 +1,82 @@
 ---
 title: Stenographer
-date: 2026-04-08
-tags: [llm, context, streaming, indexing, observer]
-sources: [Project specification draft]
+date: 2026-06-09
+tags: [llm, context, streaming, indexing, observer, mcp, graphrag]
+sources: [stenographer repo (ground truth), project specification draft (roadmap)]
 ---
 
 # Stenographer
 
 > A streaming companion observer for continuous conversation indexing.
 
-**Version:** 0.1.0-draft
+**Version:** 0.1.0-alpha.2
 **Author:** Johnny Clem
-**Depends on:** `@shorthand/core`
 
-## What It Is
-
-**Stenographer** is a background process that continuously reads conversation output (JSONL log file) and maintains a running semantic index — without participating in the conversation.
+**Stenographer** is a background process that continuously reads conversation output (JSONL log files) and maintains a running semantic index — without participating in the conversation.
 
 Think of a **court stenographer**: they don't argue cases, they don't make decisions. They produce a structured, indexed, queryable record of everything that was said. That's the model.
 
-## Why Not Just Compact After the Fact?
+---
 
-Post-hoc compaction works (that's what [[short-hand]] does), but it's **batch-oriented**. You have to wait for the conversation to end (or a breakpoint) before compaction runs.
+## Current State (ground truth of the repo)
 
-Stenographer operates in **real time** — by the time a compaction pass is needed, Stenographer has already built the entity graph, scored importance, and identified corrections. The compactor can use Stenographer's state as a **warm start** instead of processing from raw messages.
+Everything in this section is implemented and tested in the repository as of 2026-06-09.
 
-## Architecture
-
-```
-┌─────────────────────────────────────┐
-│ HOST PROCESS                        │
-│ User ←→ Host LLM → conversation.jsonl │
-└─────────────────────────────────────┘
-              (file tail)
-┌─────────────────────────────────────┐
-│ STENOGRAPHER PROCESS               │
-│                                    │
-│ JSONL Tailer → Message Parser       │
-│                          ↓        │
-│                 Importance Detector │
-│                          ↓        │
-│                 Entity Graph (State) │
-│                          ↓        │
-│                 SQLite Sidecar      │
-│                          ↓        │
-│                 Query Interface     │
-└─────────────────────────────────────┘
-```
-
-## Five-Stage Pipeline
+### Pipeline
 
 | Stage | What It Does |
 |-------|--------------|
-| 1. Parse & Normalize | JSONL → ConversationMessage |
-| 2. Embed | 384-dim vector (ONNX all-MiniLM-L6-v2) |
-| 3. Score Importance | Three-signal model |
-| 4. Extract Structure | Regex (Tier 0) or Gemma (Tier 1.5) |
-| 5. Persist | SQLite sidecar |
+| 1. Parse & Normalize | Provider adapter → ConversationMessage |
+| 2. Score Importance | Three-signal model (regex Tier 0) |
+| 3. Extract Structure | Regex patterns: entities, decisions, corrections |
+| 4. Embed | 384-dim transformer (all-MiniLM-L6-v2 via @xenova/transformers), offline hashed-lexical fallback |
+| 5. Persist | SQLite (better-sqlite3) + sqlite-vec vector index |
 
-## Importance Scoring (Three-Signal Model)
+### Modes
 
-- **State delta (45%)** — Does message change entity graph?
-- **Reference frequency (25%)** — How often are entities referenced later?
-- **Trajectory discontinuity (30%)** — Does message shift conversation direction?
+- **live** — tail a single JSONL file, serve MCP over stdio
+- **catchup** — index a completed file once (no watcher), then serve
+- **watch** — watch a directory; every `*.jsonl` file becomes its own session
+- **daemon** — live + REST API (default port 8787)
 
-## Query Interface
+### Adapters
 
-```typescript
-interface StenographerAPI {
-  getCompactedState(level: CompactionLevel): Promise<CompactedState>;
-  getImportantMessages(n: number): Promise<ImportanceScore[]>;
-  getEntityGraph(): Promise<{ nodes: EntityNode[]; edges: EntityRelation[] }>;
-  getActiveDecisions(): Promise<Decision[]>;
-  getTombstones(): Promise<Tombstone[]>;
-  searchSimilar(query: string, k: number): Promise<ScoredMessage[]>;
-  buildContextFrame(tokenBudget: number): Promise<ContextFrame>;
-  getStatus(): Promise<StenographerStatus>;
-}
-```
+`jsonl` (native schema), `claude-code` (session logs), `anthropic` (content-block messages), `openai` (chat format incl. tool_calls), `generic` (best-effort field mapping). Auto-detected from file content when not specified.
 
-## Local Model: Gemma 4
+### Importance Scoring (Three-Signal Model)
 
-Only invoked for high-importance messages (~20-30%):
+- **State delta (45%)** — decisions, corrections, tool calls
+- **Reference frequency (25%)** — how often the message's entities were referenced recently
+- **Trajectory discontinuity (30%)** — topic-shift indicators, length deviation
 
-| Model | Size | Speed |
-|-------|------|-------|
-| Gemma 4 E2B | ~1.5 GB | ~50 tok/s |
-| Gemma 4 E4B | ~3 GB | ~30 tok/s |
+### Decisions, Tombstones, Supersession
 
-Why Gemma:
-- Apache 2.0 license (no commercial restrictions)
-- Native JSON output
-- Native function calling
-- 128K context window
+Decisions are **append-only with a supersession chain**. A tombstone does not bind a conclusion forever — it records the *current version* of a fact with its provenance, and currency is inherently overridable:
 
-## Agent Profiles
+- A new decision (or an "actually, …" correction) whose embedding is close enough to an active decision **closes** the old record: `superseded = true`, `superseded_by → successor`. Close means "we have a fresher version", not "this died".
+- The old record is never deleted; it keeps its provenance (`source_message_id`, timestamp).
+- A tombstone row records each supersession event: what was superseded, what it was corrected to, why, and the message that triggered it.
+- The chain is walkable from any link (`get_decision_chain`); the last entry is the current version.
 
-Custom importance weights + extraction per agent type:
+### Query Surface
 
-- **Coding** — architecture, bugs, tests (stateDelta: 50%)
-- **Paralegal** — cases, deadlines (referenceFrequency: 35%)
-- **Image Gen** — styles, corrections (trajectoryDiscontinuity: 50%)
+One engine (`Stenographer` class, implements `StenographerAPI`) exposed two ways:
 
-## Integration Patterns
+**MCP tools (stdio):** `get_recent_messages`, `get_entities`, `get_relations`, `get_decisions`, `get_decision_history`, `get_decision_chain`, `get_corrections`, `search_conversation` (GraphRAG hybrid), `search_similar` (persistent vector index), `get_context_frame`, `get_status`
 
-1. **Middleware** (recommended) — intercepts LLM requests, replaces raw history with context frame
-2. **MCP Tool** — host LLM queries via tool calls
-3. **SDK Wrapper** — transparently manages context
+**REST (daemon mode or `--rest-port`):** `/status`, `/messages`, `/entities`, `/relations`, `/decisions`, `/decisions/history`, `/decisions/:id/chain`, `/tombstones`, `/search`, `/graphrag`, `/context-frame`
 
-## Implementation Phases
+### GraphRAG Search
 
-| Phase | Features |
-|-------|----------|
-| v0.1.0 | Core pipeline, JSONL tailer, embedding, SQLite (2-3 weeks) |
-| v0.2.0 | Query server, context frames (2 weeks) |
-| v0.3.0 | Gemma integration, agent profiles (3 weeks) |
-| v0.4.0 | Daemon mode, cross-session (3 weeks) |
-| v0.5.0 | Resilience, provider portability (2 weeks) |
+`search_conversation` merges vector similarity with entity-graph traversal (co-mention edges, BFS to configurable depth), re-ranks with weighted scores, and enriches results with temporally neighboring messages.
 
-## Performance Targets
+---
 
-| Metric | Target |
-|--------|--------|
-| Message latency (no model) | < 10ms |
-| Message latency (with model) | < 500ms |
-| Memory (no model) | < 100 MB |
-| Memory (E2B) | < 1.7 GB |
+## Roadmap (aspirational — not yet built)
 
-## The Full Stack
+Everything below is design intent carried forward from the original specification. None of it exists in the repo today.
+
+### The Stack
 
 ```
 Stenographer (real-time index)
@@ -139,8 +88,39 @@ Smallchat (tool dispatch)
 AgentVault (deployment)
 ```
 
+The `@shorthand/core` dependency and warm-start handoff to the compactor are unimplemented. See [[short-hand]], [[smallchat]], [[agentvault]].
+
+### Tier 1.5 Extraction: Local Model (Gemma)
+
+Model-based structured extraction for high-importance messages (~20-30%), replacing/augmenting the regex Tier 0:
+
+| Model | Size | Speed |
+|-------|------|-------|
+| Gemma E2B | ~1.5 GB | ~50 tok/s |
+| Gemma E4B | ~3 GB | ~30 tok/s |
+
+The `extractionThreshold` config key is reserved for gating this.
+
+### Agent Profiles
+
+Custom importance weights + extraction per agent type (coding, paralegal, image-gen).
+
+### Integration Patterns
+
+1. **Middleware** — intercept LLM requests, replace raw history with context frame
+2. **SDK Wrapper** — transparently manage context
+   (MCP tool integration is the one pattern that exists today.)
+
+### Other roadmap items
+
+- GraphQL query surface (REST + MCP exist today)
+- Neo4j persistent graph backend (Cypher builders exist; no driver/connection)
+- `getCompactedState(level)` compaction-level API from the original spec
+- Cross-session entity resolution and tombstone truth-base semantics shared with [[short-hand]]
+- Performance targets (sub-10ms message latency without model; memory budgets)
+
 ## Related
 
-- [[short-hand]] — Post-hoc compaction
-- [[smallchat]] — Tool dispatch
-- [[agentvault]] — Deployment
+- [[short-hand]] — Post-hoc compaction (roadmap integration)
+- [[smallchat]] — Tool dispatch (roadmap integration)
+- [[agentvault]] — Deployment (roadmap integration)

@@ -1,15 +1,22 @@
 /**
  * Stenographer — Embeddings
- * Deterministic local embeddings via hashed lexical features
- * (word + character n-grams). No network, no API keys, no model download.
  *
- * Note: these are lexical embeddings, not transformer embeddings — similar
- * wording scores high, paraphrases score lower. Good enough for Tier 0
- * conversation recall; a transformer backend can be swapped in behind the
- * same LocalEmbedder interface later.
+ * Two interchangeable embedders behind one interface:
+ * - TransformerEmbedder (default): real semantic embeddings via
+ *   @xenova/transformers (all-MiniLM-L6-v2, 384-dim). Downloads the model
+ *   (~25MB quantized) on first use, then runs fully locally. No API keys.
+ * - HashedEmbedder: deterministic hashed lexical features (word + char
+ *   n-grams). Zero downloads, fully offline; weaker on paraphrase. Used as
+ *   the automatic fallback when the model can't be loaded.
  */
 
 export const EMBEDDING_DIMENSIONS = 384;
+
+export interface Embedder {
+  embed(text: string): Promise<number[]>;
+  embedBatch(texts: string[]): Promise<number[][]>;
+  readonly dimensions: number;
+}
 
 // FNV-1a 32-bit hash — stable across runs and platforms
 function fnv1a(str: string): number {
@@ -30,10 +37,63 @@ function tokenize(text: string): string[] {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Embedder (local, deterministic, no API keys)
+// Transformer Embedder (default — real semantic embeddings)
 // ─────────────────────────────────────────────────────────────
 
-export class LocalEmbedder {
+export class TransformerEmbedder implements Embedder {
+  private cache: EmbeddingCache;
+  private model: string;
+  private pipe: ((text: string, opts: object) => Promise<{ data: Float32Array }>) | null = null;
+  private loading: Promise<void> | null = null;
+
+  constructor(model: string = 'Xenova/all-MiniLM-L6-v2', cacheSize: number = 10000) {
+    this.model = model;
+    this.cache = new EmbeddingCache(cacheSize);
+  }
+
+  /** Loads the model (downloads on first ever use). Throws if unavailable. */
+  async load(): Promise<void> {
+    if (this.pipe) return;
+    if (!this.loading) {
+      this.loading = (async () => {
+        const { pipeline } = await import('@xenova/transformers');
+        this.pipe = (await pipeline('feature-extraction', this.model, {
+          quantized: true,
+        })) as unknown as typeof this.pipe;
+      })();
+    }
+    await this.loading;
+  }
+
+  async embed(text: string): Promise<number[]> {
+    const cached = this.cache.get(text);
+    if (cached) return cached;
+
+    await this.load();
+    const out = await this.pipe!(text, { pooling: 'mean', normalize: true });
+    const vec = Array.from(out.data);
+    this.cache.set(text, vec);
+    return vec;
+  }
+
+  async embedBatch(texts: string[]): Promise<number[][]> {
+    const results: number[][] = [];
+    for (const t of texts) {
+      results.push(await this.embed(t));
+    }
+    return results;
+  }
+
+  get dimensions(): number {
+    return EMBEDDING_DIMENSIONS;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Hashed Embedder (offline fallback, deterministic)
+// ─────────────────────────────────────────────────────────────
+
+export class HashedEmbedder implements Embedder {
   private cache: EmbeddingCache;
 
   constructor(cacheSize: number = 10000) {
@@ -79,6 +139,38 @@ export class LocalEmbedder {
 
   get dimensions(): number {
     return EMBEDDING_DIMENSIONS;
+  }
+}
+
+// Back-compat alias: LocalEmbedder was the original exported name
+export { HashedEmbedder as LocalEmbedder };
+
+// ─────────────────────────────────────────────────────────────
+// Factory — transformer by default, graceful offline fallback
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Creates the configured embedder.
+ * - 'hashed': offline lexical embedder
+ * - any other value (or undefined): transformer model name, defaulting to
+ *   Xenova/all-MiniLM-L6-v2. If the model can't be loaded (offline, missing
+ *   optional dep), falls back to the hashed embedder with a warning.
+ */
+export async function createEmbedder(embeddingModel?: string): Promise<Embedder> {
+  if (embeddingModel === 'hashed') {
+    return new HashedEmbedder();
+  }
+
+  const transformer = new TransformerEmbedder(embeddingModel || 'Xenova/all-MiniLM-L6-v2');
+  try {
+    await transformer.load();
+    return transformer;
+  } catch (err) {
+    console.error(
+      `⚠️  Could not load transformer embeddings (${err instanceof Error ? err.message : err}); ` +
+        'falling back to offline hashed embeddings'
+    );
+    return new HashedEmbedder();
   }
 }
 

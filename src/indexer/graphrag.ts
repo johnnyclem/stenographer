@@ -4,7 +4,7 @@
  * Inspired by neo4j-graphrag-python patterns
  */
 
-import { LocalEmbedder, VectorIndex } from './embeddings.js';
+import { HashedEmbedder, VectorIndex, type Embedder } from './embeddings.js';
 import type { ConversationMessage, EntityNode, EntityRelation } from '../types.js';
 
 // ─────────────────────────────────────────────────────────────
@@ -31,27 +31,31 @@ export interface RetrievedChunk {
 // ─────────────────────────────────────────────────────────────
 
 export class GraphRAGRetriever {
-  private embedder: LocalEmbedder;
+  private embedder: Embedder;
   private vectorIndex: VectorIndex;
   private entityIndex: Map<string, EntityNode>;
   private relationIndex: Map<string, EntityRelation[]>;
   private messages: Map<string, ConversationMessage>;
 
-  constructor() {
-    this.embedder = new LocalEmbedder();
+  constructor(embedder?: Embedder) {
+    this.embedder = embedder ?? new HashedEmbedder();
     this.vectorIndex = new VectorIndex();
     this.entityIndex = new Map();
     this.relationIndex = new Map();
     this.messages = new Map();
   }
 
+  /** Swap the embedder (e.g. once the transformer model has loaded). */
+  setEmbedder(embedder: Embedder): void {
+    this.embedder = embedder;
+  }
+
   // ─────────────────────────────────────────────────────────
   // Indexing Phase
   // ─────────────────────────────────────────────────────────
 
-  async indexMessage(msg: ConversationMessage): Promise<void> {
-    // Generate embedding
-    const embedding = await this.embedder.embed(msg.content);
+  async indexMessage(msg: ConversationMessage, precomputedEmbedding?: number[]): Promise<void> {
+    const embedding = precomputedEmbedding ?? (await this.embedder.embed(msg.content));
 
     // Add to vector index
     this.vectorIndex.add(msg.id, embedding, msg.content, {

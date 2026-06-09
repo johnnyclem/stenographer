@@ -5,8 +5,6 @@
  * MCP court reporter for AI agent conversations
  */
 
-import { parseArgs } from 'node:util';
-
 const commands: Record<string, (args: string[]) => Promise<void>> = {
   start: async (args) => {
     const { runCLI } = await import('../dist/index.js');
@@ -20,30 +18,41 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
 };
 
 async function main() {
-  const { positionals, values } = parseArgs({
-    options: {
-      help: { type: 'boolean', short: 'h' },
-    },
-    allowPositionals: true,
-  });
+  // Don't parseArgs here — subcommand flags (e.g. --mode daemon) must reach
+  // the command untouched
+  const argv = process.argv.slice(2);
+  const wantsHelp = argv.includes('-h') || argv.includes('--help');
 
-  if (values.help || positionals.length === 0) {
+  if (wantsHelp || argv.length === 0) {
     console.log(`
 Stenographer 🤖 MCP court reporter
 
 Usage:
-  stenographer start <log-path> [state-path]  Start the MCP server
-  stenographer init [name]                     Initialize a new project
-  stenographer -h, --help                      Show help
+  stenographer start <log-path> [state-path] [options]  Start the MCP server
+  stenographer init [name]                              Initialize a new project
+  stenographer -h, --help                               Show help
+
+Options (start):
+  -m, --mode <mode>        live | catchup | watch | daemon  (default: live)
+                           live:    tail a file and serve MCP
+                           catchup: index a completed file, then serve
+                           watch:   watch a directory for *.jsonl session logs
+                           daemon:  live + REST API (default port 8787)
+  -a, --adapter <name>     jsonl | anthropic | openai | claude-code | generic
+                           (default: auto-detect from file content)
+  -e, --embeddings <name>  Transformer model name, or 'hashed' for the
+                           offline lexical embedder
+      --rest-port <port>   Serve the REST API on this port
 
 Examples:
   stenographer start ./conversation.jsonl
-  stenographer start ./logs/chat.jsonl ./state.db
+  stenographer start ./logs/chat.jsonl ./state.db --mode daemon
+  stenographer start ~/.claude/projects/myproj --mode watch --adapter claude-code
 `);
     process.exit(0);
   }
 
-  const [command, ...args] = positionals;
+  const [command, ...args] = argv;
   const fn = commands[command as keyof typeof commands];
 
   if (!fn) {

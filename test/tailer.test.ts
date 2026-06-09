@@ -2,7 +2,8 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, appendFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Tailer, JsonlAdapter, detectAdapter } from '../src/indexer/tailer.js';
+import { Tailer, JsonlAdapter } from '../src/indexer/tailer.js';
+import { detectAdapter } from '../src/indexer/adapters.js';
 import type { ConversationMessage } from '../src/types.js';
 
 const line = (id: string, content: string) =>

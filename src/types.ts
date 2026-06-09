@@ -79,6 +79,8 @@ export interface Decision {
   firstSeen: string;
   superseded: boolean;
   supersededBy: string | null;
+  /** Provenance: the message that asserted this decision. */
+  sourceMessageId?: string | null;
 }
 
 export interface Tombstone {
@@ -87,6 +89,10 @@ export interface Tombstone {
   correctedTo: string;
   reason: string;
   createdAt: string;
+  /** Provenance: the message that triggered the supersession. */
+  sourceMessageId?: string | null;
+  /** The decision record this tombstone closed, if any. */
+  supersededDecisionId?: string | null;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -110,6 +116,8 @@ export interface IndexedDecision {
   description: string;
   timestamp: string;
   superseded: boolean;
+  supersededBy: string | null;
+  sourceMessageId: string | null;
 }
 
 export interface IndexedTombstone {
@@ -119,6 +127,8 @@ export interface IndexedTombstone {
   correctedTo: string;
   reason: string;
   timestamp: string;
+  sourceMessageId: string | null;
+  supersededDecisionId: string | null;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -163,11 +173,22 @@ export type StenographerMode =
 // ─────────────────────────────────────────────────────────────
 
 export interface StenographerConfig {
+  /** File to tail ('live'/'catchup'/'daemon') or directory to watch ('watch'). */
   logPath: string;
   mode: StenographerMode;
+  /** Log format adapter; omit to auto-detect from file content. */
   adapter?: 'jsonl' | 'anthropic' | 'openai' | 'claude-code' | 'generic';
   statePath?: string;
-  extractionThreshold?: number;
-  memtableSize?: number;
+  /** 'hashed' for the offline lexical embedder, or a transformer model name
+   *  (default: Xenova/all-MiniLM-L6-v2; falls back to hashed if unavailable). */
   embeddingModel?: string;
+  /** Cosine-similarity threshold above which a new decision/correction
+   *  supersedes an existing active decision. Default 0.6. */
+  supersedeThreshold?: number;
+  /** Port for the REST API. Defaults to 8787 in daemon mode, off otherwise. */
+  restPort?: number;
+  /** Reserved for Tier-1 model-based extraction (roadmap). */
+  extractionThreshold?: number;
+  /** Reserved (roadmap). */
+  memtableSize?: number;
 }

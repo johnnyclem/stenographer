@@ -43,6 +43,13 @@ export class JsonlAdapter implements LogAdapter {
 // File Tailer
 // ─────────────────────────────────────────────────────────────
 
+export interface TailerOptions {
+  sessionId?: string;
+  adapter?: LogAdapter;
+  /** When false, process the file once and don't watch for changes (catchup mode). Default true. */
+  follow?: boolean;
+}
+
 export class Tailer extends EventEmitter {
   private adapter: LogAdapter;
   private filePath: string;
@@ -50,13 +57,20 @@ export class Tailer extends EventEmitter {
   private watcher: FSWatcher | null = null;
   private sessionId: string;
   private isRunning: boolean = false;
+  private follow: boolean;
   private processing: Promise<void> = Promise.resolve();
 
-  constructor(filePath: string, sessionId?: string, adapter?: LogAdapter) {
+  constructor(filePath: string, sessionIdOrOptions?: string | TailerOptions, adapter?: LogAdapter) {
     super();
+    const options: TailerOptions =
+      typeof sessionIdOrOptions === 'string' || sessionIdOrOptions === undefined
+        ? { sessionId: sessionIdOrOptions, adapter }
+        : sessionIdOrOptions;
+
     this.filePath = filePath;
-    this.sessionId = sessionId || `session_${Date.now()}`;
-    this.adapter = adapter ?? new JsonlAdapter();
+    this.sessionId = options.sessionId || `session_${Date.now()}`;
+    this.adapter = options.adapter ?? new JsonlAdapter();
+    this.follow = options.follow ?? true;
   }
 
   async start(): Promise<void> {
@@ -65,6 +79,11 @@ export class Tailer extends EventEmitter {
 
     // Initial catchup — process the file from the beginning
     await this.readFrom(0);
+
+    if (!this.follow) {
+      this.isRunning = false;
+      return;
+    }
 
     // Watch for new lines; serialize reads so overlapping change events
     // can't process the same byte range twice
@@ -111,37 +130,4 @@ export class Tailer extends EventEmitter {
   }
 }
 
-// ─────────────────────────────────────────────────────────────
-// Adapter Registry
-// ─────────────────────────────────────────────────────────────
-
-export const adapters: Map<string, LogAdapter> = new Map([
-  ['jsonl', new JsonlAdapter()],
-]);
-
-export function detectAdapter(filePath: string): Promise<LogAdapter> {
-  return new Promise((resolve) => {
-    const stream = createReadStream(filePath, { end: 1024 * 10 });
-    const rl = createInterface({ input: stream });
-    const lines: string[] = [];
-
-    rl.on('line', (line) => {
-      if (line.trim()) {
-        lines.push(line);
-        if (lines.length >= 5) rl.close();
-      }
-    });
-
-    rl.on('close', () => {
-      for (const adapter of adapters.values()) {
-        if (adapter.detect(lines)) {
-          resolve(adapter);
-          return;
-        }
-      }
-      resolve(new JsonlAdapter());
-    });
-
-    stream.on('error', () => resolve(new JsonlAdapter()));
-  });
-}
+// Adapter registry and format detection live in ./adapters.ts
