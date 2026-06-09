@@ -4,12 +4,13 @@
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import type { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { Tailer } from '../indexer/tailer.js';
 import { StateStore } from '../store/index.js';
-import { ImportanceDetector } from '../indexer/importance.js';
+import { ImportanceDetector, extractStructure } from '../indexer/importance.js';
 import { GraphRAGRetriever } from '../indexer/graphrag.js';
+import { LocalEmbedder } from '../indexer/embeddings.js';
 import type { StenographerConfig, ConversationMessage } from '../types.js';
 
 // ─────────────────────────────────────────────────────────────
@@ -22,7 +23,9 @@ export class StenographerServer {
   private store: StateStore;
   private detector: ImportanceDetector;
   private retriever: GraphRAGRetriever;
+  private embedder: LocalEmbedder;
   private sessionId: string;
+  private indexing: Promise<void> = Promise.resolve();
 
   constructor(config: StenographerConfig) {
     this.sessionId = `session_${Date.now()}`;
@@ -30,10 +33,13 @@ export class StenographerServer {
     this.tailer = new Tailer(config.logPath, this.sessionId);
     this.detector = new ImportanceDetector();
     this.retriever = new GraphRAGRetriever();
+    this.embedder = new LocalEmbedder();
 
-    // Set up message handler
-    this.tailer.on('message', async (msg: ConversationMessage) => {
-      await this.indexMessage(msg);
+    // Serialize indexing so messages are processed in arrival order
+    this.tailer.on('message', (msg: ConversationMessage) => {
+      this.indexing = this.indexing.then(() => this.indexMessage(msg)).catch((err) => {
+        console.error(`Failed to index message ${msg.id}:`, err);
+      });
     });
 
     // Create MCP server
@@ -54,6 +60,11 @@ export class StenographerServer {
 
   async start(): Promise<void> {
     await this.tailer.start();
+
+    // Serve MCP over stdio (stdout is the protocol channel — all logging
+    // in this process must go to stderr)
+    const transport = new StdioServerTransport();
+    await this.server.connect(transport);
   }
 
   stop(): void {
@@ -62,36 +73,67 @@ export class StenographerServer {
   }
 
   private async indexMessage(msg: ConversationMessage): Promise<void> {
-    // Score importance
-    const history = this.store.getMessagesBySession(this.sessionId);
+    // Score importance against recent history (detector only looks at the
+    // last 20 messages, so don't load the whole session)
+    const history: ConversationMessage[] = this.store
+      .getRecentMessages(this.sessionId, 20)
+      .reverse()
+      .map((m) => ({
+        id: m.id,
+        role: m.role as ConversationMessage['role'],
+        content: m.content,
+        timestamp: m.timestamp,
+        sessionId: m.sessionId,
+      }));
     const score = this.detector.score(msg, history);
 
-    // Extract entities
-    const extracted = this.detector.extractStructure(msg.content);
+    // Extract entities, decisions, corrections
+    const extracted = extractStructure(msg);
 
     // Index in GraphRAG retriever (for semantic search)
     await this.retriever.indexMessage(msg);
 
-    // Index entities and relations
+    // Index entities (in-memory graph + durable store)
     for (const entity of extracted.entities) {
-      this.retriever.indexEntity({
+      const node = {
         id: entity.name,
         type: entity.type,
         value: entity.value,
         firstSeen: msg.timestamp,
         lastSeen: msg.timestamp,
         references: 1,
-      });
+      };
+      this.retriever.indexEntity(node);
+      this.store.upsertEntity(node);
+    }
+
+    // Entities mentioned in the same message are related — record
+    // co-mention edges for graph traversal
+    for (let i = 0; i < extracted.entities.length; i++) {
+      for (let j = i + 1; j < extracted.entities.length; j++) {
+        const from = extracted.entities[i].name;
+        const to = extracted.entities[j].name;
+        this.retriever.indexRelation(from, to, 'co_mentioned');
+        this.retriever.indexRelation(to, from, 'co_mentioned');
+        this.store.upsertRelation({
+          from,
+          to,
+          relation: 'co_mentioned',
+          firstSeen: msg.timestamp,
+          lastSeen: msg.timestamp,
+        });
+      }
     }
 
     // Store in SQLite
+    const embedding = await this.embedder.embed(msg.content);
     this.store.addMessage({
       id: msg.id,
       sessionId: this.sessionId,
       role: msg.role,
       content: msg.content,
       timestamp: msg.timestamp,
-      embedding: [], // TODO: embed and store
+      embedding,
       importanceScore: score,
       entityIds: extracted.entities.map((e) => e.name),
     });
@@ -188,7 +230,7 @@ export class StenographerServer {
 
     // Handle tool calls
     this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
-      const { name, arguments: args } = request;
+      const { name, arguments: args } = request.params;
 
       try {
         switch (name) {
@@ -374,10 +416,11 @@ export async function runCLI(args: string[]): Promise<void> {
   const logPath = args[0] || './conversation.jsonl';
   const statePath = args[1] || './stenographer.db';
 
-  console.log(`🤖 Starting Stenographer v0.1.0-alpha.2`);
-  console.log(`📄 Watching: ${logPath}`);
-  console.log(`💾 State: ${statePath}`);
-  console.log(`🔍 GraphRAG: Enabled (hybrid vector + graph search)`);
+  // Log to stderr — stdout carries the MCP stdio protocol
+  console.error(`🤖 Starting Stenographer v0.1.0-alpha.2`);
+  console.error(`📄 Watching: ${logPath}`);
+  console.error(`💾 State: ${statePath}`);
+  console.error(`🔍 GraphRAG: Enabled (hybrid vector + graph search)`);
 
   const server = new StenographerServer({
     logPath,
@@ -387,11 +430,10 @@ export async function runCLI(args: string[]): Promise<void> {
 
   await server.start();
 
-  console.log('✅ Stenographer is running. Press Ctrl+C to stop.');
+  console.error('✅ Stenographer is running. Press Ctrl+C to stop.');
 
-  // Keep process alive
   process.on('SIGINT', () => {
-    console.log('\n👋 Shutting down...');
+    console.error('\n👋 Shutting down...');
     server.stop();
     process.exit(0);
   });

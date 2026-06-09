@@ -10,7 +10,7 @@ import type {
   IndexedTombstone,
   EntityNode,
   EntityRelation,
-} from './types.js';
+} from '../types.js';
 
 export class StateStore {
   private db: Database.Database;
@@ -69,7 +69,7 @@ export class StateStore {
         value TEXT NOT NULL,
         first_seen TEXT NOT NULL,
         last_seen TEXT NOT NULL,
-        references INTEGER DEFAULT 1
+        ref_count INTEGER DEFAULT 1
       )
     `);
 
@@ -110,9 +110,11 @@ export class StateStore {
   // ─────────────────────────────────────────────────────────
 
   addMessage(msg: IndexedMessage): void {
+    // OR REPLACE: the tailer may re-deliver lines (e.g. on restart or
+    // partial-write re-reads), so inserts must be idempotent by id.
     const stmt = this.db.prepare(`
-      INSERT INTO messages (id, session_id, role, content, timestamp, 
-        embedding, importance_state_delta, importance_reference_freq, 
+      INSERT OR REPLACE INTO messages (id, session_id, role, content, timestamp,
+        embedding, importance_state_delta, importance_reference_freq,
         importance_trajectory_disc, entity_ids)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
@@ -123,7 +125,9 @@ export class StateStore {
       msg.role,
       msg.content,
       msg.timestamp,
-      Buffer.from(new Float32Array(msg.embedding)),
+      // Serialize the underlying bytes — Buffer.from(typedArray) without
+      // .buffer would truncate each float to a single byte
+      Buffer.from(new Float32Array(msg.embedding).buffer),
       msg.importanceScore.stateDelta,
       msg.importanceScore.referenceFrequency,
       msg.importanceScore.trajectoryDiscontinuity,
@@ -153,8 +157,8 @@ export class StateStore {
   }
 
   private rowToMessage(row: any): IndexedMessage {
-    const embedding = row.embedding 
-      ? Array.from(new Float32Array(row.embedding)) 
+    const embedding = row.embedding
+      ? Array.from(new Float32Array(row.embedding.buffer, row.embedding.byteOffset, row.embedding.byteLength / 4))
       : [];
     
     return {
@@ -251,14 +255,39 @@ export class StateStore {
 
   upsertEntity(entity: EntityNode): void {
     const stmt = this.db.prepare(`
-      INSERT INTO entities (id, type, value, first_seen, last_seen, references)
+      INSERT INTO entities (id, type, value, first_seen, last_seen, ref_count)
       VALUES (?, ?, ?, ?, ?, 1)
       ON CONFLICT(id) DO UPDATE SET
         last_seen = excluded.last_seen,
-        references = references + 1
+        ref_count = ref_count + 1
     `);
-    
+
     stmt.run(entity.id, entity.type, entity.value, entity.firstSeen, entity.lastSeen);
+  }
+
+  upsertRelation(relation: EntityRelation): void {
+    const stmt = this.db.prepare(`
+      INSERT INTO entity_relations (entity_from, entity_to, relation, first_seen, last_seen)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(entity_from, entity_to, relation) DO UPDATE SET
+        last_seen = excluded.last_seen
+    `);
+
+    stmt.run(relation.from, relation.to, relation.relation, relation.firstSeen, relation.lastSeen);
+  }
+
+  getRelations(): EntityRelation[] {
+    const stmt = this.db.prepare(`
+      SELECT * FROM entity_relations ORDER BY first_seen ASC
+    `);
+
+    return stmt.all().map((row: any) => ({
+      from: row.entity_from,
+      to: row.entity_to,
+      relation: row.relation,
+      firstSeen: row.first_seen,
+      lastSeen: row.last_seen,
+    }));
   }
 
   getEntities(sessionId: string): EntityNode[] {
@@ -275,7 +304,7 @@ export class StateStore {
       value: row.value,
       firstSeen: row.first_seen,
       lastSeen: row.last_seen,
-      references: row.references,
+      references: row.ref_count,
     }));
   }
 

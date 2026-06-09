@@ -1,23 +1,76 @@
 /**
  * Stenographer — Embeddings
- * ONNX-based local embeddings (all-MiniLM-L6-v2)
- * No API keys required
+ * Deterministic local embeddings via hashed lexical features
+ * (word + character n-grams). No network, no API keys, no model download.
+ *
+ * Note: these are lexical embeddings, not transformer embeddings — similar
+ * wording scores high, paraphrases score lower. Good enough for Tier 0
+ * conversation recall; a transformer backend can be swapped in behind the
+ * same LocalEmbedder interface later.
  */
 
-import { getEmbedding } from 'onigasm';
-import type { ConversationMessage } from '../types.js';
+export const EMBEDDING_DIMENSIONS = 384;
+
+// FNV-1a 32-bit hash — stable across runs and platforms
+function fnv1a(str: string): number {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) {
+    hash ^= str.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return hash >>> 0;
+}
+
+function tokenize(text: string): string[] {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter((t) => t.length > 0);
+}
 
 // ─────────────────────────────────────────────────────────────
-// Embedder (ONNX-based, local, no API keys)
+// Embedder (local, deterministic, no API keys)
 // ─────────────────────────────────────────────────────────────
 
 export class LocalEmbedder {
-  private model = 'all-MiniLM-L6-v2'; // 384-dim, ~90MB
+  private cache: EmbeddingCache;
+
+  constructor(cacheSize: number = 10000) {
+    this.cache = new EmbeddingCache(cacheSize);
+  }
 
   async embed(text: string): Promise<number[]> {
-    // onigasm loads the WASM model automatically
-    const result = await getEmbedding(text);
-    return Array.from(result);
+    const cached = this.cache.get(text);
+    if (cached) return cached;
+
+    const vec = new Array<number>(EMBEDDING_DIMENSIONS).fill(0);
+    const tokens = tokenize(text);
+
+    for (const token of tokens) {
+      // Word-level feature (signed hashing keeps the expected dot product
+      // of unrelated texts near zero)
+      const h = fnv1a(token);
+      vec[h % EMBEDDING_DIMENSIONS] += h & 1 ? 1 : -1;
+
+      // Character trigram features capture morphology / partial matches
+      const padded = `_${token}_`;
+      for (let i = 0; i + 3 <= padded.length; i++) {
+        const g = fnv1a(padded.slice(i, i + 3));
+        vec[g % EMBEDDING_DIMENSIONS] += (g & 1 ? 1 : -1) * 0.5;
+      }
+    }
+
+    // L2 normalize so cosine similarity reduces to a dot product
+    let norm = 0;
+    for (const v of vec) norm += v * v;
+    norm = Math.sqrt(norm);
+    if (norm > 0) {
+      for (let i = 0; i < vec.length; i++) vec[i] /= norm;
+    }
+
+    this.cache.set(text, vec);
+    return vec;
   }
 
   async embedBatch(texts: string[]): Promise<number[][]> {
@@ -25,7 +78,7 @@ export class LocalEmbedder {
   }
 
   get dimensions(): number {
-    return 384; // all-MiniLM-L6-v2 output dim
+    return EMBEDDING_DIMENSIONS;
   }
 }
 
@@ -122,9 +175,9 @@ export class EmbeddingCache {
 
   set(key: string, embedding: number[]): void {
     if (this.cache.size >= this.maxSize) {
-      // Simple eviction: clear half when full
+      // Simple eviction: drop the oldest half when full
       const entries = Array.from(this.cache.entries());
-      this.cache = new Map(entries.slice(0, this.maxSize / 2));
+      this.cache = new Map(entries.slice(Math.floor(this.maxSize / 2)));
     }
     this.cache.set(key, embedding);
   }

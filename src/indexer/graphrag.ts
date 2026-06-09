@@ -4,7 +4,7 @@
  * Inspired by neo4j-graphrag-python patterns
  */
 
-import { LocalEmbedder, VectorIndex, cosineSimilarity } from './embeddings.js';
+import { LocalEmbedder, VectorIndex } from './embeddings.js';
 import type { ConversationMessage, EntityNode, EntityRelation } from '../types.js';
 
 // ─────────────────────────────────────────────────────────────
@@ -69,10 +69,16 @@ export class GraphRAGRetriever {
   }
 
   indexRelation(from: string, to: string, relation: string): void {
-    const key = `${from}->${to}`;
-    const existing = this.relationIndex.get(key) || [];
-    existing.push({ from, to, relation, firstSeen: new Date().toISOString(), lastSeen: new Date().toISOString() });
-    this.relationIndex.set(key, existing);
+    // Keyed by source entity so graphTraversal can look up outgoing edges
+    const existing = this.relationIndex.get(from) || [];
+    const now = new Date().toISOString();
+    const duplicate = existing.find((r) => r.to === to && r.relation === relation);
+    if (duplicate) {
+      duplicate.lastSeen = now;
+      return;
+    }
+    existing.push({ from, to, relation, firstSeen: now, lastSeen: now });
+    this.relationIndex.set(from, existing);
   }
 
   // ─────────────────────────────────────────────────────────
@@ -96,7 +102,7 @@ export class GraphRAGRetriever {
     const merged = this.mergeResults(vectorResults, graphChunks, k);
 
     // Step 5: Add context (neighbors, paths)
-    return this.enrichWithContext(merged, query);
+    return this.enrichWithContext(merged);
   }
 
   private extractEntitiesFromQuery(query: string): string[] {
@@ -196,7 +202,7 @@ export class GraphRAGRetriever {
       .slice(0, k);
   }
 
-  private enrichWithContext(chunks: RetrievedChunk[], query: string): RetrievedChunk[] {
+  private enrichWithContext(chunks: RetrievedChunk[]): RetrievedChunk[] {
     // Add context: include related messages for each chunk
     return chunks.map((chunk) => {
       if (chunk.type === 'message') {
@@ -236,10 +242,14 @@ export class GraphRAGRetriever {
   // ─────────────────────────────────────────────────────────
 
   getStats(): { vectors: number; entities: number; relations: number } {
+    let relations = 0;
+    for (const edges of this.relationIndex.values()) {
+      relations += edges.length;
+    }
     return {
       vectors: this.vectorIndex.size(),
-      entities: this.entityIndex.size(),
-      relations: this.relationIndex.size(),
+      entities: this.entityIndex.size,
+      relations,
     };
   }
 }
@@ -255,12 +265,10 @@ export function buildVectorCypher(
 ): string {
   const embeddingList = `[${queryEmbedding.join(',')}]`;
   return `
-    MATCH (m:Message)
-    WHERE m.embedding IS NOT NULL
-    WITH m, vector.similarity.cosine(m.embedding, ${embeddingList}) AS sim
-    RETURN m.id AS id, m.content AS content, sim AS score
-    ORDER BY sim DESC
-    LIMIT ${k}
+    CALL db.index.vector.queryNodes('${indexName}', ${Math.floor(k)}, ${embeddingList})
+    YIELD node, score
+    RETURN node.id AS id, node.content AS content, score
+    ORDER BY score DESC
   `;
 }
 
@@ -268,11 +276,11 @@ export function buildGraphCypher(
   entityIds: string[],
   depth: number = 2
 ): string {
-  const entityList = entityIds.map((e) => `'${e}'`).join(', ');
+  const entityList = entityIds.map((e) => `'${e.replace(/'/g, "\\'")}'`).join(', ');
   return `
     MATCH (e:Entity)
     WHERE e.id IN [${entityList}]
-    MATCH path = (e)-[r*1..${depth}]-(related:Entity)
+    MATCH path = (e)-[r*1..${Math.max(1, Math.floor(depth))}]-(related:Entity)
     RETURN e.id AS start, nodes(path) AS entities, relationships(path) AS relations
     LIMIT 20
   `;

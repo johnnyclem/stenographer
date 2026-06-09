@@ -144,7 +144,7 @@ export interface StenographerAPI {
     messagesIndexed: number;
     entities: number;
     decisions: number;
-    tomb stones: number;
+    tombstones: number;
   }>;
 }
 

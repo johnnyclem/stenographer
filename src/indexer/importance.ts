@@ -32,6 +32,19 @@ const ENTITY_PATTERNS = [
   /connected to (.+)/i,
 ];
 
+export function extractEntities(content: string): string[] {
+  const entities: string[] = [];
+
+  for (const pattern of ENTITY_PATTERNS) {
+    const match = content.match(pattern);
+    if (match && match[1]) {
+      entities.push(match[1].trim());
+    }
+  }
+
+  return entities;
+}
+
 export class ImportanceDetector {
   private weights = {
     stateDelta: 0.45,
@@ -94,7 +107,7 @@ export class ImportanceDetector {
     if (history.length === 0) return 0;
 
     // Extract entities from current message
-    const entities = this.extractEntities(message.content);
+    const entities = extractEntities(message.content);
     if (entities.length === 0) return 0;
 
     // Count references to these entities in prior messages
@@ -146,19 +159,6 @@ export class ImportanceDetector {
 
     return 0;
   }
-
-  private extractEntities(content: string): string[] {
-    const entities: string[] = [];
-
-    for (const pattern of ENTITY_PATTERNS) {
-      const match = content.match(pattern);
-      if (match && match[1]) {
-        entities.push(match[1].trim());
-      }
-    }
-
-    return entities;
-  }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -195,7 +195,7 @@ export function extractStructure(message: ConversationMessage): ExtractedStructu
   }
 
   // Extract entities
-  result.entities = this.extractEntities(message.content).map((e) => ({
+  result.entities = extractEntities(message.content).map((e) => ({
     name: e,
     type: 'extracted',
     value: e,

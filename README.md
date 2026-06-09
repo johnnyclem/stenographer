@@ -9,7 +9,7 @@ Stenographer is an MCP server that watches your conversation logs and builds a q
 ## What's New in 0.1.0-alpha.2
 
 - **GraphRAG Search** — Hybrid vector similarity + graph traversal
-- **Local Embeddings** — ONNX-based (all-MiniLM-L6-v2), no API keys
+- **Local Embeddings** — Deterministic hashed lexical embeddings (word + character n-grams), fully offline, no API keys, no model download
 - **Contextual Ranking** — Merges vector and graph results with weighted scoring
 
 ## The Stack
@@ -88,7 +88,7 @@ Returns ranked results with scores, types (message/entity/path), and context.
           ▼                               ▼
 ┌─────────────────────┐         ┌─────────────────────────┐
 │ Importance Detector │         │  Local Embedder         │
-│  3-signal scoring   │         │  (all-MiniLM-L6-v2)    │
+│  3-signal scoring   │         │  (hashed lexical)       │
 └─────────┬───────────┘         └───────────┬─────────────┘
           │                                 │
           ▼                                 ▼
