@@ -1,23 +1,136 @@
 /**
  * Stenographer — Embeddings
- * ONNX-based local embeddings (all-MiniLM-L6-v2)
- * No API keys required
+ *
+ * Two interchangeable embedders behind one interface:
+ * - TransformerEmbedder (default): real semantic embeddings via
+ *   @xenova/transformers (all-MiniLM-L6-v2, 384-dim). Downloads the model
+ *   (~25MB quantized) on first use, then runs fully locally. No API keys.
+ * - HashedEmbedder: deterministic hashed lexical features (word + char
+ *   n-grams). Zero downloads, fully offline; weaker on paraphrase. Used as
+ *   the automatic fallback when the model can't be loaded.
  */
 
-import { getEmbedding } from 'onigasm';
-import type { ConversationMessage } from '../types.js';
+export const EMBEDDING_DIMENSIONS = 384;
+
+export interface Embedder {
+  embed(text: string): Promise<number[]>;
+  embedBatch(texts: string[]): Promise<number[][]>;
+  readonly dimensions: number;
+}
+
+// FNV-1a 32-bit hash — stable across runs and platforms
+function fnv1a(str: string): number {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) {
+    hash ^= str.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return hash >>> 0;
+}
+
+function tokenize(text: string): string[] {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter((t) => t.length > 0);
+}
 
 // ─────────────────────────────────────────────────────────────
-// Embedder (ONNX-based, local, no API keys)
+// Transformer Embedder (default — real semantic embeddings)
 // ─────────────────────────────────────────────────────────────
 
-export class LocalEmbedder {
-  private model = 'all-MiniLM-L6-v2'; // 384-dim, ~90MB
+export class TransformerEmbedder implements Embedder {
+  private cache: EmbeddingCache;
+  private model: string;
+  private pipe: ((text: string, opts: object) => Promise<{ data: Float32Array }>) | null = null;
+  private loading: Promise<void> | null = null;
+
+  constructor(model: string = 'Xenova/all-MiniLM-L6-v2', cacheSize: number = 10000) {
+    this.model = model;
+    this.cache = new EmbeddingCache(cacheSize);
+  }
+
+  /** Loads the model (downloads on first ever use). Throws if unavailable. */
+  async load(): Promise<void> {
+    if (this.pipe) return;
+    if (!this.loading) {
+      this.loading = (async () => {
+        const { pipeline } = await import('@xenova/transformers');
+        this.pipe = (await pipeline('feature-extraction', this.model, {
+          quantized: true,
+        })) as unknown as typeof this.pipe;
+      })();
+    }
+    await this.loading;
+  }
 
   async embed(text: string): Promise<number[]> {
-    // onigasm loads the WASM model automatically
-    const result = await getEmbedding(text);
-    return Array.from(result);
+    const cached = this.cache.get(text);
+    if (cached) return cached;
+
+    await this.load();
+    const out = await this.pipe!(text, { pooling: 'mean', normalize: true });
+    const vec = Array.from(out.data);
+    this.cache.set(text, vec);
+    return vec;
+  }
+
+  async embedBatch(texts: string[]): Promise<number[][]> {
+    const results: number[][] = [];
+    for (const t of texts) {
+      results.push(await this.embed(t));
+    }
+    return results;
+  }
+
+  get dimensions(): number {
+    return EMBEDDING_DIMENSIONS;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Hashed Embedder (offline fallback, deterministic)
+// ─────────────────────────────────────────────────────────────
+
+export class HashedEmbedder implements Embedder {
+  private cache: EmbeddingCache;
+
+  constructor(cacheSize: number = 10000) {
+    this.cache = new EmbeddingCache(cacheSize);
+  }
+
+  async embed(text: string): Promise<number[]> {
+    const cached = this.cache.get(text);
+    if (cached) return cached;
+
+    const vec = new Array<number>(EMBEDDING_DIMENSIONS).fill(0);
+    const tokens = tokenize(text);
+
+    for (const token of tokens) {
+      // Word-level feature (signed hashing keeps the expected dot product
+      // of unrelated texts near zero)
+      const h = fnv1a(token);
+      vec[h % EMBEDDING_DIMENSIONS] += h & 1 ? 1 : -1;
+
+      // Character trigram features capture morphology / partial matches
+      const padded = `_${token}_`;
+      for (let i = 0; i + 3 <= padded.length; i++) {
+        const g = fnv1a(padded.slice(i, i + 3));
+        vec[g % EMBEDDING_DIMENSIONS] += (g & 1 ? 1 : -1) * 0.5;
+      }
+    }
+
+    // L2 normalize so cosine similarity reduces to a dot product
+    let norm = 0;
+    for (const v of vec) norm += v * v;
+    norm = Math.sqrt(norm);
+    if (norm > 0) {
+      for (let i = 0; i < vec.length; i++) vec[i] /= norm;
+    }
+
+    this.cache.set(text, vec);
+    return vec;
   }
 
   async embedBatch(texts: string[]): Promise<number[][]> {
@@ -25,7 +138,39 @@ export class LocalEmbedder {
   }
 
   get dimensions(): number {
-    return 384; // all-MiniLM-L6-v2 output dim
+    return EMBEDDING_DIMENSIONS;
+  }
+}
+
+// Back-compat alias: LocalEmbedder was the original exported name
+export { HashedEmbedder as LocalEmbedder };
+
+// ─────────────────────────────────────────────────────────────
+// Factory — transformer by default, graceful offline fallback
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Creates the configured embedder.
+ * - 'hashed': offline lexical embedder
+ * - any other value (or undefined): transformer model name, defaulting to
+ *   Xenova/all-MiniLM-L6-v2. If the model can't be loaded (offline, missing
+ *   optional dep), falls back to the hashed embedder with a warning.
+ */
+export async function createEmbedder(embeddingModel?: string): Promise<Embedder> {
+  if (embeddingModel === 'hashed') {
+    return new HashedEmbedder();
+  }
+
+  const transformer = new TransformerEmbedder(embeddingModel || 'Xenova/all-MiniLM-L6-v2');
+  try {
+    await transformer.load();
+    return transformer;
+  } catch (err) {
+    console.error(
+      `⚠️  Could not load transformer embeddings (${err instanceof Error ? err.message : err}); ` +
+        'falling back to offline hashed embeddings'
+    );
+    return new HashedEmbedder();
   }
 }
 
@@ -122,9 +267,9 @@ export class EmbeddingCache {
 
   set(key: string, embedding: number[]): void {
     if (this.cache.size >= this.maxSize) {
-      // Simple eviction: clear half when full
+      // Simple eviction: drop the oldest half when full
       const entries = Array.from(this.cache.entries());
-      this.cache = new Map(entries.slice(0, this.maxSize / 2));
+      this.cache = new Map(entries.slice(Math.floor(this.maxSize / 2)));
     }
     this.cache.set(key, embedding);
   }

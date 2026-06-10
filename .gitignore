@@ -1,5 +1,8 @@
 node_modules/
 dist/
+dist-cli/
 .env
 .DS_Store
 *.log
+*.db
+*.jsonl

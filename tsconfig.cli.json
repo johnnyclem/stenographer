@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "outDir": "./dist-cli",
+    "rootDir": "./cli",
+    "declaration": false,
+    "declarationMap": false
+  },
+  "include": ["cli/**/*"]
+}

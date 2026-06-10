@@ -1,118 +1,48 @@
 /**
  * Stenographer — MCP Server
- * Exposes conversation index as MCP tools with GraphRAG search
+ * Exposes the StenographerAPI surface as MCP tools over stdio.
+ * All indexing/query logic lives in the core engine (../core/stenographer.js).
  */
 
+import { parseArgs } from 'node:util';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import type { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { Tailer } from '../indexer/tailer.js';
-import { StateStore } from '../store/index.js';
-import { ImportanceDetector } from '../indexer/importance.js';
-import { GraphRAGRetriever } from '../indexer/graphrag.js';
-import type { StenographerConfig, ConversationMessage } from '../types.js';
+import { Stenographer } from '../core/stenographer.js';
+import type { StenographerConfig, StenographerMode } from '../types.js';
+
+const VERSION = '0.1.0-alpha.2';
 
 // ─────────────────────────────────────────────────────────────
 // MCP Server Implementation
 // ─────────────────────────────────────────────────────────────
 
 export class StenographerServer {
+  readonly engine: Stenographer;
   private server: Server;
-  private tailer: Tailer;
-  private store: StateStore;
-  private detector: ImportanceDetector;
-  private retriever: GraphRAGRetriever;
-  private sessionId: string;
 
   constructor(config: StenographerConfig) {
-    this.sessionId = `session_${Date.now()}`;
-    this.store = new StateStore(config.statePath || './stenographer.db');
-    this.tailer = new Tailer(config.logPath, this.sessionId);
-    this.detector = new ImportanceDetector();
-    this.retriever = new GraphRAGRetriever();
+    this.engine = new Stenographer(config);
 
-    // Set up message handler
-    this.tailer.on('message', async (msg: ConversationMessage) => {
-      await this.indexMessage(msg);
-    });
-
-    // Create MCP server
     this.server = new Server(
-      {
-        name: 'stenographer',
-        version: '0.1.0-alpha.2',
-      },
-      {
-        capabilities: {
-          tools: {},
-        },
-      }
+      { name: 'stenographer', version: VERSION },
+      { capabilities: { tools: {} } }
     );
 
     this.setupHandlers();
   }
 
   async start(): Promise<void> {
-    await this.tailer.start();
+    await this.engine.start();
+
+    // Serve MCP over stdio (stdout is the protocol channel — all logging
+    // in this process must go to stderr)
+    const transport = new StdioServerTransport();
+    await this.server.connect(transport);
   }
 
   stop(): void {
-    this.tailer.stop();
-    this.store.close();
-  }
-
-  private async indexMessage(msg: ConversationMessage): Promise<void> {
-    // Score importance
-    const history = this.store.getMessagesBySession(this.sessionId);
-    const score = this.detector.score(msg, history);
-
-    // Extract entities
-    const extracted = this.detector.extractStructure(msg.content);
-
-    // Index in GraphRAG retriever (for semantic search)
-    await this.retriever.indexMessage(msg);
-
-    // Index entities and relations
-    for (const entity of extracted.entities) {
-      this.retriever.indexEntity({
-        id: entity.name,
-        type: entity.type,
-        value: entity.value,
-        firstSeen: msg.timestamp,
-        lastSeen: msg.timestamp,
-        references: 1,
-      });
-    }
-
-    // Store in SQLite
-    this.store.addMessage({
-      id: msg.id,
-      sessionId: this.sessionId,
-      role: msg.role,
-      content: msg.content,
-      timestamp: msg.timestamp,
-      embedding: [], // TODO: embed and store
-      importanceScore: score,
-      entityIds: extracted.entities.map((e) => e.name),
-    });
-
-    // Store decisions
-    for (const decision of extracted.decisions) {
-      this.store.addDecision(this.sessionId, {
-        id: `decision_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-        description: decision,
-      });
-    }
-
-    // Store tombstones (corrections)
-    for (const correction of extracted.corrections) {
-      this.store.addTombstone(this.sessionId, {
-        id: `tombstone_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-        superseded: correction.from,
-        correctedTo: correction.to,
-        reason: 'Correction detected',
-      });
-    }
+    this.engine.stop();
   }
 
   private setupHandlers(): void {
@@ -132,36 +62,62 @@ export class StenographerServer {
         {
           name: 'get_entities',
           description: 'Get all entities extracted from the conversation',
-          inputSchema: {
-            type: 'object',
-            properties: {},
-          },
+          inputSchema: { type: 'object', properties: {} },
+        },
+        {
+          name: 'get_relations',
+          description: 'Get all entity relations (knowledge graph edges) from the conversation',
+          inputSchema: { type: 'object', properties: {} },
         },
         {
           name: 'get_decisions',
           description: 'Get all active (non-superseded) decisions made in the conversation',
+          inputSchema: { type: 'object', properties: {} },
+        },
+        {
+          name: 'get_decision_history',
+          description:
+            'Get the full decision history including superseded versions. Each superseded decision keeps its provenance and points at its successor.',
+          inputSchema: { type: 'object', properties: {} },
+        },
+        {
+          name: 'get_decision_chain',
+          description:
+            'Get the supersession chain containing a decision, oldest observation first. The last entry is the current version of that decision.',
           inputSchema: {
             type: 'object',
-            properties: {},
+            properties: {
+              id: { type: 'string', description: 'Decision id anywhere in the chain' },
+            },
+            required: ['id'],
           },
         },
         {
           name: 'get_corrections',
           description: 'Get all corrections/tombstones from the conversation',
-          inputSchema: {
-            type: 'object',
-            properties: {},
-          },
+          inputSchema: { type: 'object', properties: {} },
         },
         {
           name: 'search_conversation',
-          description: 'Search the conversation semantically using GraphRAG - hybrid vector + graph search',
+          description:
+            'Search the conversation semantically using GraphRAG - hybrid vector + graph search',
           inputSchema: {
             type: 'object',
             properties: {
               query: { type: 'string', description: 'Search query' },
               k: { type: 'number', description: 'Number of results', default: 5 },
               graph_depth: { type: 'number', description: 'Graph traversal depth', default: 2 },
+            },
+          },
+        },
+        {
+          name: 'search_similar',
+          description: 'Pure vector similarity search over indexed messages (persistent index)',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              query: { type: 'string', description: 'Search query' },
+              k: { type: 'number', description: 'Number of results', default: 5 },
             },
           },
         },
@@ -178,135 +134,25 @@ export class StenographerServer {
         {
           name: 'get_status',
           description: 'Get stenographer status and statistics',
-          inputSchema: {
-            type: 'object',
-            properties: {},
-          },
+          inputSchema: { type: 'object', properties: {} },
         },
       ],
     }));
 
     // Handle tool calls
     this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
-      const { name, arguments: args } = request;
+      const { name, arguments: args } = request.params;
 
       try {
-        switch (name) {
-          case 'get_recent_messages': {
-            const n = (args as any).n || 10;
-            const messages = this.store.getRecentMessages(this.sessionId, n);
-            return {
-              content: [
-                {
-                  type: 'text',
-                  text: JSON.stringify(messages, null, 2),
-                },
-              ],
-            };
-          }
-
-          case 'get_entities': {
-            const entities = this.store.getEntities(this.sessionId);
-            return {
-              content: [
-                {
-                  type: 'text',
-                  text: JSON.stringify(entities, null, 2),
-                },
-              ],
-            };
-          }
-
-          case 'get_decisions': {
-            const decisions = this.store.getActiveDecisions(this.sessionId);
-            return {
-              content: [
-                {
-                  type: 'text',
-                  text: JSON.stringify(decisions, null, 2),
-                },
-              ],
-            };
-          }
-
-          case 'get_corrections': {
-            const tombstones = this.store.getTombstones(this.sessionId);
-            return {
-              content: [
-                {
-                  type: 'text',
-                  text: JSON.stringify(tombstones, null, 2),
-                },
-              ],
-            };
-          }
-
-          case 'search_conversation': {
-            const query = (args as any).query || '';
-            const k = (args as any).k || 5;
-            const graphDepth = (args as any).graph_depth || 2;
-
-            // Use GraphRAG retriever
-            const results = await this.retriever.search({
-              query,
-              k,
-              graphDepth,
-            });
-
-            return {
-              content: [
-                {
-                  type: 'text',
-                  text: JSON.stringify({
-                    query,
-                    results,
-                    stats: this.retriever.getStats(),
-                  }, null, 2),
-                },
-              ],
-            };
-          }
-
-          case 'get_context_frame': {
-            const budget = (args as any).budget || 2000;
-            const messages = this.store.getMessagesBySession(this.sessionId);
-            const decisions = this.store.getActiveDecisions(this.sessionId);
-            const entities = this.store.getEntities(this.sessionId);
-
-            // Build context frame within budget
-            const frame = this.buildContextFrame(messages, decisions, entities, budget);
-
-            return {
-              content: [
-                {
-                  type: 'text',
-                  text: frame,
-                },
-              ],
-            };
-          }
-
-          case 'get_status': {
-            const stats = this.store.getStats(this.sessionId);
-            const retrieverStats = this.retriever.getStats();
-            return {
-              content: [
-                {
-                  type: 'text',
-                  text: JSON.stringify({
-                    ...stats,
-                    retriever: retrieverStats,
-                    sessionId: this.sessionId,
-                    version: '0.1.0-alpha.2',
-                  }, null, 2),
-                },
-              ],
-            };
-          }
-
-          default:
-            throw new Error(`Unknown tool: ${name}`);
-        }
+        const result = await this.callTool(name, (args ?? {}) as Record<string, unknown>);
+        return {
+          content: [
+            {
+              type: 'text',
+              text: typeof result === 'string' ? result : JSON.stringify(result, null, 2),
+            },
+          ],
+        };
       } catch (error) {
         return {
           content: [
@@ -321,48 +167,62 @@ export class StenographerServer {
     });
   }
 
-  private buildContextFrame(
-    messages: any[],
-    decisions: any[],
-    entities: any[],
-    budget: number
-  ): string {
-    const parts: string[] = [];
+  private async callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
+    switch (name) {
+      case 'get_recent_messages':
+        return this.engine.getRecentMessages((args.n as number) || 10);
 
-    // Add entities (most compact)
-    if (entities.length > 0) {
-      parts.push(`## Entities\n${entities.map((e) => `- ${e.value} (${e.type})`).join('\n')}`);
+      case 'get_entities':
+        return this.engine.getEntities();
+
+      case 'get_relations':
+        return this.engine.getRelations();
+
+      case 'get_decisions':
+        return this.engine.getActiveDecisions();
+
+      case 'get_decision_history':
+        return this.engine.getDecisionHistory();
+
+      case 'get_decision_chain': {
+        const id = args.id as string;
+        if (!id) throw new Error('Missing required argument: id');
+        return this.engine.getDecisionChain(id);
+      }
+
+      case 'get_corrections':
+        return this.engine.getTombstones();
+
+      case 'search_conversation': {
+        const query = (args.query as string) || '';
+        const k = (args.k as number) || 5;
+        const graphDepth = (args.graph_depth as number) || 2;
+        const results = await this.engine.searchGraphRAG({ query, k, graphDepth });
+        return { query, results, stats: this.engine.retriever.getStats() };
+      }
+
+      case 'search_similar':
+        return this.engine.searchSimilar((args.query as string) || '', (args.k as number) || 5);
+
+      case 'get_context_frame':
+        return this.engine.buildContextFrame((args.budget as number) || 2000);
+
+      case 'get_status': {
+        const stats = await this.engine.getStatus();
+        return {
+          ...stats,
+          retriever: this.engine.retriever.getStats(),
+          vectorBackend: this.engine.store.vectorSearchBackend,
+          sessionId: this.engine.getSessionId(),
+          mode: this.engine.config.mode,
+          restPort: this.engine.restPort,
+          version: VERSION,
+        };
+      }
+
+      default:
+        throw new Error(`Unknown tool: ${name}`);
     }
-
-    // Add decisions
-    if (decisions.length > 0) {
-      parts.push(`## Decisions\n${decisions.map((d) => `- ${d.description}`).join('\n')}`);
-    }
-
-    // Add recent messages (most expensive)
-    let currentTokens = this.estimateTokens(parts.join('\n'));
-    const recentMessages: string[] = [];
-
-    for (const msg of messages.slice(-10)) {
-      const msgText = `\n${msg.role}: ${msg.content.slice(0, 200)}`;
-      const msgTokens = this.estimateTokens(msgText);
-
-      if (currentTokens + msgTokens > budget) break;
-
-      recentMessages.unshift(msgText);
-      currentTokens += msgTokens;
-    }
-
-    if (recentMessages.length > 0) {
-      parts.push(`## Recent Messages${recentMessages.join('')}`);
-    }
-
-    return parts.join('\n\n');
-  }
-
-  private estimateTokens(text: string): number {
-    // Rough heuristic: ~4 chars per token
-    return Math.ceil(text.length / 4);
   }
 }
 
@@ -370,28 +230,51 @@ export class StenographerServer {
 // CLI Entry Point
 // ─────────────────────────────────────────────────────────────
 
+const MODES: StenographerMode[] = ['live', 'catchup', 'watch', 'daemon'];
+
 export async function runCLI(args: string[]): Promise<void> {
-  const logPath = args[0] || './conversation.jsonl';
-  const statePath = args[1] || './stenographer.db';
-
-  console.log(`🤖 Starting Stenographer v0.1.0-alpha.2`);
-  console.log(`📄 Watching: ${logPath}`);
-  console.log(`💾 State: ${statePath}`);
-  console.log(`🔍 GraphRAG: Enabled (hybrid vector + graph search)`);
-
-  const server = new StenographerServer({
-    logPath,
-    statePath,
-    mode: 'live',
+  const { positionals, values } = parseArgs({
+    args,
+    options: {
+      mode: { type: 'string', short: 'm' },
+      adapter: { type: 'string', short: 'a' },
+      'rest-port': { type: 'string' },
+      embeddings: { type: 'string', short: 'e' },
+    },
+    allowPositionals: true,
   });
 
+  const logPath = positionals[0] || './conversation.jsonl';
+  const statePath = positionals[1] || './stenographer.db';
+
+  const mode = (values.mode as StenographerMode) || 'live';
+  if (!MODES.includes(mode)) {
+    console.error(`Unknown mode '${mode}'. Available: ${MODES.join(', ')}`);
+    process.exit(1);
+  }
+
+  const config: StenographerConfig = {
+    logPath,
+    statePath,
+    mode,
+    adapter: values.adapter as StenographerConfig['adapter'],
+    embeddingModel: values.embeddings,
+    restPort: values['rest-port'] ? Number.parseInt(values['rest-port'], 10) : undefined,
+  };
+
+  // Log to stderr — stdout carries the MCP stdio protocol
+  console.error(`🤖 Starting Stenographer v${VERSION}`);
+  console.error(`📄 ${mode === 'watch' ? 'Watching directory' : 'Watching'}: ${logPath}`);
+  console.error(`💾 State: ${statePath}`);
+  console.error(`🎛  Mode: ${mode}${config.adapter ? `, adapter: ${config.adapter}` : ' (adapter auto-detect)'}`);
+
+  const server = new StenographerServer(config);
   await server.start();
 
-  console.log('✅ Stenographer is running. Press Ctrl+C to stop.');
+  console.error('✅ Stenographer is running. Press Ctrl+C to stop.');
 
-  // Keep process alive
   process.on('SIGINT', () => {
-    console.log('\n👋 Shutting down...');
+    console.error('\n👋 Shutting down...');
     server.stop();
     process.exit(0);
   });

@@ -3,13 +3,13 @@
  * Watches and processes conversation log files
  */
 
-import { createReadStream, FSWatcher } from 'node:fs';
+import { createReadStream, watch, type FSWatcher } from 'node:fs';
+import { stat } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
-import { watch } from 'node:fs';
 import { EventEmitter } from 'node:events';
 import { MessageSchema, type ConversationMessage } from '../types.js';
 
-export interface JsonlAdapter {
+export interface LogAdapter {
   parseLine(line: string): ConversationMessage | null;
   detect(lines: string[]): boolean;
 }
@@ -18,7 +18,7 @@ export interface JsonlAdapter {
 // Standard JSONL Adapter
 // ─────────────────────────────────────────────────────────────
 
-export class JsonlAdapter implements JsonlAdapter {
+export class JsonlAdapter implements LogAdapter {
   parseLine(line: string): ConversationMessage | null {
     try {
       const parsed = JSON.parse(line);
@@ -43,32 +43,53 @@ export class JsonlAdapter implements JsonlAdapter {
 // File Tailer
 // ─────────────────────────────────────────────────────────────
 
+export interface TailerOptions {
+  sessionId?: string;
+  adapter?: LogAdapter;
+  /** When false, process the file once and don't watch for changes (catchup mode). Default true. */
+  follow?: boolean;
+}
+
 export class Tailer extends EventEmitter {
-  private adapter: JsonlAdapter;
+  private adapter: LogAdapter;
   private filePath: string;
   private position: number = 0;
   private watcher: FSWatcher | null = null;
   private sessionId: string;
   private isRunning: boolean = false;
+  private follow: boolean;
+  private processing: Promise<void> = Promise.resolve();
 
-  constructor(filePath: string, sessionId?: string) {
+  constructor(filePath: string, sessionIdOrOptions?: string | TailerOptions, adapter?: LogAdapter) {
     super();
+    const options: TailerOptions =
+      typeof sessionIdOrOptions === 'string' || sessionIdOrOptions === undefined
+        ? { sessionId: sessionIdOrOptions, adapter }
+        : sessionIdOrOptions;
+
     this.filePath = filePath;
-    this.sessionId = sessionId || `session_${Date.now()}`;
-    this.adapter = new JsonlAdapter();
+    this.sessionId = options.sessionId || `session_${Date.now()}`;
+    this.adapter = options.adapter ?? new JsonlAdapter();
+    this.follow = options.follow ?? true;
   }
 
   async start(): Promise<void> {
     if (this.isRunning) return;
     this.isRunning = true;
 
-    // Initial catchup — process entire file
-    await this.processFile();
+    // Initial catchup — process the file from the beginning
+    await this.readFrom(0);
 
-    // Watch for new lines
+    if (!this.follow) {
+      this.isRunning = false;
+      return;
+    }
+
+    // Watch for new lines; serialize reads so overlapping change events
+    // can't process the same byte range twice
     this.watcher = watch(this.filePath, (eventType) => {
       if (eventType === 'change') {
-        this.processNew();
+        this.processing = this.processing.then(() => this.readFrom(this.position));
       }
     });
   }
@@ -85,28 +106,16 @@ export class Tailer extends EventEmitter {
     return this.sessionId;
   }
 
-  private async processFile(): Promise<void> {
-    const stream = createReadStream(this.filePath);
-    const rl = createInterface({ input: stream });
-    const lines: string[] = [];
-
-    for await (const line of rl) {
-      if (line.trim()) {
-        lines.push(line);
-        const msg = this.adapter.parseLine(line);
-        if (msg) {
-          this.emit('message', { ...msg, sessionId: this.sessionId });
-        }
-      }
+  private async readFrom(start: number): Promise<void> {
+    const { size } = await stat(this.filePath);
+    if (size < start) {
+      // File was truncated/rotated — start over
+      start = 0;
     }
+    if (size === start) return;
 
-    // Save position for incremental reads
-    this.position = 0; // Would track actual position in production
-  }
-
-  private async processNew(): Promise<void> {
-    const stream = createReadStream(this.filePath, { start: this.position });
-    const rl = createInterface({ input: stream });
+    const stream = createReadStream(this.filePath, { start, end: size - 1 });
+    const rl = createInterface({ input: stream, crlfDelay: Infinity });
 
     for await (const line of rl) {
       if (line.trim()) {
@@ -116,35 +125,9 @@ export class Tailer extends EventEmitter {
         }
       }
     }
+
+    this.position = size;
   }
 }
 
-// ─────────────────────────────────────────────────────────────
-// Adapter Registry (for future provider adapters)
-// ─────────────────────────────────────────────────────────────
-
-export const adapters: Map<string, JsonlAdapter> = new Map([
-  ['jsonl', new JsonlAdapter()],
-]);
-
-export function detectAdapter(filePath: string): Promise<JsonlAdapter> {
-  return new Promise((resolve) => {
-    const stream = createReadStream(filePath, { end: 1024 * 10 });
-    const rl = createInterface({ input: stream });
-    const lines: string[] = [];
-    let collected = 0;
-
-    rl.on('line', (line) => {
-      if (line.trim()) {
-        lines.push(line);
-        collected++;
-        if (collected >= 5) rl.close();
-      }
-    });
-
-    rl.on('close', () => {
-      // Auto-detect: prefer JSONL for now
-      resolve(new JsonlAdapter());
-    });
-  });
-}
+// Adapter registry and format detection live in ./adapters.ts
