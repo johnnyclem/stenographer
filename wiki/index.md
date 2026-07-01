@@ -32,3 +32,9 @@ Last updated: 2026-06-09
 - [[wiki/smallchat]] — Tool compiler for AI agents (object-oriented inference)
 - [[wiki/short-hand]] — Progressive context compaction for LLMs (LSM-tree)
 - [[wiki/agentvault]] — Persistent on-chain AI agent platform (ICP canisters)
+
+---
+
+## Ecosystem Evaluation
+
+- [`docs/ecosystem/executive-summary.md`](../docs/ecosystem/executive-summary.md) — cross-repo evaluation from Stenographer's vantage point: what's actually wired vs. aspirational across the four-project stack, with a companion [engineering guide](../docs/ecosystem/engineering-guide.md).
