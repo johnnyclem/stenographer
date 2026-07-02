@@ -128,7 +128,7 @@ The `search_conversation` tool performs **hybrid retrieval**:
 
 ## Roadmap
 
-- **The Agent Stack** — warm-state handoff to [short-hand](https://github.com/johnnyclem/short-hand) (compaction), [smallchat](https://github.com/johnnyclem/smallchat) (tool dispatch), [agentvault](https://github.com/johnnyclem/agentvault) (deployment). See `wiki/` for the ground-truth/roadmap split.
+- **The Agent Stack** — warm-state handoff to [short-hand](https://github.com/johnnyclem/short-hand) (compaction), [smallchat](https://github.com/johnnyclem/smallchat) (tool dispatch), [agentvault](https://github.com/johnnyclem/agentvault) (deployment). This is a design target, not shipped code — see `wiki/` for the ground-truth/roadmap split and [`docs/ecosystem/`](./docs/ecosystem/executive-summary.md) for a source-verified evaluation of what's actually wired today.
 - **Tier 1.5 extraction** — local model (Gemma) for high-importance messages, gated by `extractionThreshold`
 - **GraphQL** query surface
 - **Neo4j** persistent graph backend (Cypher builders ship today: `buildVectorCypher`, `buildGraphCypher`)
