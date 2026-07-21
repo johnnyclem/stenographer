@@ -1,20 +1,37 @@
 # Stenographer 🤖
 
-> MCP court reporter with GraphRAG — queryable conversation index for AI agents
+[![CI](https://github.com/johnnyclem/stenographer/actions/workflows/ci.yml/badge.svg)](https://github.com/johnnyclem/stenographer/actions/workflows/ci.yml)
+[![Version](https://img.shields.io/badge/version-0.1.0--alpha.2-orange)](https://github.com/johnnyclem/stenographer/releases)
+[![Node](https://img.shields.io/badge/node-%3E%3D20-brightgreen)](https://nodejs.org)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 
-**Version:** 0.1.0-alpha.2
+> MCP court reporter with GraphRAG — a queryable conversation index for AI agents
 
-Stenographer is an MCP server that watches your conversation logs and builds a queryable index. Think of it as a court reporter sitting in the room — it doesn't participate, but it's always listening and ready to answer questions.
+Stenographer is an MCP server that watches your conversation logs and builds a queryable index in real time. Think of it as a court reporter sitting in the room: it doesn't participate in the conversation, but it's always listening, and it can answer questions about everything that's been said — who decided what, when they changed their mind, and why.
+
+Point it at a JSONL log, and it gives your agent stack a semantic memory: entities, decisions, corrections, and hybrid vector+graph search, all backed by a local SQLite file — no external services required.
+
+## Why Stenographer
+
+- **Passive by design** — it never writes back to the conversation or takes actions; it only observes and indexes, so it's safe to attach to any agent loop.
+- **Decisions don't just vanish when an agent changes its mind** — supersession chains keep the old answer, the new answer, and the provenance linking them, instead of silently overwriting history.
+- **Runs fully local** — embeddings, vector search, and storage all happen on-disk with no API keys and no network calls (see [Offline mode](#offline-mode)).
+- **Two ways in** — MCP over stdio for agent tool calls, REST over HTTP for everything else (dashboards, scripts, curl).
 
 ## Features
 
-- **GraphRAG Search** — Hybrid vector similarity + graph traversal
-- **Real Local Embeddings** — all-MiniLM-L6-v2 via `@xenova/transformers` (~25MB model, downloaded once, runs fully locally, no API keys). Offline hashed-lexical fallback when the model can't load, or opt in with `--embeddings hashed`.
+- **GraphRAG Search** — hybrid vector similarity + entity-graph traversal, merged and re-ranked in one query
+- **Real Local Embeddings** — `all-MiniLM-L6-v2` via `@xenova/transformers` (~25MB model, downloaded once, runs fully locally, no API keys). Offline hashed-lexical fallback when the model can't load, or opt in explicitly with `--embeddings hashed`
 - **Persistent Vector Index** — `sqlite-vec` KNN index in the same SQLite file as everything else (brute-force cosine fallback if the extension can't load)
+- **Importance Scoring** — a three-signal model (state delta, reference frequency, trajectory discontinuity) flags which messages matter, so retrieval and context-framing can prioritize signal over noise
 - **Decision Supersession (Tombstones)** — decisions are append-only; a newer decision or an "actually, …" correction closes the old record onto its successor, keeping full provenance
 - **Four Modes** — `live`, `catchup`, `watch` (a directory of session logs), `daemon` (live + REST API)
 - **Provider Adapters** — `jsonl`, `claude-code`, `anthropic`, `openai`, `generic`, auto-detected from file content
 - **Two Query Surfaces** — MCP over stdio, REST over HTTP (GraphQL: roadmap)
+
+## Requirements
+
+- Node.js >= 20
 
 ## Install
 
@@ -41,7 +58,20 @@ npx stenographer start ./finished.jsonl --mode catchup
 npx stenographer start ./conversation.jsonl --embeddings hashed
 ```
 
-Options: `--mode live|catchup|watch|daemon`, `--adapter jsonl|claude-code|anthropic|openai|generic`, `--embeddings <model|hashed>`, `--rest-port <port>`.
+### CLI Options
+
+| Flag | Values | Default | Description |
+|------|--------|---------|-------------|
+| `-m, --mode` | `live` \| `catchup` \| `watch` \| `daemon` | `live` | `live`: tail a file and serve MCP. `catchup`: index a completed file, then serve. `watch`: watch a directory for `*.jsonl` session logs. `daemon`: live + REST API |
+| `-a, --adapter` | `jsonl` \| `claude-code` \| `anthropic` \| `openai` \| `generic` | auto-detect | Log format adapter |
+| `-e, --embeddings` | model name \| `hashed` | `Xenova/all-MiniLM-L6-v2` | Transformer model, or the offline lexical embedder (see [Offline mode](#offline-mode)) |
+| `--rest-port` | port number | `8787` in daemon mode, off otherwise | Serve the REST API on this port |
+
+Positional args: `stenographer start <log-path> [state-path]` — `state-path` defaults to `./stenographer.db`.
+
+### Offline mode
+
+By default, Stenographer downloads a ~25MB embedding model on first run and does everything else locally after that — no ongoing network calls, no API keys, ever. If you need to skip even that one-time download, pass `--embeddings hashed` to use an offline hashed-lexical embedder instead; the same fallback kicks in automatically if the transformer model fails to load.
 
 ## MCP Tools
 
@@ -65,10 +95,20 @@ Options: `--mode live|catchup|watch|daemon`, `--adapter jsonl|claude-code|anthro
 GET /status                  GET /decisions
 GET /messages?n=10           GET /decisions/history
 GET /entities                GET /decisions/:id/chain
-GET /relations               GET /tombstones
+GET /relations                GET /tombstones
 GET /search?q=...&k=5        GET /graphrag?q=...&k=5&depth=2
 GET /context-frame?budget=2000
 ```
+
+## Importance Scoring
+
+Every indexed message gets a three-signal importance score, used to prioritize what surfaces in search results and context frames:
+
+| Signal | Weight | What it captures |
+|--------|--------|-------------------|
+| **State delta** | 45% | Decisions, corrections, and tool calls — moments where conversation state actually changed |
+| **Trajectory discontinuity** | 30% | Topic shifts and length deviation from the recent baseline |
+| **Reference frequency** | 25% | How often the message's entities have been referenced recently |
 
 ## Decision Supersession
 
@@ -138,9 +178,20 @@ The `search_conversation` tool performs **hybrid retrieval**:
 
 ```bash
 npm install
-npm run build
-npm test
+npm run build   # tsc (core) + tsc -p tsconfig.cli.json (CLI)
+npm test        # vitest
+npm run lint    # tsc --noEmit
 ```
+
+Tests live in [`test/`](./test), covering the core engine, GraphRAG retriever, embeddings, importance scoring, provider adapters, the tailer, the SQLite store, and the REST API.
+
+## Contributing
+
+Issues and pull requests are welcome. Before opening a PR, make sure `npm run lint`, `npm test`, and `npm run build` all pass.
+
+## License
+
+[MIT](./LICENSE)
 
 ## Credits
 
