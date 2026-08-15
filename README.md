@@ -21,7 +21,7 @@ Point it at a JSONL log, and it gives your agent stack a semantic memory: entiti
 ## Features
 
 - **GraphRAG Search** — hybrid vector similarity + entity-graph traversal, merged and re-ranked in one query
-- **Real Local Embeddings** — `all-MiniLM-L6-v2` via `@xenova/transformers` (~25MB model, downloaded once, runs fully locally, no API keys). Offline hashed-lexical fallback when the model can't load, or opt in explicitly with `--embeddings hashed`
+- **Real Local Embeddings** — `all-MiniLM-L6-v2` via `@huggingface/transformers` (~25MB model, downloaded once, runs fully locally, no API keys). Offline hashed-lexical fallback when the model can't load, or opt in explicitly with `--embeddings hashed`
 - **Persistent Vector Index** — `sqlite-vec` KNN index in the same SQLite file as everything else (brute-force cosine fallback if the extension can't load)
 - **Importance Scoring** — a three-signal model (state delta, reference frequency, trajectory discontinuity) flags which messages matter, so retrieval and context-framing can prioritize signal over noise
 - **Decision Supersession (Tombstones)** — decisions are append-only; a newer decision or an "actually, …" correction closes the old record onto its successor, keeping full provenance

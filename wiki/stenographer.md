@@ -29,7 +29,7 @@ Everything in this section is implemented and tested in the repository as of 202
 | 1. Parse & Normalize | Provider adapter → ConversationMessage |
 | 2. Score Importance | Three-signal model (regex Tier 0) |
 | 3. Extract Structure | Regex patterns: entities, decisions, corrections |
-| 4. Embed | 384-dim transformer (all-MiniLM-L6-v2 via @xenova/transformers), offline hashed-lexical fallback |
+| 4. Embed | 384-dim transformer (all-MiniLM-L6-v2 via @huggingface/transformers), offline hashed-lexical fallback |
 | 5. Persist | SQLite (better-sqlite3) + sqlite-vec vector index |
 
 ### Modes
