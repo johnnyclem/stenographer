@@ -71,6 +71,32 @@ describe('StateStore', () => {
     expect(entities[0].lastSeen).toBe('2026-01-02T00:00:00Z');
   });
 
+  it('does not return entities whose id is merely a substring of a referenced one', () => {
+    store.upsertEntity({
+      id: 'sql',
+      type: 'extracted',
+      value: 'sql',
+      firstSeen: '2026-01-01T00:00:00Z',
+      lastSeen: '2026-01-01T00:00:00Z',
+      references: 1,
+    });
+    store.upsertEntity({
+      id: 'postgresql',
+      type: 'extracted',
+      value: 'postgresql',
+      firstSeen: '2026-01-01T00:00:00Z',
+      lastSeen: '2026-01-01T00:00:00Z',
+      references: 1,
+    });
+    // Only "postgresql" is actually referenced — "sql" is a substring of it
+    // but was never mentioned on its own, so a LIKE-based join would
+    // incorrectly pull it in too.
+    store.addMessage(sampleMessage('m1', { entityIds: ['postgresql'] }));
+
+    const entities = store.getEntities('session_test');
+    expect(entities.map((e) => e.id)).toEqual(['postgresql']);
+  });
+
   it('stores and retrieves relations', () => {
     store.upsertRelation({
       from: 'postgres',
