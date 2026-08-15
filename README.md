@@ -66,6 +66,7 @@ npx stenographer start ./conversation.jsonl --embeddings hashed
 | `-a, --adapter` | `jsonl` \| `claude-code` \| `anthropic` \| `openai` \| `generic` | auto-detect | Log format adapter |
 | `-e, --embeddings` | model name \| `hashed` | `Xenova/all-MiniLM-L6-v2` | Transformer model, or the offline lexical embedder (see [Offline mode](#offline-mode)) |
 | `--rest-port` | port number | `8787` in daemon mode, off otherwise | Serve the REST API on this port |
+| `--rest-host` | hostname/IP | `127.0.0.1` | Interface for the REST API to bind to. The API has no authentication, so it stays loopback-only unless you explicitly opt into wider exposure (e.g. `0.0.0.0` behind a trusted network boundary) |
 
 Positional args: `stenographer start <log-path> [state-path]` — `state-path` defaults to `./stenographer.db`.
 
@@ -99,6 +100,8 @@ GET /relations                GET /tombstones
 GET /search?q=...&k=5        GET /graphrag?q=...&k=5&depth=2
 GET /context-frame?budget=2000
 ```
+
+There's no authentication on these routes, so the server binds to `127.0.0.1` by default — pass `--rest-host` if you deliberately want it reachable from elsewhere.
 
 ## Importance Scoring
 

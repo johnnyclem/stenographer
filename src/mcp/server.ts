@@ -239,6 +239,7 @@ export async function runCLI(args: string[]): Promise<void> {
       mode: { type: 'string', short: 'm' },
       adapter: { type: 'string', short: 'a' },
       'rest-port': { type: 'string' },
+      'rest-host': { type: 'string' },
       embeddings: { type: 'string', short: 'e' },
     },
     allowPositionals: true,
@@ -260,6 +261,7 @@ export async function runCLI(args: string[]): Promise<void> {
     adapter: values.adapter as StenographerConfig['adapter'],
     embeddingModel: values.embeddings,
     restPort: values['rest-port'] ? Number.parseInt(values['rest-port'], 10) : undefined,
+    restHost: values['rest-host'] as string | undefined,
   };
 
   // Log to stderr — stdout carries the MCP stdio protocol

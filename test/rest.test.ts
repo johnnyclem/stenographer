@@ -92,4 +92,10 @@ describe('REST API', () => {
     const res = await fetch(`${base}/status`, { method: 'POST' });
     expect(res.status).toBe(405);
   });
+
+  it('binds to loopback by default, not all interfaces', () => {
+    // The REST API has no authentication — it must not default to 0.0.0.0.
+    const address = (engine as any).restServer.server.address();
+    expect(address.address).toMatch(/^(127\.0\.0\.1|::1)$/);
+  });
 });

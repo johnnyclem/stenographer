@@ -96,9 +96,10 @@ export class Stenographer implements StenographerAPI {
     const restPort =
       this.config.restPort ?? (this.config.mode === 'daemon' ? DEFAULT_DAEMON_REST_PORT : undefined);
     if (restPort !== undefined) {
+      const restHost = this.config.restHost ?? '127.0.0.1';
       this.restServer = new RestServer(this);
-      await this.restServer.start(restPort);
-      console.error(`🌐 REST API listening on http://localhost:${restPort}`);
+      await this.restServer.start(restPort, restHost);
+      console.error(`🌐 REST API listening on http://${restHost}:${this.restServer.port}`);
     }
   }
 
