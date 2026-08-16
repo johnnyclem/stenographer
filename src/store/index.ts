@@ -469,24 +469,36 @@ export class StateStore {
   }
 
   getEntities(sessionId: string | null): EntityNode[] {
-    // Get entities that appear in this session's messages (or all)
-    const stmt = sessionId
-      ? this.db.prepare(`
-          SELECT DISTINCT e.* FROM entities e
-          JOIN messages m ON m.entity_ids LIKE '%' || e.id || '%'
-          WHERE m.session_id = ?
-        `)
-      : this.db.prepare('SELECT * FROM entities');
-
-    const rows = sessionId ? stmt.all(sessionId) : stmt.all();
-    return rows.map((row: any) => ({
+    const rowToNode = (row: any): EntityNode => ({
       id: row.id,
       type: row.type,
       value: row.value,
       firstSeen: row.first_seen,
       lastSeen: row.last_seen,
       references: row.ref_count,
-    }));
+    });
+
+    if (!sessionId) {
+      return (this.db.prepare('SELECT * FROM entities').all() as any[]).map(rowToNode);
+    }
+
+    // entity_ids is a raw (unescaped) extracted-text id, so it can't be
+    // matched with SQL LIKE without false positives on substrings or
+    // wildcard characters — join in application code instead.
+    const entityIdRows = this.db
+      .prepare('SELECT entity_ids FROM messages WHERE session_id = ?')
+      .all(sessionId) as Array<{ entity_ids: string }>;
+
+    const referencedIds = new Set<string>();
+    for (const row of entityIdRows) {
+      for (const id of JSON.parse(row.entity_ids || '[]') as string[]) {
+        referencedIds.add(id);
+      }
+    }
+    if (referencedIds.size === 0) return [];
+
+    const allEntities = this.db.prepare('SELECT * FROM entities').all() as any[];
+    return allEntities.filter((row) => referencedIds.has(row.id)).map(rowToNode);
   }
 
   // ─────────────────────────────────────────────────────────

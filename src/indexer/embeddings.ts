@@ -3,8 +3,8 @@
  *
  * Two interchangeable embedders behind one interface:
  * - TransformerEmbedder (default): real semantic embeddings via
- *   @xenova/transformers (all-MiniLM-L6-v2, 384-dim). Downloads the model
- *   (~25MB quantized) on first use, then runs fully locally. No API keys.
+ *   @huggingface/transformers (all-MiniLM-L6-v2, 384-dim). Downloads the
+ *   model (~25MB quantized) on first use, then runs fully locally. No API keys.
  * - HashedEmbedder: deterministic hashed lexical features (word + char
  *   n-grams). Zero downloads, fully offline; weaker on paraphrase. Used as
  *   the automatic fallback when the model can't be loaded.
@@ -56,9 +56,10 @@ export class TransformerEmbedder implements Embedder {
     if (this.pipe) return;
     if (!this.loading) {
       this.loading = (async () => {
-        const { pipeline } = await import('@xenova/transformers');
+        const { pipeline } = await import('@huggingface/transformers');
         this.pipe = (await pipeline('feature-extraction', this.model, {
-          quantized: true,
+          // q8: same quantized weights as the old `quantized: true` option
+          dtype: 'q8',
         })) as unknown as typeof this.pipe;
       })();
     }

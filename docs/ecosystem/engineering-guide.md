@@ -20,7 +20,7 @@ and
 | Provider adapters | `src/indexer/adapters.ts` | `jsonl`, `claude-code`, `anthropic`, `openai`, `generic`; auto-detected via `detectAdapter` |
 | Tailer | `src/indexer/tailer.ts` | File-tail primitive + `JsonlAdapter`/`LogAdapter` interface |
 | Importance scoring | `src/indexer/importance.ts` | Three-signal model: state delta (45%), reference frequency (25%), trajectory discontinuity (30%) |
-| Embeddings | `src/indexer/embeddings.ts` | `all-MiniLM-L6-v2` via `@xenova/transformers`, offline hashed-lexical fallback |
+| Embeddings | `src/indexer/embeddings.ts` | `all-MiniLM-L6-v2` via `@huggingface/transformers`, offline hashed-lexical fallback |
 | GraphRAG retriever | `src/indexer/graphrag.ts` | Entity-graph traversal + vector merge/re-rank |
 | Persistence | `src/store/index.ts` | `better-sqlite3` + `sqlite-vec` KNN index, brute-force cosine fallback |
 | Types / public contract | `src/types.ts` | `StenographerAPI`, `ConversationMessage`, `Decision`, `Tombstone`, `EntityNode`, `EntityRelation`, `StenographerConfig` |

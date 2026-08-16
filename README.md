@@ -21,7 +21,7 @@ Point it at a JSONL log, and it gives your agent stack a semantic memory: entiti
 ## Features
 
 - **GraphRAG Search** — hybrid vector similarity + entity-graph traversal, merged and re-ranked in one query
-- **Real Local Embeddings** — `all-MiniLM-L6-v2` via `@xenova/transformers` (~25MB model, downloaded once, runs fully locally, no API keys). Offline hashed-lexical fallback when the model can't load, or opt in explicitly with `--embeddings hashed`
+- **Real Local Embeddings** — `all-MiniLM-L6-v2` via `@huggingface/transformers` (~25MB model, downloaded once, runs fully locally, no API keys). Offline hashed-lexical fallback when the model can't load, or opt in explicitly with `--embeddings hashed`
 - **Persistent Vector Index** — `sqlite-vec` KNN index in the same SQLite file as everything else (brute-force cosine fallback if the extension can't load)
 - **Importance Scoring** — a three-signal model (state delta, reference frequency, trajectory discontinuity) flags which messages matter, so retrieval and context-framing can prioritize signal over noise
 - **Decision Supersession (Tombstones)** — decisions are append-only; a newer decision or an "actually, …" correction closes the old record onto its successor, keeping full provenance
@@ -66,6 +66,7 @@ npx stenographer start ./conversation.jsonl --embeddings hashed
 | `-a, --adapter` | `jsonl` \| `claude-code` \| `anthropic` \| `openai` \| `generic` | auto-detect | Log format adapter |
 | `-e, --embeddings` | model name \| `hashed` | `Xenova/all-MiniLM-L6-v2` | Transformer model, or the offline lexical embedder (see [Offline mode](#offline-mode)) |
 | `--rest-port` | port number | `8787` in daemon mode, off otherwise | Serve the REST API on this port |
+| `--rest-host` | hostname/IP | `127.0.0.1` | Interface for the REST API to bind to. The API has no authentication, so it stays loopback-only unless you explicitly opt into wider exposure (e.g. `0.0.0.0` behind a trusted network boundary) |
 
 Positional args: `stenographer start <log-path> [state-path]` — `state-path` defaults to `./stenographer.db`.
 
@@ -99,6 +100,8 @@ GET /relations                GET /tombstones
 GET /search?q=...&k=5        GET /graphrag?q=...&k=5&depth=2
 GET /context-frame?budget=2000
 ```
+
+There's no authentication on these routes, so the server binds to `127.0.0.1` by default — pass `--rest-host` if you deliberately want it reachable from elsewhere.
 
 ## Importance Scoring
 

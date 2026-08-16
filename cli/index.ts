@@ -43,6 +43,9 @@ Options (start):
   -e, --embeddings <name>  Transformer model name, or 'hashed' for the
                            offline lexical embedder
       --rest-port <port>   Serve the REST API on this port
+      --rest-host <host>   Interface for the REST API to bind to
+                           (default: 127.0.0.1 — the API has no auth,
+                           so it stays loopback-only unless overridden)
 
 Examples:
   stenographer start ./conversation.jsonl

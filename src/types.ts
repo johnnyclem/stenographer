@@ -187,6 +187,13 @@ export interface StenographerConfig {
   supersedeThreshold?: number;
   /** Port for the REST API. Defaults to 8787 in daemon mode, off otherwise. */
   restPort?: number;
+  /**
+   * Host/interface for the REST API to bind to. Defaults to `127.0.0.1` —
+   * the API has no authentication, so it stays loopback-only unless the
+   * operator explicitly opts into wider exposure (e.g. `0.0.0.0` in a
+   * container reached only through a trusted network boundary).
+   */
+  restHost?: string;
   /** Reserved for Tier-1 model-based extraction (roadmap). */
   extractionThreshold?: number;
   /** Reserved (roadmap). */

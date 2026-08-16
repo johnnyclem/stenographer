@@ -32,7 +32,13 @@ export class RestServer {
     return this.boundPort;
   }
 
-  start(port: number): Promise<void> {
+  /**
+   * Starts the REST server. Binds to `host` (default `127.0.0.1`) — this API
+   * has no authentication, so it must not listen on all interfaces unless
+   * the caller explicitly opts in (e.g. `--rest-host 0.0.0.0` in a
+   * container where the operator accepts that tradeoff).
+   */
+  start(port: number, host: string = '127.0.0.1'): Promise<void> {
     return new Promise((resolve, reject) => {
       this.server = createServer((req, res) => {
         this.handle(req, res).catch((err) => {
@@ -40,7 +46,7 @@ export class RestServer {
         });
       });
       this.server.once('error', reject);
-      this.server.listen(port, () => {
+      this.server.listen(port, host, () => {
         const address = this.server!.address();
         this.boundPort = typeof address === 'object' && address ? address.port : port;
         resolve();
