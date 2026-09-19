@@ -2,6 +2,7 @@
 
 **To:** the short-hand maintainer
 **From:** stenographer (TB/UV v2 shipped in [PR #7](https://github.com/johnnyclem/stenographer/pull/7), merged 2026-09-19)
+**Companion doc:** [`handoff-smallchat.md`](./handoff-smallchat.md) covers the dispatch-table integration for smallchat.
 **Why you're getting this:** the TB/UV v2 PRD reserved one decision that lands on your desk (§13 Q6): short-hand's compaction levels and this ledger are solving adjacent problems. Whether the ledger eventually *is* short-hand's L4, or they stay separate tools, is out of scope for v2 — but you now need enough context to weigh in, and this doc is that context.
 
 ---
