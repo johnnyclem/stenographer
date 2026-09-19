@@ -33,4 +33,20 @@ export {
   type QueryContext,
   type RetrievedChunk,
 } from './indexer/graphrag.js';
+export {
+  TruthLedger,
+  TruthWriteError,
+  ContemptError,
+  type WriteContext,
+  type TruthFilter,
+} from './truth/ledger.js';
+export {
+  exportWikiEntries,
+  importWikiEntries,
+  entryToWikiLine,
+  wikiLineToEntry,
+  type WikiEntryLine,
+  type ImportResult,
+} from './truth/wiki.js';
+export * from './truth/types.js';
 export * from './types.js';

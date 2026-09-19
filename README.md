@@ -90,6 +90,24 @@ By default, Stenographer downloads a ~25MB embedding model on first run and does
 | `get_context_frame` | Build token-budgeted context |
 | `get_status` | Statistics, vector backend, mode |
 
+### Truth-layer tools (TB/UV v2)
+
+| Tool | Description |
+|------|-------------|
+| `list_proposals` | The review inbox: machine-drafted candidates awaiting sign/dismiss |
+| `sign_proposal` | Mint a TB/UV from a proposal under an accountable signer (`edits` supported) |
+| `dismiss_proposal` | Dismiss with a required reason (kept as detector training data) |
+| `assert_tombstone` | Direct TB for authors who already know — evidence required |
+| `assert_uv` | Assert an unverified belief with a machine-actionable `verifyBy`; `contests` disputes a TB |
+| `resolve_uv` | Verify/refute a UV with evidence; `command` evidence self-signs |
+| `override_tombstone` | The force path: override a TB with a proven addendum |
+| `get_verification_queue` | Open UVs ranked for opportunistic verification |
+| `get_contested` | All TB+UV disputes |
+| `get_truth` / `search_truth` | Truth entries by filter / by embedding relevance |
+| `file_ruling` | Strike, promotion, or contempt ruling with a written opinion |
+| `export_wiki_entries` / `import_wiki_entries` | Lossless team llm-wiki JSONL interop |
+| `backfill_legacy_tombstones` | Phase-1 migration of pre-assertion supersessions |
+
 ## REST API (daemon mode or `--rest-port`)
 
 ```
@@ -129,6 +147,28 @@ produces:
 - a tombstone: what was superseded, what corrected it, why, and the triggering message
 
 Matching uses embedding similarity (`supersedeThreshold`, default 0.45, calibrated for MiniLM: rewrites of the same decision score ~0.46–0.94, unrelated decisions ~0.06). `get_decision_chain` walks any chain oldest → current.
+
+## Asserted Truth Layer (TB/UV v2)
+
+The tombstone pipeline is split into **detection** (automatic, proposal-only) and **assertion** (accountable, signed). Machines detect; authors assert — no inferred write ever lands as truth.
+
+Five record types live in one append-only ledger (`truth_entries`, mirrored to wiki JSONL):
+
+- **`TB`** — asserted tombstone: a prior statement is provably stale/wrong. Requires evidence and a signer.
+- **`UV`** — unverified assertion ("there be dragons"): believed true, stated before verification exists, with a machine-actionable `verifyBy` hint.
+- **`PROPOSAL`** — what the supersession detector now emits. Signing mints the TB/UV; dismissing costs nothing, so thresholds can be tuned for recall.
+- **`ADDENDUM`** — evidence attached after the fact (UV resolutions, TB overrides).
+- **`RULING`** — a signed judgment with a required written opinion: `strike` (inadmissible, never deleted), `promotion` (evidence ruled sufficient), `contempt` (self-corroboration called out — mints one conduct TB, no karma system).
+
+**Override protocol** (force semantics, enforced at the storage layer): flipping an active TB requires either a contesting UV (`contests` — TB becomes `contested` but stays truth) or a proven addendum with evidence (`overrides`). There is no third path, and no path at all for anonymous writes — generic identities (`system`, `assistant`, …) are rejected at the schema level.
+
+**Contempt of corpus**: corroboration must be provenance-independent. A `verifies`/`signs` whose actor shares the author or agent session of its target is rejected at write time — three subagents affirming their parent's UV is one opinion wearing three hats.
+
+**Rollout** is governed by `truthMode`:
+- `shadow` (default, Phase 0): auto-close keeps working *and* every detection lands as a proposal — observe quality, tune.
+- `assert` (Phase 1): auto-close is disabled; detection is proposal-only, and signing a proposal is what closes the superseded decision. `backfill_legacy_tombstones` migrates pre-assertion supersessions as queryably second-class TBs (`author: migration`).
+
+Downstream consumers get the confidence type in every result, with the consumption rules embedded in the tool descriptions: active TB = ground truth; contested TB = truth with a visible asterisk; open UV = **flag, don't block**; refuted/overridden = history, never citable.
 
 ## GraphRAG Search
 
