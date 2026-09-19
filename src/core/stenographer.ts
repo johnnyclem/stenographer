@@ -14,6 +14,22 @@ import { ImportanceDetector, extractStructure } from '../indexer/importance.js';
 import { GraphRAGRetriever, type QueryContext, type RetrievedChunk } from '../indexer/graphrag.js';
 import { createEmbedder, cosineSimilarity, type Embedder } from '../indexer/embeddings.js';
 import { RestServer } from '../api/rest.js';
+import {
+  exportWikiEntries,
+  importWikiEntries,
+  type ImportResult,
+} from '../truth/wiki.js';
+import type { TruthFilter } from '../truth/ledger.js';
+import type {
+  Evidence,
+  VerifyBy,
+  TbEntry,
+  UvEntry,
+  ProposalEntry,
+  AddendumEntry,
+  RulingEntry,
+  ProposalBody,
+} from '../truth/types.js';
 import type {
   StenographerAPI,
   StenographerConfig,
@@ -30,6 +46,9 @@ import type {
 const DEFAULT_SUPERSEDE_THRESHOLD = 0.45;
 const DEFAULT_DAEMON_REST_PORT = 8787;
 
+/** Registered identity for the embedding-similarity supersession detector. */
+const DETECTOR_AUTHOR = 'detector:supersession';
+
 export class Stenographer implements StenographerAPI {
   readonly config: StenographerConfig;
   readonly store: StateStore;
@@ -43,6 +62,7 @@ export class Stenographer implements StenographerAPI {
   private sessionId: string;
   private indexing: Promise<void> = Promise.resolve();
   private supersedeThreshold: number;
+  private truthMode: 'shadow' | 'assert';
 
   constructor(config: StenographerConfig) {
     this.config = config;
@@ -51,6 +71,7 @@ export class Stenographer implements StenographerAPI {
     this.detector = new ImportanceDetector();
     this.retriever = new GraphRAGRetriever();
     this.supersedeThreshold = config.supersedeThreshold ?? DEFAULT_SUPERSEDE_THRESHOLD;
+    this.truthMode = config.truthMode ?? 'shadow';
   }
 
   /** Session scope for queries: single session in file modes, all in watch mode. */
@@ -288,16 +309,22 @@ export class Stenographer implements StenographerAPI {
     });
 
     if (match) {
-      this.store.supersedeDecision(match.id, newId);
-      this.store.addTombstone(sessionId, {
-        id: `tombstone_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-        superseded: match.description,
-        correctedTo: description,
-        reason: 'Superseded by newer decision',
-        sourceMessageId: msg.id,
-        supersededDecisionId: match.id,
-        timestamp: msg.timestamp,
-      });
+      // Detection is proposal-only: the detector may never write truth.
+      this.writeSupersessionProposal(sessionId, match, { id: newId, description }, msg);
+
+      if (this.truthMode === 'shadow') {
+        // Phase 0: auto-close continues alongside proposals
+        this.store.supersedeDecision(match.decision.id, newId);
+        this.store.addTombstone(sessionId, {
+          id: `tombstone_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+          superseded: match.decision.description,
+          correctedTo: description,
+          reason: 'Superseded by newer decision',
+          sourceMessageId: msg.id,
+          supersededDecisionId: match.decision.id,
+          timestamp: msg.timestamp,
+        });
+      }
     }
   }
 
@@ -310,31 +337,100 @@ export class Stenographer implements StenographerAPI {
 
     let supersededDecisionId: string | undefined;
     let supersededText = '';
+    let newId: string | undefined;
 
     if (match) {
       // The correction is the fresher version of a settled decision:
-      // record it as a new decision and close the old one onto it.
-      const newId = `decision_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      // record it as a new decision; closing the old one is truth-mode-gated.
+      newId = `decision_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
       this.store.addDecision(sessionId, {
         id: newId,
         description: correctedStatement,
         sourceMessageId: msg.id,
         timestamp: msg.timestamp,
       });
-      this.store.supersedeDecision(match.id, newId);
-      supersededDecisionId = match.id;
-      supersededText = match.description;
+      this.writeSupersessionProposal(
+        sessionId,
+        match,
+        { id: newId, description: correctedStatement },
+        msg
+      );
+      supersededDecisionId = match.decision.id;
+      supersededText = match.decision.description;
     }
 
-    this.store.addTombstone(sessionId, {
-      id: `tombstone_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-      superseded: supersededText,
-      correctedTo: correctedStatement,
-      reason: match ? 'Correction superseded prior decision' : 'Correction detected',
-      sourceMessageId: msg.id,
-      supersededDecisionId,
-      timestamp: msg.timestamp,
-    });
+    if (this.truthMode === 'shadow') {
+      // Phase 0: legacy auto-close + inferred tombstone continue
+      if (match && newId) {
+        this.store.supersedeDecision(match.decision.id, newId);
+      }
+      this.store.addTombstone(sessionId, {
+        id: `tombstone_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        superseded: supersededText,
+        correctedTo: correctedStatement,
+        reason: match ? 'Correction superseded prior decision' : 'Correction detected',
+        sourceMessageId: msg.id,
+        supersededDecisionId,
+        timestamp: msg.timestamp,
+      });
+    } else if (!match) {
+      // Assert mode, unmatched correction: still worth a reviewable proposal
+      this.store.truth.addProposal(
+        {
+          kind: 'tombstone',
+          draft: {
+            claim: `Correction detected: ${correctedStatement}`,
+            evidence: [{ kind: 'message', ref: msg.id, detail: correctedStatement }],
+          },
+          signal: { source: 'supersession-detector', detail: 'correction pattern, no matching decision' },
+          targetRef: `correction:${msg.id}`,
+        },
+        {
+          author: DETECTOR_AUTHOR,
+          provenance: { kind: 'sourceMessageId', ref: msg.id },
+          timestamp: msg.timestamp,
+        }
+      );
+    }
+  }
+
+  /**
+   * Writes a PROPOSAL(kind: tombstone) for a detected supersession — the
+   * detector's only write surface into the truth layer. Signing it (an
+   * accountable author) is what closes the superseded decision in assert
+   * mode; dismissing it costs nothing.
+   */
+  private writeSupersessionProposal(
+    sessionId: string,
+    match: { decision: IndexedDecision; score: number },
+    successor: { id: string; description: string },
+    msg: ConversationMessage
+  ): void {
+    this.store.truth.addProposal(
+      {
+        kind: 'tombstone',
+        draft: {
+          claim: `"${match.decision.description}" is superseded by "${successor.description}"`,
+          evidence: [{ kind: 'message', ref: msg.id, detail: successor.description }],
+        },
+        signal: {
+          source: 'supersession-detector',
+          score: match.score,
+          threshold: this.supersedeThreshold,
+        },
+        targetRef: match.decision.id,
+        meta: {
+          supersededDecisionId: match.decision.id,
+          successorDecisionId: successor.id,
+          sessionId,
+        },
+      },
+      {
+        author: DETECTOR_AUTHOR,
+        provenance: { kind: 'sourceMessageId', ref: msg.id },
+        timestamp: msg.timestamp,
+      }
+    );
   }
 
   /** Finds the active decision most similar to the given text, if above threshold. */
@@ -342,7 +438,7 @@ export class Stenographer implements StenographerAPI {
     sessionId: string,
     text: string,
     excludeSourceMessageId?: string
-  ): Promise<IndexedDecision | null> {
+  ): Promise<{ decision: IndexedDecision; score: number } | null> {
     // A message never supersedes decisions it asserted itself
     const active = this.store
       .getActiveDecisions(sessionId)
@@ -362,7 +458,9 @@ export class Stenographer implements StenographerAPI {
       }
     }
 
-    return bestScore >= this.supersedeThreshold ? best : null;
+    return best && bestScore >= this.supersedeThreshold
+      ? { decision: best, score: bestScore }
+      : null;
   }
 
   // ─────────────────────────────────────────────────────────
@@ -478,6 +576,283 @@ export class Stenographer implements StenographerAPI {
     tombstones: number;
   }> {
     return this.store.getStats(this.scope);
+  }
+
+  // ─────────────────────────────────────────────────────────
+  // TB/UV v2 — Asserted truth layer
+  // ─────────────────────────────────────────────────────────
+
+  private async ensureEmbedder(): Promise<Embedder> {
+    if (!this.embedder) {
+      this.embedder = await createEmbedder(this.config.embeddingModel);
+    }
+    return this.embedder;
+  }
+
+  getTruthMode(): 'shadow' | 'assert' {
+    return this.truthMode;
+  }
+
+  /** The review inbox. */
+  async listProposals(
+    status?: ProposalBody['status'],
+    kind?: ProposalBody['kind']
+  ): Promise<ProposalEntry[]> {
+    return this.store.truth.listProposals(status, kind);
+  }
+
+  /**
+   * Mints the TB/UV from a proposal under an accountable signer, and closes
+   * the superseded decision the proposal targeted (idempotent in shadow
+   * mode, where auto-close already did it).
+   */
+  async signProposal(
+    proposalId: string,
+    signedBy: string,
+    edits?: Record<string, unknown>,
+    agentSessionId?: string
+  ): Promise<TbEntry | UvEntry> {
+    const proposal = this.store.truth.getEntry(proposalId) as ProposalEntry | null;
+    const draft = { ...(proposal?.body.draft ?? {}), ...(edits ?? {}) };
+    const text = (draft.claim as string) ?? (draft.assertion as string) ?? '';
+    const embedding = text ? await (await this.ensureEmbedder()).embed(text) : undefined;
+
+    const entry = this.store.truth.signProposal(proposalId, signedBy, edits, {
+      embedding,
+      agentSessionId,
+    });
+
+    const meta = proposal?.body.meta;
+    if (meta?.supersededDecisionId && meta?.successorDecisionId) {
+      this.store.supersedeDecision(
+        meta.supersededDecisionId as string,
+        meta.successorDecisionId as string
+      );
+    }
+    return entry;
+  }
+
+  async dismissProposal(
+    proposalId: string,
+    dismissedBy: string,
+    reason: string
+  ): Promise<ProposalEntry> {
+    return this.store.truth.dismissProposal(proposalId, dismissedBy, reason);
+  }
+
+  /** Direct TB, skipping the proposal path — for authors who already know. */
+  async assertTombstone(input: {
+    claim: string;
+    evidence: Evidence[];
+    signedBy: string;
+    author?: string;
+    agentSessionId?: string;
+  }): Promise<TbEntry> {
+    const embedding = await (await this.ensureEmbedder()).embed(input.claim);
+    return this.store.truth.assertTombstone(
+      { claim: input.claim, evidence: input.evidence, signedBy: input.signedBy },
+      {
+        author: input.author ?? input.signedBy,
+        agentSessionId: input.agentSessionId ?? null,
+        embedding,
+      }
+    );
+  }
+
+  async assertUv(input: {
+    assertion: string;
+    basis: string;
+    verifyBy: VerifyBy;
+    contests?: string;
+    author: string;
+    agentSessionId?: string;
+  }): Promise<UvEntry> {
+    const embedding = await (await this.ensureEmbedder()).embed(input.assertion);
+    return this.store.truth.assertUv(
+      {
+        assertion: input.assertion,
+        basis: input.basis,
+        verifyBy: input.verifyBy,
+        contests: input.contests,
+      },
+      { author: input.author, agentSessionId: input.agentSessionId ?? null, embedding }
+    );
+  }
+
+  async resolveUv(
+    uvId: string,
+    resolution: 'verified' | 'refuted',
+    evidence: Evidence[],
+    opts: {
+      author: string;
+      signedBy?: string;
+      opinion?: string;
+      mintTombstone?: string;
+      agentSessionId?: string;
+    }
+  ): Promise<{
+    uv: UvEntry;
+    addendum: AddendumEntry;
+    tombstone: TbEntry | null;
+    ruling: RulingEntry | null;
+  }> {
+    const uv = this.store.truth.getEntry(uvId) as UvEntry | null;
+    const embedding = uv
+      ? await (await this.ensureEmbedder()).embed(uv.body.assertion)
+      : undefined;
+    return this.store.truth.resolveUv(uvId, resolution, evidence, {
+      author: opts.author,
+      signedBy: opts.signedBy,
+      opinion: opts.opinion,
+      mintTombstone: opts.mintTombstone,
+      agentSessionId: opts.agentSessionId ?? null,
+      embedding,
+    });
+  }
+
+  /** The force path — fails without evidence. */
+  async overrideTombstone(
+    tbId: string,
+    addendum: { evidence: Evidence[]; note?: string },
+    opts: { author: string; agentSessionId?: string }
+  ): Promise<{ tombstone: TbEntry; addendum: AddendumEntry }> {
+    return this.store.truth.overrideTombstone(tbId, addendum, {
+      author: opts.author,
+      agentSessionId: opts.agentSessionId ?? null,
+    });
+  }
+
+  async fileRuling(input: {
+    kind: 'strike' | 'promotion' | 'contempt';
+    opinion: string;
+    target: string;
+    author: string;
+    agentSessionId?: string;
+  }): Promise<{ ruling: RulingEntry; conductTombstone: TbEntry | null }> {
+    return this.store.truth.fileRuling(
+      { kind: input.kind, opinion: input.opinion, target: input.target },
+      { author: input.author, agentSessionId: input.agentSessionId ?? null }
+    );
+  }
+
+  /**
+   * Open UVs ranked for opportunistic verification (§6): contested pairs
+   * first, then relevance to the caller's working context, then age.
+   * `ask`-shaped UVs are deprioritized for agents — they surface in
+   * human-facing views instead. (Reference frequency, the PRD's second
+   * criterion, needs retrieval tracking — a fast-follow.)
+   */
+  async getVerificationQueue(
+    context?: string,
+    k: number = 10
+  ): Promise<Array<UvEntry & { queueRank: { contesting: boolean; relevance: number; deprioritized: boolean } }>> {
+    const uvs = this.store.truth.getOpenUvs();
+    const ctxEmbedding = context ? await (await this.ensureEmbedder()).embed(context) : null;
+
+    const scored = uvs.map((uv) => {
+      const contesting = Boolean(uv.body.contests);
+      const relevance =
+        ctxEmbedding && uv.embedding ? cosineSimilarity(ctxEmbedding, uv.embedding) : 0;
+      const deprioritized = uv.body.verifyBy.kind === 'ask';
+      return { uv, contesting, relevance, deprioritized };
+    });
+
+    scored.sort(
+      (a, b) =>
+        Number(b.contesting) - Number(a.contesting) ||
+        Number(a.deprioritized) - Number(b.deprioritized) ||
+        b.relevance - a.relevance ||
+        a.uv.createdAt.localeCompare(b.uv.createdAt)
+    );
+
+    return scored.slice(0, k).map(({ uv, contesting, relevance, deprioritized }) => {
+      const { embedding: _drop, ...entry } = uv;
+      return { ...entry, queueRank: { contesting, relevance, deprioritized } };
+    });
+  }
+
+  /** All TB+UV disputes, for humans and dashboards. */
+  async getContestedTruth(): Promise<Array<{ tombstone: TbEntry; contestedBy: UvEntry[] }>> {
+    return this.store.truth.getContested();
+  }
+
+  /** Truth entries by filter; ties between TB and UV break toward the TB. */
+  async getTruth(filter: TruthFilter = 'current'): Promise<Array<TbEntry | UvEntry>> {
+    return this.store.truth.getTruth(filter).map(({ embedding: _drop, ...entry }) => entry);
+  }
+
+  /**
+   * Truth entries relevant to a query, ranked by embedding similarity.
+   * Ties between a TB and a UV covering the same subject break toward the
+   * TB; UVs are not down-weighted into invisibility — the dragon marker
+   * only works if you can see it.
+   */
+  async searchTruth(
+    query: string,
+    k: number = 5,
+    filter: TruthFilter = 'current'
+  ): Promise<Array<(TbEntry | UvEntry) & { relevance: number }>> {
+    const entries = this.store.truth.getTruth(filter);
+    if (entries.length === 0) return [];
+    const queryEmbedding = await (await this.ensureEmbedder()).embed(query);
+
+    return entries
+      .map((entry) => {
+        const { embedding, ...rest } = entry;
+        const relevance = embedding ? cosineSimilarity(queryEmbedding, embedding) : 0;
+        return { ...rest, relevance };
+      })
+      .sort(
+        (a, b) =>
+          b.relevance - a.relevance ||
+          // Equal relevance: the asserted, proven record wins the tie
+          Number(b.type === 'TB') - Number(a.type === 'TB')
+      )
+      .slice(0, k);
+  }
+
+  async getTruthStats(): Promise<{
+    tombstones: number;
+    uvs: number;
+    openUvs: number;
+    openProposals: number;
+    contested: number;
+    rulings: number;
+  }> {
+    return this.store.truth.getStats();
+  }
+
+  /** §8 export: signed truth only, x-steno namespaced extras. */
+  async exportWikiEntries(options: { since?: string; path?: string } = {}): Promise<{
+    lines: string[];
+    count: number;
+  }> {
+    return exportWikiEntries(this.store.truth, options);
+  }
+
+  /** §8 import: wiki entries keep their ids/authors; conflicts become proposals. */
+  async importWikiEntries(input: { path?: string; lines?: string[] }): Promise<ImportResult> {
+    return importWikiEntries(this.store.truth, input);
+  }
+
+  /**
+   * Phase 1 backfill: existing auto-closed supersessions become queryably
+   * second-class TBs (author 'migration', signedBy null). No history is
+   * rewritten; each can be re-signed or contested like anything else.
+   */
+  async backfillLegacyTombstones(): Promise<number> {
+    let count = 0;
+    for (const legacy of this.store.getTombstones(null)) {
+      const entry = this.store.truth.backfillLegacyTombstone({
+        id: legacy.id,
+        superseded: legacy.superseded,
+        correctedTo: legacy.correctedTo,
+        reason: legacy.reason,
+        timestamp: legacy.timestamp,
+      });
+      if (entry) count++;
+    }
+    return count;
   }
 }
 

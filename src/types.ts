@@ -185,6 +185,14 @@ export interface StenographerConfig {
   /** Cosine-similarity threshold above which a new decision/correction
    *  supersedes an existing active decision. Default 0.6. */
   supersedeThreshold?: number;
+  /**
+   * TB/UV v2 rollout mode for the asserted-truth ledger:
+   * - 'shadow' (default, Phase 0): the supersession detector keeps its
+   *   auto-close behavior AND writes PROPOSALs to the truth ledger.
+   * - 'assert' (Phase 1): auto-close is disabled; detection is
+   *   proposal-only and truth requires an accountable signer.
+   */
+  truthMode?: 'shadow' | 'assert';
   /** Port for the REST API. Defaults to 8787 in daemon mode, off otherwise. */
   restPort?: number;
   /**

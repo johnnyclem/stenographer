@@ -10,6 +10,7 @@
 import Database from 'better-sqlite3';
 import * as sqliteVec from 'sqlite-vec';
 import { cosineSimilarity, EMBEDDING_DIMENSIONS } from '../indexer/embeddings.js';
+import { TruthLedger } from '../truth/ledger.js';
 import type {
   IndexedMessage,
   IndexedDecision,
@@ -26,6 +27,7 @@ export class StateStore {
   private db: Database.Database;
   private dimensions: number;
   private vecEnabled: boolean = false;
+  private truthLedger: TruthLedger | null = null;
 
   constructor(dbPath: string, options: StateStoreOptions = {}) {
     this.db = new Database(dbPath);
@@ -45,6 +47,14 @@ export class StateStore {
   /** Whether vector search is index-backed (sqlite-vec) or brute-force. */
   get vectorSearchBackend(): 'sqlite-vec' | 'brute-force' {
     return this.vecEnabled ? 'sqlite-vec' : 'brute-force';
+  }
+
+  /** The append-only asserted-truth ledger (TB/UV v2), on the same database. */
+  get truth(): TruthLedger {
+    if (!this.truthLedger) {
+      this.truthLedger = new TruthLedger(this.db);
+    }
+    return this.truthLedger;
   }
 
   private init(): void {
