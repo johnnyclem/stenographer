@@ -170,6 +170,8 @@ Five record types live in one append-only ledger (`truth_entries`, mirrored to w
 
 Downstream consumers get the confidence type in every result, with the consumption rules embedded in the tool descriptions: active TB = ground truth; contested TB = truth with a visible asterisk; open UV = **flag, don't block**; refuted/overridden = history, never citable.
 
+**Proposal intake** (`importProposalDrafts`): external tools — today [short-hand](https://github.com/johnnyclem/short-hand)'s compactor, which exports its L4 candidate invariants and detected corrections as draft JSONL — can file candidates into the ledger. Every line lands as a `PROPOSAL` under a detector identity (`detector:short-hand`); there is no external write path to TB or UV, the detector cannot sign its own intake, and `targetRef` dedupe makes re-imports idempotent. This is the Option B seam from the TB/UV v2 handoff (§13 Q6): format-level interop, no code dependency in either direction.
+
 ## GraphRAG Search
 
 The `search_conversation` tool performs **hybrid retrieval**:

@@ -174,7 +174,12 @@ export interface ProposalBody {
   draft: Record<string, unknown>;
   /** What triggered it (embedding score + threshold, sync scan diff, manual flag). */
   signal: {
-    source: 'supersession-detector' | 'sync-scan' | 'manual-flag' | 'wiki-reconciliation';
+    source:
+      | 'supersession-detector'
+      | 'sync-scan'
+      | 'manual-flag'
+      | 'wiki-reconciliation'
+      | 'compaction-candidate';
     score?: number;
     threshold?: number;
     detail?: string;
