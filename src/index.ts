@@ -48,5 +48,10 @@ export {
   type WikiEntryLine,
   type ImportResult,
 } from './truth/wiki.js';
+export {
+  importProposalDrafts,
+  COMPACTION_DETECTOR,
+  type IntakeResult,
+} from './truth/intake.js';
 export * from './truth/types.js';
 export * from './types.js';
