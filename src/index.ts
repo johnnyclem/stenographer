@@ -53,5 +53,14 @@ export {
   COMPACTION_DETECTOR,
   type IntakeResult,
 } from './truth/intake.js';
+export {
+  ObjectionLog,
+  findLiteralHits,
+  assertedText,
+  type Objection,
+  type ObjectionMode,
+  type ObjectionStatus,
+  type ObjectionStats,
+} from './truth/objections.js';
 export * from './truth/types.js';
 export * from './types.js';

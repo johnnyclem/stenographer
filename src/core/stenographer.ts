@@ -20,6 +20,7 @@ import {
   type ImportResult,
 } from '../truth/wiki.js';
 import type { TruthFilter } from '../truth/ledger.js';
+import type { Objection, ObjectionMode, ObjectionStatus, ObjectionStats } from '../truth/objections.js';
 import type {
   Evidence,
   VerifyBy,
@@ -29,6 +30,7 @@ import type {
   AddendumEntry,
   RulingEntry,
   ProposalBody,
+  TombstonedLiteral,
 } from '../truth/types.js';
 import type {
   StenographerAPI,
@@ -63,6 +65,7 @@ export class Stenographer implements StenographerAPI {
   private indexing: Promise<void> = Promise.resolve();
   private supersedeThreshold: number;
   private truthMode: 'shadow' | 'assert';
+  private objectionMode: ObjectionMode;
 
   constructor(config: StenographerConfig) {
     this.config = config;
@@ -72,6 +75,7 @@ export class Stenographer implements StenographerAPI {
     this.retriever = new GraphRAGRetriever();
     this.supersedeThreshold = config.supersedeThreshold ?? DEFAULT_SUPERSEDE_THRESHOLD;
     this.truthMode = config.truthMode ?? 'shadow';
+    this.objectionMode = config.objectionMode ?? 'shadow';
   }
 
   /** Session scope for queries: single session in file modes, all in watch mode. */
@@ -271,6 +275,20 @@ export class Stenographer implements StenographerAPI {
       importanceScore: score,
       entityIds: extracted.entities.map((e) => e.name),
     });
+
+    // Real-time objections (§12): opposing counsel reads the same stream.
+    // Catch-up replays history, so its objections are recorded for shadow
+    // judging but never delivered as if they were live.
+    try {
+      this.store.objections.scan(
+        msg,
+        sessionId,
+        this.objectionMode === 'deliver' && this.config.mode === 'catchup' ? 'shadow' : this.objectionMode
+      );
+    } catch (err) {
+      // Counsel failing must never cost the record
+      console.error(`Objection scan failed for message ${msg.id}:`, err);
+    }
 
     // Decisions: append-only with supersession. A new decision close enough
     // to an active one is a fresher version of the same fact — the old
@@ -645,12 +663,13 @@ export class Stenographer implements StenographerAPI {
     claim: string;
     evidence: Evidence[];
     signedBy: string;
+    literals?: TombstonedLiteral[];
     author?: string;
     agentSessionId?: string;
   }): Promise<TbEntry> {
     const embedding = await (await this.ensureEmbedder()).embed(input.claim);
     return this.store.truth.assertTombstone(
-      { claim: input.claim, evidence: input.evidence, signedBy: input.signedBy },
+      { claim: input.claim, evidence: input.evidence, signedBy: input.signedBy, literals: input.literals },
       {
         author: input.author ?? input.signedBy,
         agentSessionId: input.agentSessionId ?? null,
@@ -820,6 +839,53 @@ export class Stenographer implements StenographerAPI {
     rulings: number;
   }> {
     return this.store.truth.getStats();
+  }
+
+  // ─────────────────────────────────────────────────────────
+  // Real-time objections (§12)
+  // ─────────────────────────────────────────────────────────
+
+  getObjectionMode(): ObjectionMode {
+    return this.objectionMode;
+  }
+
+  /** Objections emitted on /flags; `includeShadow` adds the would-have-beens. */
+  async getObjections(
+    options: { since?: string; status?: ObjectionStatus; includeShadow?: boolean; limit?: number } = {}
+  ): Promise<Objection[]> {
+    return this.store.objections.list(options);
+  }
+
+  /**
+   * The judge rules. Sustained lands in the record as corroboration for
+   * the TB; overruled is signal for tightening the matcher. Either way the
+   * ruling is an ordinary RULING in the ledger, with a written opinion.
+   */
+  async ruleOnObjection(
+    objectionId: string,
+    outcome: 'sustained' | 'overruled',
+    opts: { author: string; opinion: string; agentSessionId?: string }
+  ): Promise<{ objection: Objection; ruling: RulingEntry }> {
+    const objection = this.store.objections.get(objectionId);
+    if (!objection) throw new Error(`no such objection: ${objectionId}`);
+    if (objection.status !== 'pending') {
+      throw new Error(`objection ${objectionId} was already ${objection.status}`);
+    }
+    const ruling = this.store.truth.fileObjectionRuling(
+      { objectionId, tbId: objection.tbId, outcome, opinion: opts.opinion },
+      {
+        author: opts.author,
+        agentSessionId: opts.agentSessionId ?? null,
+        provenance: { kind: 'sourceMessageId', ref: objection.messageId },
+      }
+    );
+    this.store.objections.markRuled(objectionId, outcome, ruling.id);
+    return { objection: this.store.objections.get(objectionId)!, ruling };
+  }
+
+  /** The tuning dial: a falling sustain rate means tighten the matcher. */
+  async getObjectionStats(): Promise<ObjectionStats & { mode: ObjectionMode }> {
+    return { ...this.store.objections.stats(), mode: this.objectionMode };
   }
 
   /** §8 export: signed truth only, x-steno namespaced extras. */

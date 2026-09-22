@@ -11,6 +11,7 @@
  *   GET /decisions/history    (full supersession history)
  *   GET /decisions/:id/chain  (one supersession chain, oldest first)
  *   GET /tombstones
+ *   GET /flags?since=<id>&status=pending&include=shadow  (real-time objections, §12)
  *   GET /search?q=...&k=5     (semantic vector search)
  *   GET /graphrag?q=...&k=5&depth=2  (hybrid vector + graph search)
  *   GET /context-frame?budget=2000
@@ -111,6 +112,27 @@ export class RestServer {
       case '/tombstones':
         sendJson(res, 200, await this.engine.getTombstones());
         return;
+
+      case '/flags': {
+        // Pull transport: consumers poll with the last id they saw. SSE vs
+        // webhook push is an open question (§14.8); both can layer on this.
+        const status = url.searchParams.get('status');
+        if (status && !['pending', 'sustained', 'overruled'].includes(status)) {
+          sendJson(res, 400, { error: `Invalid status: ${status}` });
+          return;
+        }
+        sendJson(
+          res,
+          200,
+          await this.engine.getObjections({
+            since: url.searchParams.get('since') ?? undefined,
+            status: (status as 'pending' | 'sustained' | 'overruled' | null) ?? undefined,
+            includeShadow: url.searchParams.get('include') === 'shadow',
+            limit: intParam(url, 'limit', 100),
+          })
+        );
+        return;
+      }
 
       case '/search': {
         const q = url.searchParams.get('q');

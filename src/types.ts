@@ -193,6 +193,15 @@ export interface StenographerConfig {
    *   proposal-only and truth requires an accountable signer.
    */
   truthMode?: 'shadow' | 'assert';
+  /**
+   * Real-time objections (§12, Phase 5): assistant output asserting a
+   * tombstoned literal raises an objection citing the TB.
+   * - 'shadow' (default): objections are recorded and rulable (for shadow
+   *   judging against MR catches) but never emitted on /flags.
+   * - 'deliver': objections are emitted on GET /flags.
+   * - 'off': the detector doesn't run.
+   */
+  objectionMode?: 'off' | 'shadow' | 'deliver';
   /** Port for the REST API. Defaults to 8787 in daemon mode, off otherwise. */
   restPort?: number;
   /**

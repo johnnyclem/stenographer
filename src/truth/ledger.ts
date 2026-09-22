@@ -31,6 +31,7 @@ import {
   type UvBody,
   type ProposalBody,
   type VerifyBy,
+  type TombstonedLiteral,
 } from './types.js';
 
 export class TruthWriteError extends Error {}
@@ -52,6 +53,8 @@ const MANUAL: Provenance = { kind: 'manual' };
 
 export class TruthLedger {
   private db: Database.Database;
+  /** Bumped on every write through this instance — cheap cache invalidation. */
+  private writes = 0;
 
   constructor(db: Database.Database) {
     this.db = db;
@@ -130,10 +133,22 @@ export class TruthLedger {
     }
   }
 
+  /**
+   * Changes whenever the ledger may have changed: in-process writes bump
+   * the counter, and SQLite's data_version moves on commits from other
+   * connections. Caches over the ledger (e.g. the active-TB cache for
+   * objections) compare this instead of re-querying.
+   */
+  generation(): string {
+    const dataVersion = this.db.pragma('data_version', { simple: true }) as number;
+    return `${this.writes}:${dataVersion}`;
+  }
+
   private insertEntry(
     entry: Omit<TruthEntry, 'links'>,
     embedding?: number[]
   ): void {
+    this.writes++;
     const status = (entry.body as { status?: string }).status ?? null;
     const targetRef = (entry.body as { targetRef?: string | null }).targetRef ?? null;
     this.db
@@ -160,6 +175,7 @@ export class TruthLedger {
   }
 
   private addLink(fromId: string, toId: string, type: LinkType): void {
+    this.writes++;
     this.db
       .prepare('INSERT OR IGNORE INTO truth_links (from_id, to_id, link_type) VALUES (?, ?, ?)')
       .run(fromId, toId, type);
@@ -167,6 +183,7 @@ export class TruthLedger {
 
   /** Derived-state cache update — only ever called inside a legal transition. */
   private setStatus(id: string, status: string): void {
+    this.writes++;
     // The body JSON is the exported record; keep its status in sync with the column.
     const row = this.db.prepare('SELECT body FROM truth_entries WHERE id = ?').get(id) as
       | { body: string }
@@ -300,6 +317,7 @@ export class TruthLedger {
     }
 
     const body = { ...proposal.body, status: 'dismissed' as const, dismissedBy, dismissReason: reason };
+    this.writes++;
     this.db
       .prepare('UPDATE truth_entries SET status = ?, body = ? WHERE id = ?')
       .run('dismissed', JSON.stringify(body), proposalId);
@@ -311,7 +329,7 @@ export class TruthLedger {
   // ─────────────────────────────────────────────────────────
 
   assertTombstone(
-    input: { claim: string; evidence: Evidence[]; signedBy: string },
+    input: { claim: string; evidence: Evidence[]; signedBy: string; literals?: TombstonedLiteral[] },
     ctx: WriteContext
   ): TbEntry {
     const parsed = TbInputSchema.parse(input);
@@ -329,7 +347,7 @@ export class TruthLedger {
   }
 
   private insertTb(
-    input: { claim: string; evidence: Evidence[]; signedBy: string },
+    input: { claim: string; evidence: Evidence[]; signedBy: string; literals?: TombstonedLiteral[] },
     ctx: WriteContext
   ): TbEntry {
     const id = ulid();
@@ -347,6 +365,8 @@ export class TruthLedger {
           evidence: input.evidence,
           signedBy: input.signedBy,
           status: 'active',
+          // Only present when given, so literal-free TBs keep their exact shape
+          ...(input.literals && input.literals.length > 0 ? { literals: input.literals } : {}),
         } satisfies TbBody,
       },
       ctx.embedding
@@ -597,6 +617,7 @@ export class TruthLedger {
         const target = this.mustGet(input.target);
         this.addLink(rulingId, target.id, 'strikes');
         // Inadmissible for retrieval; nothing is deleted — append-only holds
+        this.writes++;
         this.db.prepare('UPDATE truth_entries SET struck = 1 WHERE id = ?').run(target.id);
       } else if (input.kind === 'promotion') {
         this.mustGet(input.target);
@@ -621,6 +642,62 @@ export class TruthLedger {
       ruling: this.getEntry(rulingId) as RulingEntry,
       conductTombstone: tbId ? (this.getEntry(tbId) as TbEntry) : null,
     };
+  }
+
+  /**
+   * Ruling on a real-time objection (§12). The real-time layer feeds the
+   * same record — it does not get its own — so the judgment lands as an
+   * ordinary RULING targeting the TB: sustained is corroboration for the
+   * TB, overruled is signal for tightening the matcher. Neither changes
+   * the TB's status.
+   *
+   * No provenance-independence check: the corroborating evidence is the
+   * detector's catch in a transcript, not the ruler's word, so the
+   * operator who signed a TB may still rule on objections that cite it.
+   */
+  fileObjectionRuling(
+    input: { objectionId: string; tbId: string; outcome: 'sustained' | 'overruled'; opinion: string },
+    ctx: WriteContext
+  ): RulingEntry {
+    this.requireAccountable(ctx.author, 'ruling author');
+    if (!input.opinion || input.opinion.trim().length === 0) {
+      throw new TruthWriteError('a ruling requires a written opinion — rulings are precedent');
+    }
+    this.mustGetTyped<TbEntry>(input.tbId, 'TB');
+    const id = ulid();
+    this.insertEntry(
+      {
+        id,
+        type: 'RULING',
+        createdAt: ctx.timestamp ?? new Date().toISOString(),
+        author: ctx.author,
+        provenance: ctx.provenance ?? MANUAL,
+        agentSessionId: ctx.agentSessionId ?? null,
+        origin: 'local',
+        body: {
+          kind: 'objection',
+          opinion: input.opinion,
+          target: input.tbId,
+          objectionId: input.objectionId,
+          outcome: input.outcome,
+        },
+      },
+      ctx.embedding
+    );
+    return this.getEntry(id) as RulingEntry;
+  }
+
+  /** Active or contested TBs that carry matchable literals, excluding struck ones. */
+  getMatchableTombstones(): TbEntry[] {
+    const rows = this.db
+      .prepare(`
+        SELECT * FROM truth_entries
+        WHERE type = 'TB' AND status IN ('active','contested') AND struck = 0
+          AND json_array_length(json_extract(body, '$.literals')) > 0
+        ORDER BY created_at ASC
+      `)
+      .all() as any[];
+    return rows.map((r) => this.rowToEntry(r) as TbEntry);
   }
 
   private insertRuling(
