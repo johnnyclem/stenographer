@@ -10,11 +10,19 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { Stenographer } from '../core/stenographer.js';
 import { CONSUMPTION_RULES } from '../truth/types.js';
+import { createMcpChannelTransport, type ObjectionSinkConfig } from '../truth/delivery.js';
 import type { Evidence, VerifyBy, ProposalBody, TombstonedLiteral } from '../truth/types.js';
 import type { TruthFilter } from '../truth/ledger.js';
 import type { StenographerConfig, StenographerMode } from '../types.js';
 
 const VERSION = '0.1.0-alpha.2';
+
+/** Read by clients that support Claude Code channels (claude/channel). */
+const CHANNEL_INSTRUCTIONS =
+  'Events from the stenographer channel are real-time objections: something you just asserted contradicts a ' +
+  'signed tombstone (TB) in the truth ledger. Each cites the TB (the exhibit) and the transcript line. Treat the TB ' +
+  'as ground truth unless the objection says it is contested: correct course before continuing, and tell the user. ' +
+  'If the objection is wrong or immaterial, say so. Rule on it with rule_on_objection.';
 
 // ─────────────────────────────────────────────────────────────
 // MCP Server Implementation
@@ -29,7 +37,12 @@ export class StenographerServer {
 
     this.server = new Server(
       { name: 'stenographer', version: VERSION },
-      { capabilities: { tools: {} } }
+      {
+        // claude/channel: Claude Code's built-in channel protocol — lets this
+        // server push objections into the attached session as they're raised
+        capabilities: { tools: {}, experimental: { 'claude/channel': {} } },
+        instructions: CHANNEL_INSTRUCTIONS,
+      }
     );
 
     this.setupHandlers();
@@ -42,6 +55,18 @@ export class StenographerServer {
     // in this process must go to stderr)
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
+
+    // Objections go to the attached client as channel events the moment
+    // they're raised. Watch mode tails many sessions over one connection,
+    // so it can't know which objections belong to this client — skip there.
+    const { config } = this.engine;
+    if (config.objectionMcpChannel !== false && config.mode !== 'watch') {
+      this.engine.addObjectionTransport(
+        createMcpChannelTransport((params) =>
+          this.server.notification({ method: 'notifications/claude/channel', params })
+        )
+      );
+    }
   }
 
   stop(): void {
@@ -723,6 +748,10 @@ export async function runCLI(args: string[]): Promise<void> {
       'rest-host': { type: 'string' },
       embeddings: { type: 'string', short: 'e' },
       objections: { type: 'string' },
+      'objection-channel': { type: 'string', multiple: true },
+      'objection-webhook': { type: 'string', multiple: true },
+      'objection-batch-size': { type: 'string' },
+      'no-mcp-channel': { type: 'boolean' },
     },
     allowPositionals: true,
   });
@@ -742,6 +771,25 @@ export async function runCLI(args: string[]): Promise<void> {
     process.exit(1);
   }
 
+  // Webhook receivers (§14.8). Secrets come from the environment so they
+  // don't land in shell history or process listings.
+  const batchSize = values['objection-batch-size']
+    ? Number.parseInt(values['objection-batch-size'] as string, 10)
+    : undefined;
+  const objectionSinks: ObjectionSinkConfig[] = [
+    ...((values['objection-channel'] as string[] | undefined) ?? []).map((url) => ({
+      kind: 'channel' as const,
+      url,
+      secret: process.env.SMALLCHAT_CHANNEL_SECRET,
+    })),
+    ...((values['objection-webhook'] as string[] | undefined) ?? []).map((url) => ({
+      kind: 'webhook' as const,
+      url,
+      secret: process.env.STENOGRAPHER_WEBHOOK_SECRET,
+      batchSize,
+    })),
+  ];
+
   const config: StenographerConfig = {
     logPath,
     statePath,
@@ -751,6 +799,8 @@ export async function runCLI(args: string[]): Promise<void> {
     restPort: values['rest-port'] ? Number.parseInt(values['rest-port'], 10) : undefined,
     restHost: values['rest-host'] as string | undefined,
     objectionMode,
+    objectionSinks,
+    objectionMcpChannel: !values['no-mcp-channel'],
   };
 
   // Log to stderr — stdout carries the MCP stdio protocol

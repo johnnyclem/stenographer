@@ -4,6 +4,7 @@
  */
 
 import { z } from 'zod';
+import type { ObjectionSinkConfig } from './truth/delivery.js';
 
 // ─────────────────────────────────────────────────────────────
 // Message Schema (input from JSONL tailer)
@@ -202,6 +203,21 @@ export interface StenographerConfig {
    * - 'off': the detector doesn't run.
    */
   objectionMode?: 'off' | 'shadow' | 'deliver';
+  /**
+   * Webhook receivers for delivered objections (§14.8: webhooks). Channel
+   * sinks (smallchat's channel bridge → Claude Code channel events) get each
+   * objection as it's discovered; plain webhooks, for harnesses that can't
+   * be interrupted, get batches of `batchSize` (default 3). URLs must be
+   * loopback unless `allowRemote` is set.
+   */
+  objectionSinks?: ObjectionSinkConfig[];
+  /**
+   * When serving MCP, push each delivered objection to the attached client
+   * as a Claude Code channel event (`notifications/claude/channel`).
+   * Default true; ignored in watch mode, where one MCP connection can't be
+   * mapped to the many sessions being watched.
+   */
+  objectionMcpChannel?: boolean;
   /** Port for the REST API. Defaults to 8787 in daemon mode, off otherwise. */
   restPort?: number;
   /**

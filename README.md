@@ -67,6 +67,10 @@ npx stenographer start ./conversation.jsonl --embeddings hashed
 | `-e, --embeddings` | model name \| `hashed` | `Xenova/all-MiniLM-L6-v2` | Transformer model, or the offline lexical embedder (see [Offline mode](#offline-mode)) |
 | `--rest-port` | port number | `8787` in daemon mode, off otherwise | Serve the REST API on this port |
 | `--objections` | `off` \| `shadow` \| `deliver` | `shadow` | Real-time objections to tombstoned literals (see [Real-time objections](#real-time-objections)) |
+| `--objection-channel` | URL (repeatable) | — | smallchat channel bridge to push each objection to as it's raised. Secret from `SMALLCHAT_CHANNEL_SECRET` |
+| `--objection-webhook` | URL (repeatable) | — | Webhook for harnesses that can't be interrupted: objections arrive in batches. HMAC key from `STENOGRAPHER_WEBHOOK_SECRET` |
+| `--objection-batch-size` | number | `3` | Batch size for `--objection-webhook` |
+| `--no-mcp-channel` | — | — | Don't push objections to the attached MCP client as Claude Code channel events |
 | `--rest-host` | hostname/IP | `127.0.0.1` | Interface for the REST API to bind to. The API has no authentication, so it stays loopback-only unless you explicitly opt into wider exposure (e.g. `0.0.0.0` behind a trusted network boundary) |
 
 Positional args: `stenographer start <log-path> [state-path]` — `state-path` defaults to `./stenographer.db`.
@@ -194,7 +198,17 @@ v1 is precision over recall: exact tokens (`30` never matches `300`), the subjec
 
 Every objection ships the objection, the exhibit (the full TB, plus any contesting UVs), and the transcript line. The judge rules via `rule_on_objection`: **sustained** lands as an ordinary `RULING` (`kind: objection`) corroborating the TB; **overruled** is signal. The **sustain rate** (`get_status` → `objections`) is the tuning dial — a falling rate means tighten the matcher.
 
-`--objections shadow` (default) records objections without emitting them, so they can be shadow-judged against real MR catches; `deliver` emits them on `GET /flags` (poll with the last id as `since`); `off` disables the detector. Catch-up replays are always recorded as shadow. The daemon stays passive and loopback-only — it never writes into a conversation.
+`--objections shadow` (default) records objections without emitting them, so they can be shadow-judged against real MR catches; `deliver` pushes them (below) and serves them on `GET /flags` (poll with the last id as `since`); `off` disables the detector. Catch-up replays are always recorded as shadow.
+
+**Delivery (webhooks).** In `deliver` mode, objections are pushed to every configured receiver:
+
+| Receiver | How it's reached | When it's delivered |
+|---|---|---|
+| Claude Code (built-in channel) | The attached MCP client gets `notifications/claude/channel`; stenographer declares the `claude/channel` capability | As discovered |
+| smallchat agent-to-agent messaging | `--objection-channel <url>` → `POST <url>/event` on smallchat's channel bridge (`X-Channel-Secret`), relayed into the agent's session | As discovered |
+| Harnesses without interrupts | `--objection-webhook <url>` → `POST {type: "stenographer.objections", objections: [...]}`, signed `X-Stenographer-Signature: sha256=<hmac>` | Once a batch of 3 is pending |
+
+Delivery state is durable: a partial batch survives a restart, failed deliveries retry, and an objection the judge already ruled on is dropped from the queue. Webhook URLs must be loopback unless a sink sets `allowRemote`, since objections carry transcript lines. Watch mode skips the MCP channel because one connection can't be mapped to the many sessions it watches, so use a smallchat channel or a webhook there. Stenographer itself still never writes into a conversation: it emits to receivers the operator configured, and they decide what to do.
 
 ## GraphRAG Search
 
