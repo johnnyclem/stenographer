@@ -66,6 +66,7 @@ npx stenographer start ./conversation.jsonl --embeddings hashed
 | `-a, --adapter` | `jsonl` \| `claude-code` \| `anthropic` \| `openai` \| `generic` | auto-detect | Log format adapter |
 | `-e, --embeddings` | model name \| `hashed` | `Xenova/all-MiniLM-L6-v2` | Transformer model, or the offline lexical embedder (see [Offline mode](#offline-mode)) |
 | `--rest-port` | port number | `8787` in daemon mode, off otherwise | Serve the REST API on this port |
+| `--objections` | `off` \| `shadow` \| `deliver` | `shadow` | Real-time objections to tombstoned literals (see [Real-time objections](#real-time-objections)) |
 | `--rest-host` | hostname/IP | `127.0.0.1` | Interface for the REST API to bind to. The API has no authentication, so it stays loopback-only unless you explicitly opt into wider exposure (e.g. `0.0.0.0` behind a trusted network boundary) |
 
 Positional args: `stenographer start <log-path> [state-path]` — `state-path` defaults to `./stenographer.db`.
@@ -107,6 +108,8 @@ By default, Stenographer downloads a ~25MB embedding model on first run and does
 | `file_ruling` | Strike, promotion, or contempt ruling with a written opinion |
 | `export_wiki_entries` / `import_wiki_entries` | Lossless team llm-wiki JSONL interop |
 | `backfill_legacy_tombstones` | Phase-1 migration of pre-assertion supersessions |
+| `list_objections` | Real-time objections (objection + exhibit + transcript line); `includeShadow` for shadow judging |
+| `rule_on_objection` | Sustain or overrule an objection with a written opinion — files a `RULING` |
 
 ## REST API (daemon mode or `--rest-port`)
 
@@ -117,6 +120,7 @@ GET /entities                GET /decisions/:id/chain
 GET /relations                GET /tombstones
 GET /search?q=...&k=5        GET /graphrag?q=...&k=5&depth=2
 GET /context-frame?budget=2000
+GET /flags?since=<id>&status=pending&include=shadow
 ```
 
 There's no authentication on these routes, so the server binds to `127.0.0.1` by default — pass `--rest-host` if you deliberately want it reachable from elsewhere.
@@ -171,6 +175,26 @@ Five record types live in one append-only ledger (`truth_entries`, mirrored to w
 Downstream consumers get the confidence type in every result, with the consumption rules embedded in the tool descriptions: active TB = ground truth; contested TB = truth with a visible asterisk; open UV = **flag, don't block**; refuted/overridden = history, never citable.
 
 **Proposal intake** (`importProposalDrafts`): external tools — today [short-hand](https://github.com/johnnyclem/short-hand)'s compactor, which exports its L4 candidate invariants and detected corrections as draft JSONL — can file candidates into the ledger. Every line lands as a `PROPOSAL` under a detector identity (`detector:short-hand`); there is no external write path to TB or UV, the detector cannot sign its own intake, and `targetRef` dedupe makes re-imports idempotent. This is the Option B seam from the TB/UV v2 handoff (§13 Q6): format-level interop, no code dependency in either direction.
+
+### Real-time objections
+
+§11 rules on the record after the fact; objections reach the same court earlier — while the transcript is still being written. One detector (*assertion-contradicts-TB*) reads the stream stenographer already tails, backed by an in-memory cache of active TBs, and records an objection whenever **assistant output** (prose, or the new side of a tool-call edit) asserts a **tombstoned literal**.
+
+Only TBs that declare `literals` can object — an objection can only cite what the record actually contains:
+
+```json
+{ "claim": "LOG_BUDGET 30 is dead; the budget is 100",
+  "evidence": [{ "kind": "commit", "ref": "a1b2c3" }],
+  "signedBy": "johnnyclem",
+  "literals": [{ "subject": "LOG_BUDGET", "dead": "30", "current": "100" },
+               { "dead": "legacyRateLimiter", "current": "TokenBucket" }] }
+```
+
+v1 is precision over recall: exact tokens (`30` never matches `300`), the subject tolerates naming drift (`LOG_BUDGET` / `logBudget` / "log budget") but must sit next to the value, a bare value without a `subject` is rejected at write time, and a line that also mentions `current` ("bumped from 30 to 100") is discussion, not assertion. Counsel doesn't repeat itself within a session while an objection is pending or after it's overruled.
+
+Every objection ships the objection, the exhibit (the full TB, plus any contesting UVs), and the transcript line. The judge rules via `rule_on_objection`: **sustained** lands as an ordinary `RULING` (`kind: objection`) corroborating the TB; **overruled** is signal. The **sustain rate** (`get_status` → `objections`) is the tuning dial — a falling rate means tighten the matcher.
+
+`--objections shadow` (default) records objections without emitting them, so they can be shadow-judged against real MR catches; `deliver` emits them on `GET /flags` (poll with the last id as `since`); `off` disables the detector. Catch-up replays are always recorded as shadow. The daemon stays passive and loopback-only — it never writes into a conversation.
 
 ## GraphRAG Search
 

@@ -46,6 +46,9 @@ Options (start):
       --rest-host <host>   Interface for the REST API to bind to
                            (default: 127.0.0.1 — the API has no auth,
                            so it stays loopback-only unless overridden)
+      --objections <mode>  off | shadow | deliver  (default: shadow)
+                           real-time objections to tombstoned literals;
+                           shadow records them without emitting on /flags
 
 Examples:
   stenographer start ./conversation.jsonl

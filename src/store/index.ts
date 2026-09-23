@@ -11,6 +11,7 @@ import Database from 'better-sqlite3';
 import * as sqliteVec from 'sqlite-vec';
 import { cosineSimilarity, EMBEDDING_DIMENSIONS } from '../indexer/embeddings.js';
 import { TruthLedger } from '../truth/ledger.js';
+import { ObjectionLog } from '../truth/objections.js';
 import type {
   IndexedMessage,
   IndexedDecision,
@@ -28,6 +29,7 @@ export class StateStore {
   private dimensions: number;
   private vecEnabled: boolean = false;
   private truthLedger: TruthLedger | null = null;
+  private objectionLog: ObjectionLog | null = null;
 
   constructor(dbPath: string, options: StateStoreOptions = {}) {
     this.db = new Database(dbPath);
@@ -55,6 +57,14 @@ export class StateStore {
       this.truthLedger = new TruthLedger(this.db);
     }
     return this.truthLedger;
+  }
+
+  /** Real-time objections (§12): operational log beside the ledger. */
+  get objections(): ObjectionLog {
+    if (!this.objectionLog) {
+      this.objectionLog = new ObjectionLog(this.db, this.truth);
+    }
+    return this.objectionLog;
   }
 
   private init(): void {

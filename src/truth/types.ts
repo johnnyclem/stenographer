@@ -84,6 +84,35 @@ export function isSelfSigningEvidence(evidence: Evidence[]): boolean {
 }
 
 // ─────────────────────────────────────────────────────────────
+// Matchable literals — what a real-time objection can cite (§12)
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * A tombstoned literal: a numeric constant, identifier, or config value
+ * that is dead. v1 matching is precision over recall — literals, not
+ * paraphrases — so a bare number is unmatchable without a `subject`
+ * (the identifier it belongs to): "30" alone would object to everything.
+ */
+export const TombstonedLiteralSchema = z
+  .object({
+    /** The dead value or identifier, e.g. "30" or "legacyRateLimit". */
+    dead: z.string().trim().min(1),
+    /** The identifier the value belongs to, e.g. "LOG_BUDGET". */
+    subject: z.string().trim().min(1).optional(),
+    /** What replaced it, if anything — cited in the objection. */
+    current: z.string().trim().min(1).optional(),
+  })
+  .refine((l) => l.subject !== undefined || isDistinctiveIdentifier(l.dead), {
+    message:
+      'a literal without a subject must be a distinctive identifier (≥4 chars, contains a letter) — name the subject of bare values',
+  });
+export type TombstonedLiteral = z.infer<typeof TombstonedLiteralSchema>;
+
+function isDistinctiveIdentifier(value: string): boolean {
+  return value.length >= 4 && /[A-Za-z]/.test(value);
+}
+
+// ─────────────────────────────────────────────────────────────
 // verifyBy — what makes a UV pickable from the queue
 // ─────────────────────────────────────────────────────────────
 
@@ -152,6 +181,8 @@ export interface TbBody {
   /** The asserting author (distinct from `author` when an agent drafted and a human signed). */
   signedBy: string | null;
   status: TbStatus;
+  /** Matchable dead literals — optional; only TBs carrying them can raise objections (§12). */
+  literals?: TombstonedLiteral[];
 }
 
 /** UV — unverified assertion: believed true, stated before verification exists. */
@@ -200,12 +231,17 @@ export interface AddendumBody {
 }
 
 /** RULING — a signed judgment about an existing entry (§11). */
+export type RulingKind = 'strike' | 'promotion' | 'contempt' | 'objection';
+
 export interface RulingBody {
-  kind: 'strike' | 'promotion' | 'contempt';
+  kind: RulingKind;
   /** Required written reasoning — rulings are retrievable precedent. */
   opinion: string;
   /** Entry id, or registered author identity for contempt. */
   target: string;
+  /** Objection rulings (§12): the objection ruled on, and the outcome. */
+  objectionId?: string;
+  outcome?: 'sustained' | 'overruled';
 }
 
 export type TruthBody = TbBody | UvBody | ProposalBody | AddendumBody | RulingBody;
@@ -228,6 +264,7 @@ export const TbInputSchema = z.object({
   claim: z.string().min(1),
   evidence: z.array(EvidenceSchema).min(1, 'a TB requires at least one piece of evidence'),
   signedBy: AuthorSchema,
+  literals: z.array(TombstonedLiteralSchema).optional(),
 });
 
 export const UvInputSchema = z.object({

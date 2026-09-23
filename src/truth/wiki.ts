@@ -13,7 +13,8 @@
 
 import { readFileSync, writeFileSync, appendFileSync, existsSync } from 'node:fs';
 import { TruthLedger, type WriteContext } from './ledger.js';
-import type { TbEntry, UvEntry, TruthEntry, TruthLink } from './types.js';
+import { z } from 'zod';
+import { TombstonedLiteralSchema, type TbEntry, type TbBody, type UvEntry, type TruthEntry, type TruthLink } from './types.js';
 
 /** One line of the wiki's append-only JSONL ledger. */
 export interface WikiEntryLine {
@@ -25,6 +26,8 @@ export interface WikiEntryLine {
   claim?: string;
   evidence?: unknown[];
   signedBy?: string | null;
+  /** Matchable dead literals (§12) — what a real-time objection can cite. */
+  literals?: unknown[];
   // UV fields
   assertion?: string;
   basis?: string;
@@ -60,6 +63,7 @@ export function entryToWikiLine(entry: TbEntry | UvEntry): WikiEntryLine {
       claim: entry.body.claim,
       evidence: entry.body.evidence,
       signedBy: entry.body.signedBy,
+      ...(entry.body.literals ? { literals: entry.body.literals } : {}),
       status: entry.body.status,
       'x-steno': xSteno,
     };
@@ -96,6 +100,9 @@ export function wikiLineToEntry(line: WikiEntryLine): TruthEntry {
         evidence: (line.evidence as any) ?? [],
         signedBy: line.signedBy ?? null,
         status: (line.status as 'active' | 'contested' | 'overridden') ?? 'active',
+        ...(Array.isArray(line.literals) && line.literals.length > 0
+          ? { literals: validLiterals(line.literals, line.id) }
+          : {}),
       },
     };
   }
@@ -110,6 +117,16 @@ export function wikiLineToEntry(line: WikiEntryLine): TruthEntry {
       status: (line.status as 'open' | 'verified' | 'refuted') ?? 'open',
     },
   };
+}
+
+/** Rejects a wiki line whose literals could not be matched (e.g. a bare number with no subject). */
+function validLiterals(literals: unknown[], id: string): TbBody['literals'] {
+  const parsed = z.array(TombstonedLiteralSchema).safeParse(literals);
+  if (!parsed.success) {
+    throw new Error(`entry ${id}: invalid literals — ${parsed.error.issues[0]?.message}`);
+  }
+  // Keep the wiki's bytes, not the normalized parse — the round-trip is byte-stable
+  return literals as TbBody['literals'];
 }
 
 /**

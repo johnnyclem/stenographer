@@ -10,7 +10,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { Stenographer } from '../core/stenographer.js';
 import { CONSUMPTION_RULES } from '../truth/types.js';
-import type { Evidence, VerifyBy, ProposalBody } from '../truth/types.js';
+import type { Evidence, VerifyBy, ProposalBody, TombstonedLiteral } from '../truth/types.js';
 import type { TruthFilter } from '../truth/ledger.js';
 import type { StenographerConfig, StenographerMode } from '../types.js';
 
@@ -215,6 +215,22 @@ export class StenographerServer {
                 },
               },
               signedBy: { type: 'string', description: 'The asserting author — anonymous identities are rejected' },
+              literals: {
+                type: 'array',
+                description:
+                  'Matchable dead literals — numeric constants, identifiers, config values. Only TBs carrying them ' +
+                  'can raise real-time objections. A bare value needs its subject (e.g. {subject: "LOG_BUDGET", dead: "30", current: "100"}); ' +
+                  'a distinctive identifier may stand alone (e.g. {dead: "legacyRateLimiter"}).',
+                items: {
+                  type: 'object',
+                  properties: {
+                    dead: { type: 'string', description: 'The dead value or identifier' },
+                    subject: { type: 'string', description: 'The identifier the value belongs to' },
+                    current: { type: 'string', description: 'What replaced it, if anything' },
+                  },
+                  required: ['dead'],
+                },
+              },
               author: { type: 'string', description: 'Drafting author when distinct from signedBy' },
               agentSessionId: { type: 'string' },
             },
@@ -380,6 +396,43 @@ export class StenographerServer {
             required: ['kind', 'opinion', 'target', 'author'],
           },
         },
+        // ── Real-time objections (§12) ──────────────────────
+        {
+          name: 'list_objections',
+          description:
+            'Real-time objections: assistant output that asserted a tombstoned literal, each with the objection, ' +
+            'the exhibit (the full TB record) and the transcript line. An objection is a warning with a citation ' +
+            'attached — whoever is in the session decides what to do with it, then rules via rule_on_objection. ' +
+            'includeShadow adds shadow-mode objections (recorded, never delivered) for shadow judging.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              since: { type: 'string', description: 'Exclusive objection-id cursor' },
+              status: { type: 'string', enum: ['pending', 'sustained', 'overruled'] },
+              includeShadow: { type: 'boolean', default: false },
+              limit: { type: 'number', default: 100 },
+            },
+          },
+        },
+        {
+          name: 'rule_on_objection',
+          description:
+            'Rule on a real-time objection, with a written opinion. sustained: the session corrects course and the ' +
+            'ruling lands in the record as corroboration for the TB. overruled: the objection was wrong or ' +
+            'immaterial — signal for tightening the matcher. Either way an ordinary RULING is filed; the TB\'s status ' +
+            'does not change.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              objectionId: { type: 'string' },
+              outcome: { type: 'string', enum: ['sustained', 'overruled'] },
+              opinion: { type: 'string' },
+              author: { type: 'string', description: 'The judge — anonymous identities are rejected' },
+              agentSessionId: { type: 'string' },
+            },
+            required: ['objectionId', 'outcome', 'opinion', 'author'],
+          },
+        },
         {
           name: 'export_wiki_entries',
           description:
@@ -493,6 +546,7 @@ export class StenographerServer {
           ...stats,
           truth: await this.engine.getTruthStats(),
           truthMode: this.engine.getTruthMode(),
+          objections: await this.engine.getObjectionStats(),
           retriever: this.engine.retriever.getStats(),
           vectorBackend: this.engine.store.vectorSearchBackend,
           sessionId: this.engine.getSessionId(),
@@ -538,6 +592,7 @@ export class StenographerServer {
           claim: args.claim as string,
           evidence: args.evidence as Evidence[],
           signedBy: args.signedBy as string,
+          literals: args.literals as TombstonedLiteral[] | undefined,
           author: args.author as string | undefined,
           agentSessionId: args.agentSessionId as string | undefined,
         });
@@ -607,6 +662,28 @@ export class StenographerServer {
           agentSessionId: args.agentSessionId as string | undefined,
         });
 
+      case 'list_objections':
+        return this.engine.getObjections({
+          since: args.since as string | undefined,
+          status: args.status as 'pending' | 'sustained' | 'overruled' | undefined,
+          includeShadow: args.includeShadow === true,
+          limit: typeof args.limit === 'number' ? args.limit : undefined,
+        });
+
+      case 'rule_on_objection': {
+        const { objectionId, outcome, opinion, author, agentSessionId } = args as {
+          objectionId: string;
+          outcome: 'sustained' | 'overruled';
+          opinion: string;
+          author: string;
+          agentSessionId?: string;
+        };
+        if (!objectionId || !opinion || !author || !['sustained', 'overruled'].includes(outcome)) {
+          throw new Error('objectionId, outcome (sustained|overruled), opinion, and author are required');
+        }
+        return this.engine.ruleOnObjection(objectionId, outcome, { author, opinion, agentSessionId });
+      }
+
       case 'export_wiki_entries':
         return this.engine.exportWikiEntries({
           since: args.since as string | undefined,
@@ -645,6 +722,7 @@ export async function runCLI(args: string[]): Promise<void> {
       'rest-port': { type: 'string' },
       'rest-host': { type: 'string' },
       embeddings: { type: 'string', short: 'e' },
+      objections: { type: 'string' },
     },
     allowPositionals: true,
   });
@@ -658,6 +736,12 @@ export async function runCLI(args: string[]): Promise<void> {
     process.exit(1);
   }
 
+  const objectionMode = (values.objections as StenographerConfig['objectionMode']) ?? 'shadow';
+  if (!['off', 'shadow', 'deliver'].includes(objectionMode!)) {
+    console.error(`Unknown objections mode '${objectionMode}'. Available: off, shadow, deliver`);
+    process.exit(1);
+  }
+
   const config: StenographerConfig = {
     logPath,
     statePath,
@@ -666,6 +750,7 @@ export async function runCLI(args: string[]): Promise<void> {
     embeddingModel: values.embeddings,
     restPort: values['rest-port'] ? Number.parseInt(values['rest-port'], 10) : undefined,
     restHost: values['rest-host'] as string | undefined,
+    objectionMode,
   };
 
   // Log to stderr — stdout carries the MCP stdio protocol
