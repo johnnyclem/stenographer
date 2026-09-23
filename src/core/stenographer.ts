@@ -21,6 +21,7 @@ import {
 } from '../truth/wiki.js';
 import type { TruthFilter } from '../truth/ledger.js';
 import type { Objection, ObjectionMode, ObjectionStatus, ObjectionStats } from '../truth/objections.js';
+import { createSinkTransport, type ObjectionTransport } from '../truth/delivery.js';
 import type {
   Evidence,
   VerifyBy,
@@ -66,6 +67,7 @@ export class Stenographer implements StenographerAPI {
   private supersedeThreshold: number;
   private truthMode: 'shadow' | 'assert';
   private objectionMode: ObjectionMode;
+  private sinkTransports: ObjectionTransport[];
 
   constructor(config: StenographerConfig) {
     this.config = config;
@@ -76,6 +78,9 @@ export class Stenographer implements StenographerAPI {
     this.supersedeThreshold = config.supersedeThreshold ?? DEFAULT_SUPERSEDE_THRESHOLD;
     this.truthMode = config.truthMode ?? 'shadow';
     this.objectionMode = config.objectionMode ?? 'shadow';
+    // Validate sinks up front: a bad or non-loopback URL fails at startup,
+    // not at the first objection
+    this.sinkTransports = (config.objectionSinks ?? []).map(createSinkTransport);
   }
 
   /** Session scope for queries: single session in file modes, all in watch mode. */
@@ -92,6 +97,10 @@ export class Stenographer implements StenographerAPI {
   // ─────────────────────────────────────────────────────────
 
   async start(): Promise<void> {
+    for (const transport of this.sinkTransports) {
+      this.store.objectionDelivery.register(transport);
+    }
+
     this.embedder = await createEmbedder(this.config.embeddingModel);
     this.retriever.setEmbedder(this.embedder);
 
@@ -141,6 +150,8 @@ export class Stenographer implements StenographerAPI {
       this.restServer.stop();
       this.restServer = null;
     }
+    // Undelivered objections stay queued in the store for the next run
+    this.store.objectionDelivery.stop();
     this.store.close();
   }
 
@@ -280,11 +291,13 @@ export class Stenographer implements StenographerAPI {
     // Catch-up replays history, so its objections are recorded for shadow
     // judging but never delivered as if they were live.
     try {
-      this.store.objections.scan(
+      const raised = this.store.objections.scan(
         msg,
         sessionId,
         this.objectionMode === 'deliver' && this.config.mode === 'catchup' ? 'shadow' : this.objectionMode
       );
+      // Push as discovered — don't hold up indexing on a receiver
+      if (raised.some((o) => o.delivered)) void this.store.objectionDelivery.pump();
     } catch (err) {
       // Counsel failing must never cost the record
       console.error(`Objection scan failed for message ${msg.id}:`, err);
@@ -881,6 +894,19 @@ export class Stenographer implements StenographerAPI {
     );
     this.store.objections.markRuled(objectionId, outcome, ruling.id);
     return { objection: this.store.objections.get(objectionId)!, ruling };
+  }
+
+  /**
+   * Adds a delivery target at runtime — used by the MCP server to push
+   * objections to its attached client as Claude Code channel events.
+   */
+  addObjectionTransport(transport: ObjectionTransport): void {
+    this.store.objectionDelivery.register(transport);
+  }
+
+  /** Delivers whatever is due now (interrupting receivers, full batches). */
+  async deliverObjections(): Promise<void> {
+    await this.store.objectionDelivery.pump();
   }
 
   /** The tuning dial: a falling sustain rate means tighten the matcher. */

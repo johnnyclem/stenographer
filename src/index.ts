@@ -62,5 +62,15 @@ export {
   type ObjectionStatus,
   type ObjectionStats,
 } from './truth/objections.js';
+export {
+  ObjectionDispatcher,
+  createSinkTransport,
+  createMcpChannelTransport,
+  formatObjection,
+  formatObjectionBatch,
+  DEFAULT_OBJECTION_BATCH_SIZE,
+  type ObjectionSinkConfig,
+  type ObjectionTransport,
+} from './truth/delivery.js';
 export * from './truth/types.js';
 export * from './types.js';

@@ -12,6 +12,7 @@ import * as sqliteVec from 'sqlite-vec';
 import { cosineSimilarity, EMBEDDING_DIMENSIONS } from '../indexer/embeddings.js';
 import { TruthLedger } from '../truth/ledger.js';
 import { ObjectionLog } from '../truth/objections.js';
+import { ObjectionDispatcher } from '../truth/delivery.js';
 import type {
   IndexedMessage,
   IndexedDecision,
@@ -30,6 +31,7 @@ export class StateStore {
   private vecEnabled: boolean = false;
   private truthLedger: TruthLedger | null = null;
   private objectionLog: ObjectionLog | null = null;
+  private dispatcher: ObjectionDispatcher | null = null;
 
   constructor(dbPath: string, options: StateStoreOptions = {}) {
     this.db = new Database(dbPath);
@@ -65,6 +67,14 @@ export class StateStore {
       this.objectionLog = new ObjectionLog(this.db, this.truth);
     }
     return this.objectionLog;
+  }
+
+  /** Webhook/channel delivery of objections, with durable per-sink state. */
+  get objectionDelivery(): ObjectionDispatcher {
+    if (!this.dispatcher) {
+      this.dispatcher = new ObjectionDispatcher(this.db, this.objections);
+    }
+    return this.dispatcher;
   }
 
   private init(): void {

@@ -49,6 +49,18 @@ Options (start):
       --objections <mode>  off | shadow | deliver  (default: shadow)
                            real-time objections to tombstoned literals;
                            shadow records them without emitting on /flags
+      --objection-channel <url>
+                           smallchat channel bridge to push each objection
+                           to as it's raised (repeatable; secret from
+                           SMALLCHAT_CHANNEL_SECRET)
+      --objection-webhook <url>
+                           webhook for harnesses without interrupts: gets
+                           objections in batches (repeatable; HMAC key from
+                           STENOGRAPHER_WEBHOOK_SECRET)
+      --objection-batch-size <n>
+                           batch size for --objection-webhook (default: 3)
+      --no-mcp-channel     don't push objections to the attached MCP client
+                           as Claude Code channel events
 
 Examples:
   stenographer start ./conversation.jsonl
