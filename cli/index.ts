@@ -10,6 +10,14 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
     const { runCLI } = await import('../dist/index.js');
     await runCLI(args);
   },
+  proposals: async (args) => {
+    const { runNotaryCLI } = await import('../dist/index.js');
+    await runNotaryCLI('proposals', args);
+  },
+  notarize: async (args) => {
+    const { runNotaryCLI } = await import('../dist/index.js');
+    await runNotaryCLI('notarize', args);
+  },
   init: async (args) => {
     const [name = 'stenographer'] = args;
     console.log(`Initializing ${name}...`);
@@ -29,6 +37,10 @@ Stenographer 🤖 MCP court reporter
 
 Usage:
   stenographer start <log-path> [state-path] [options]  Start the MCP server
+  stenographer proposals [state-path]                   List open proposals
+  stenographer notarize <id> --as <name> [--state <path>] [--decline <reason>]
+                                                        Approve (or decline) an agent-drafted
+                                                        tombstone — interactive terminal only
   stenographer init [name]                              Initialize a new project
   stenographer -h, --help                               Show help
 
@@ -61,6 +73,9 @@ Options (start):
                            batch size for --objection-webhook (default: 3)
       --no-mcp-channel     don't push objections to the attached MCP client
                            as Claude Code channel events
+      --require-notary     agents can't assert tombstones directly: they draft
+                           with propose_tombstone and a person notarizes
+                           (REST notary routes use STENOGRAPHER_NOTARY_SECRET)
 
 Examples:
   stenographer start ./conversation.jsonl

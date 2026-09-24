@@ -218,6 +218,17 @@ export interface StenographerConfig {
    * mapped to the many sessions being watched.
    */
   objectionMcpChannel?: boolean;
+  /**
+   * Shared secret for the REST notary routes (`X-Notary-Secret`). Give it to
+   * your approval UI (e.g. smallchat), never to agents. Unset disables
+   * notarization over REST; the interactive CLI still works.
+   */
+  notarySecret?: string;
+  /**
+   * Agents must go through `propose_tombstone`: the MCP `assert_tombstone`
+   * tool is refused, so every agent-authored TB is notarized by a person.
+   */
+  requireNotary?: boolean;
   /** Port for the REST API. Defaults to 8787 in daemon mode, off otherwise. */
   restPort?: number;
   /**

@@ -31,8 +31,8 @@ import type { Objection, ObjectionLog } from './objections.js';
 export const DEFAULT_OBJECTION_BATCH_SIZE = 3;
 const RETRY_INTERVAL_MS = 15_000;
 const DELIVERY_TIMEOUT_MS = 5_000;
-const CHANNEL_NAME = 'stenographer';
-const SENDER = 'stenographer';
+export const CHANNEL_NAME = 'stenographer';
+export const SENDER = 'stenographer';
 
 /** An operator-configured webhook receiver. */
 export interface ObjectionSinkConfig {
@@ -120,7 +120,7 @@ function sinkId(config: ObjectionSinkConfig): string {
   return `${config.kind}:${config.url}`;
 }
 
-async function post(url: string, body: string, headers: Record<string, string>): Promise<void> {
+export async function post(url: string, body: string, headers: Record<string, string>): Promise<void> {
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...headers },

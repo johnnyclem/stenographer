@@ -71,6 +71,7 @@ npx stenographer start ./conversation.jsonl --embeddings hashed
 | `--objection-webhook` | URL (repeatable) | — | Webhook for harnesses that can't be interrupted: objections arrive in batches. HMAC key from `STENOGRAPHER_WEBHOOK_SECRET` |
 | `--objection-batch-size` | number | `3` | Batch size for `--objection-webhook` |
 | `--no-mcp-channel` | — | — | Don't push objections to the attached MCP client as Claude Code channel events |
+| `--require-notary` | — | off | Agents can't assert tombstones directly: they draft with `propose_tombstone` and a person notarizes (see [Agent-drafted tombstones](#agent-drafted-tombstones-notarization)). REST notary routes need `STENOGRAPHER_NOTARY_SECRET` |
 | `--rest-host` | hostname/IP | `127.0.0.1` | Interface for the REST API to bind to. The API has no authentication, so it stays loopback-only unless you explicitly opt into wider exposure (e.g. `0.0.0.0` behind a trusted network boundary) |
 
 Positional args: `stenographer start <log-path> [state-path]` — `state-path` defaults to `./stenographer.db`.
@@ -100,7 +101,8 @@ By default, Stenographer downloads a ~25MB embedding model on first run and does
 | Tool | Description |
 |------|-------------|
 | `list_proposals` | The review inbox: machine-drafted candidates awaiting sign/dismiss |
-| `sign_proposal` | Mint a TB/UV from a proposal under an accountable signer (`edits` supported) |
+| `sign_proposal` | Mint a TB/UV from a proposal under an accountable signer (`edits` supported). Refuses agent drafts — those need a notary |
+| `propose_tombstone` | An agent drafts a TB (claim, evidence, literals, rationale); it's raised to a person and never mints until they notarize it |
 | `dismiss_proposal` | Dismiss with a required reason (kept as detector training data) |
 | `assert_tombstone` | Direct TB for authors who already know — evidence required |
 | `assert_uv` | Assert an unverified belief with a machine-actionable `verifyBy`; `contests` disputes a TB |
@@ -125,6 +127,10 @@ GET /relations                GET /tombstones
 GET /search?q=...&k=5        GET /graphrag?q=...&k=5&depth=2
 GET /context-frame?budget=2000
 GET /flags?since=<id>&status=pending&include=shadow
+GET /proposals?status=open&kind=tombstone
+
+POST /proposals/:id/notarize  {notary, edits?}      X-Notary-Secret required
+POST /proposals/:id/dismiss   {dismissedBy, reason} X-Notary-Secret required
 ```
 
 There's no authentication on these routes, so the server binds to `127.0.0.1` by default — pass `--rest-host` if you deliberately want it reachable from elsewhere.
@@ -179,6 +185,18 @@ Five record types live in one append-only ledger (`truth_entries`, mirrored to w
 Downstream consumers get the confidence type in every result, with the consumption rules embedded in the tool descriptions: active TB = ground truth; contested TB = truth with a visible asterisk; open UV = **flag, don't block**; refuted/overridden = history, never citable.
 
 **Proposal intake** (`importProposalDrafts`): external tools — today [short-hand](https://github.com/johnnyclem/short-hand)'s compactor, which exports its L4 candidate invariants and detected corrections as draft JSONL — can file candidates into the ledger. Every line lands as a `PROPOSAL` under a detector identity (`detector:short-hand`); there is no external write path to TB or UV, the detector cannot sign its own intake, and `targetRef` dedupe makes re-imports idempotent. This is the Option B seam from the TB/UV v2 handoff (§13 Q6): format-level interop, no code dependency in either direction.
+
+### Agent-drafted tombstones (notarization)
+
+Agents often find the dead value first — the config that was bumped, the class that was deleted. `propose_tombstone` lets them draft the TB: claim, evidence, the literals to object to, and why. They can't sign it. The draft is a `PROPOSAL` marked `requiresNotary`, and only a person turns it into truth:
+
+1. **Raised.** The draft goes to the same receivers as objections — smallchat's channel bridge (`meta.kind: "proposal"`, with a `notarize_url`) and operator webhooks (`type: "stenographer.proposal"`) — never to the attached MCP client, which is the drafter. It's also printed to stderr and stays in `GET /proposals?status=open`.
+2. **Notarized.** A person approves or declines it through a path agents' tools don't reach:
+   - REST `POST /proposals/:id/notarize` / `dismiss` with `X-Notary-Secret` — the secret in `STENOGRAPHER_NOTARY_SECRET`, shared with your approval UI (smallchat) and not with agents. Unset, the routes answer 403.
+   - `stenographer notarize <id> --as <name> [--state <path>]` (or `--decline "<reason>"`), which needs an interactive terminal and a typed confirmation.
+3. **Minted.** The TB is signed by the notary, keeps the draft's literals (so it can object immediately), and links back to the draft. Contempt of corpus still applies: the drafting identity can't notarize its own draft.
+
+`sign_proposal` over MCP refuses agent drafts, and `--require-notary` also disables `assert_tombstone`, so with it on every agent-authored tombstone has a person's name on it. This guards against an agent approving itself through its tools; it isn't a sandbox — an agent with the operator's shell and secrets can do what the operator can.
 
 ### Real-time objections
 

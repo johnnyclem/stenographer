@@ -15,6 +15,7 @@ import {
   isAnonymousIdentity,
   isSelfSigningEvidence,
   TbInputSchema,
+  TombstoneDraftInputSchema,
   UvInputSchema,
   EvidenceSchema,
   MIGRATION_AUTHOR,
@@ -37,6 +38,8 @@ import {
 export class TruthWriteError extends Error {}
 /** Contempt of corpus: corroboration must be provenance-independent (§11). */
 export class ContemptError extends TruthWriteError {}
+/** An agent-drafted proposal reached a signing path that isn't the notary's. */
+export class NotarizationRequiredError extends TruthWriteError {}
 
 export interface WriteContext {
   author: string;
@@ -256,20 +259,52 @@ export class TruthLedger {
   }
 
   /**
+   * An agent drafts a tombstone it believes in but may not sign. The draft is
+   * validated as a TB would be (evidence, literals) so the notary reviews
+   * something that can actually mint, and it is marked `requiresNotary`:
+   * only a person, through the notary path, can turn it into truth.
+   */
+  draftTombstone(
+    input: { claim: string; evidence: Evidence[]; literals?: TombstonedLiteral[]; rationale?: string; targetRef?: string },
+    ctx: WriteContext
+  ): ProposalEntry {
+    const { claim, evidence, literals } = TombstoneDraftInputSchema.parse(input);
+    return this.addProposal(
+      {
+        kind: 'tombstone',
+        draft: { claim, evidence, ...(literals && literals.length > 0 ? { literals } : {}) },
+        signal: { source: 'agent-draft', ...(input.rationale ? { detail: input.rationale } : {}) },
+        targetRef: input.targetRef ?? null,
+        requiresNotary: true,
+      },
+      ctx
+    );
+  }
+
+  /**
    * An accountable author signs a proposal, minting the real TB/UV with a
    * `signs` link back. `edits` corrects the draft at signing time — the
    * signed version is what's true, the draft is history.
+   *
+   * Agent-drafted proposals (`requiresNotary`) only mint when the caller
+   * passes `notarized` — which only the notary paths do.
    */
   signProposal(
     proposalId: string,
     signedBy: string,
     edits?: Record<string, unknown>,
-    ctx?: Partial<WriteContext>
+    ctx?: Partial<WriteContext> & { notarized?: boolean }
   ): TbEntry | UvEntry {
     this.requireAccountable(signedBy, 'signer');
     const proposal = this.mustGetTyped<ProposalEntry>(proposalId, 'PROPOSAL');
     if (proposal.body.status !== 'open') {
       throw new TruthWriteError(`proposal ${proposalId} is already ${proposal.body.status}`);
+    }
+    if (proposal.body.requiresNotary && !ctx?.notarized) {
+      throw new NotarizationRequiredError(
+        `proposal ${proposalId} was drafted by '${proposal.author}' and must be notarized by a person — ` +
+          'it has been raised to them for approval; it is not truth until they sign it'
+      );
     }
     // A signer sharing the drafting agent's session is the drafter signing
     // its own work — one hat, not two.

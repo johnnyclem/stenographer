@@ -37,6 +37,7 @@ export {
   TruthLedger,
   TruthWriteError,
   ContemptError,
+  NotarizationRequiredError,
   type WriteContext,
   type TruthFilter,
 } from './truth/ledger.js';
@@ -72,5 +73,12 @@ export {
   type ObjectionSinkConfig,
   type ObjectionTransport,
 } from './truth/delivery.js';
+export {
+  raiseForNotarization,
+  formatProposalNotice,
+  notarySecretMatches,
+  NOTARY_SECRET_HEADER,
+} from './truth/notary.js';
+export { runNotaryCLI } from './truth/notary-cli.js';
 export * from './truth/types.js';
 export * from './types.js';
