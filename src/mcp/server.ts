@@ -218,9 +218,60 @@ export class StenographerServer {
           },
         },
         {
+          name: 'propose_tombstone',
+          description:
+            'Draft a tombstone for a person to notarize. Use this when you have found that a prior statement, decision ' +
+            'or value is provably dead: you gather the evidence and name the literals, a person approves. The draft is ' +
+            'raised to them immediately and is NOT truth until they sign it — you cannot sign or notarize it yourself, ' +
+            'and neither can any other agent. Tell the user you have raised it and what it would object to.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              claim: { type: 'string', description: 'What is dead and what replaces it (if anything)' },
+              evidence: {
+                type: 'array',
+                minItems: 1,
+                items: {
+                  type: 'object',
+                  properties: {
+                    kind: { type: 'string', enum: ['commit', 'file', 'test', 'command', 'wiki', 'message'] },
+                    ref: { type: 'string' },
+                    detail: { type: 'string' },
+                  },
+                  required: ['kind', 'ref'],
+                },
+              },
+              literals: {
+                type: 'array',
+                description:
+                  'Matchable dead literals the stenographer should object to once notarized. A bare value needs its subject ' +
+                  '(e.g. {subject: "LOG_BUDGET", dead: "30", current: "100"}); a distinctive identifier may stand alone.',
+                items: {
+                  type: 'object',
+                  properties: {
+                    dead: { type: 'string', description: 'The dead value or identifier' },
+                    subject: { type: 'string', description: 'The identifier the value belongs to' },
+                    current: { type: 'string', description: 'What replaced it, if anything' },
+                  },
+                  required: ['dead'],
+                },
+              },
+              rationale: { type: 'string', description: 'Why you believe it — shown to the person approving' },
+              proposedBy: {
+                type: 'string',
+                description: 'Your accountable agent identity (e.g. "claude-code:@ingest") — anonymous identities are rejected',
+              },
+              agentSessionId: { type: 'string', description: 'Your session id; the notary may not share it' },
+              targetRef: { type: 'string', description: 'Dedupe key: an open draft for the same target is returned instead' },
+            },
+            required: ['claim', 'evidence', 'proposedBy'],
+          },
+        },
+        {
           name: 'assert_tombstone',
           description:
-            'Directly assert a TB (skipping the proposal path) — for authors who already know. ' +
+            'Directly assert a TB (skipping the proposal path) — for authors who already know. Disabled when the ' +
+            'operator requires notarization (--require-notary): agents then draft with propose_tombstone. ' +
             'A TB claims a prior statement/decision is provably stale or wrong; at least one piece of evidence is required.',
           inputSchema: {
             type: 'object',
@@ -612,7 +663,31 @@ export class StenographerServer {
         return this.engine.dismissProposal(proposalId, dismissedBy, reason);
       }
 
+      case 'propose_tombstone': {
+        const result = await this.engine.draftTombstone({
+          claim: args.claim as string,
+          evidence: args.evidence as Evidence[],
+          literals: args.literals as TombstonedLiteral[] | undefined,
+          rationale: args.rationale as string | undefined,
+          targetRef: args.targetRef as string | undefined,
+          proposedBy: args.proposedBy as string,
+          agentSessionId: args.agentSessionId as string | undefined,
+        });
+        return {
+          proposal: result.proposal,
+          status: 'awaiting notarization — not truth until a person signs it',
+          raisedTo: result.raisedTo,
+          undelivered: result.undelivered,
+        };
+      }
+
       case 'assert_tombstone':
+        if (this.engine.config.requireNotary) {
+          throw new Error(
+            'the operator requires notarization: agents cannot assert tombstones directly — ' +
+              'draft it with propose_tombstone and a person will approve it'
+          );
+        }
         return this.engine.assertTombstone({
           claim: args.claim as string,
           evidence: args.evidence as Evidence[],
@@ -752,6 +827,7 @@ export async function runCLI(args: string[]): Promise<void> {
       'objection-webhook': { type: 'string', multiple: true },
       'objection-batch-size': { type: 'string' },
       'no-mcp-channel': { type: 'boolean' },
+      'require-notary': { type: 'boolean' },
     },
     allowPositionals: true,
   });
@@ -801,6 +877,8 @@ export async function runCLI(args: string[]): Promise<void> {
     objectionMode,
     objectionSinks,
     objectionMcpChannel: !values['no-mcp-channel'],
+    notarySecret: process.env.STENOGRAPHER_NOTARY_SECRET || undefined,
+    requireNotary: Boolean(values['require-notary']),
   };
 
   // Log to stderr — stdout carries the MCP stdio protocol

@@ -210,7 +210,8 @@ export interface ProposalBody {
       | 'sync-scan'
       | 'manual-flag'
       | 'wiki-reconciliation'
-      | 'compaction-candidate';
+      | 'compaction-candidate'
+      | 'agent-draft';
     score?: number;
     threshold?: number;
     detail?: string;
@@ -219,6 +220,12 @@ export interface ProposalBody {
   targetRef?: string | null;
   /** Engine bookkeeping (e.g. decision ids to close when signed). */
   meta?: Record<string, unknown>;
+  /**
+   * Agent-drafted proposals must be notarized by a person before they mint:
+   * no MCP tool can sign them, only the notary path (REST with the notary
+   * secret, or the interactive CLI).
+   */
+  requiresNotary?: boolean;
   status: ProposalStatus;
   dismissedBy?: string | null;
   dismissReason?: string | null;
@@ -264,6 +271,13 @@ export const TbInputSchema = z.object({
   claim: z.string().min(1),
   evidence: z.array(EvidenceSchema).min(1, 'a TB requires at least one piece of evidence'),
   signedBy: AuthorSchema,
+  literals: z.array(TombstonedLiteralSchema).optional(),
+});
+
+/** What an agent may draft: a TB body minus the signature it can't give itself. */
+export const TombstoneDraftInputSchema = z.object({
+  claim: z.string().min(1),
+  evidence: z.array(EvidenceSchema).min(1, 'a tombstone draft requires at least one piece of evidence'),
   literals: z.array(TombstonedLiteralSchema).optional(),
 });
 

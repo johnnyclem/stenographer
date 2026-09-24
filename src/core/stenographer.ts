@@ -22,6 +22,7 @@ import {
 import type { TruthFilter } from '../truth/ledger.js';
 import type { Objection, ObjectionMode, ObjectionStatus, ObjectionStats } from '../truth/objections.js';
 import { createSinkTransport, type ObjectionTransport } from '../truth/delivery.js';
+import { formatProposalNotice, raiseForNotarization } from '../truth/notary.js';
 import type {
   Evidence,
   VerifyBy,
@@ -643,6 +644,69 @@ export class Stenographer implements StenographerAPI {
     edits?: Record<string, unknown>,
     agentSessionId?: string
   ): Promise<TbEntry | UvEntry> {
+    return this.mintProposal(proposalId, signedBy, edits, { agentSessionId });
+  }
+
+  /**
+   * An agent drafts a tombstone it may not sign (§15). The draft is raised
+   * to the operator's receivers and printed to stderr; it mints only when a
+   * person notarizes it.
+   */
+  async draftTombstone(input: {
+    claim: string;
+    evidence: Evidence[];
+    literals?: TombstonedLiteral[];
+    rationale?: string;
+    targetRef?: string;
+    proposedBy: string;
+    agentSessionId?: string;
+  }): Promise<{ proposal: ProposalEntry; raisedTo: string[]; undelivered: Array<{ url: string; error?: string }> }> {
+    const embedding = await (await this.ensureEmbedder()).embed(input.claim);
+    const proposal = this.store.truth.draftTombstone(input, {
+      author: input.proposedBy,
+      agentSessionId: input.agentSessionId ?? null,
+      embedding,
+    });
+    console.error(formatProposalNotice(proposal));
+    const results = await raiseForNotarization(
+      this.config.objectionSinks ?? [],
+      proposal,
+      this.notarizeUrl(proposal.id)
+    );
+    return {
+      proposal,
+      raisedTo: results.filter((r) => !r.error).map((r) => r.url),
+      undelivered: results.filter((r) => r.error),
+    };
+  }
+
+  /**
+   * The notary path: a person approves an agent-drafted proposal. Callers
+   * (REST with the notary secret, the interactive CLI) are responsible for
+   * establishing that a person is on the other end.
+   */
+  async notarizeProposal(
+    proposalId: string,
+    notary: string,
+    edits?: Record<string, unknown>
+  ): Promise<TbEntry | UvEntry> {
+    return this.mintProposal(proposalId, notary, edits, { notarized: true });
+  }
+
+  /** Where a notary approves a proposal over REST, when the API is up. */
+  notarizeUrl(proposalId: string): string | undefined {
+    const port = this.restServer?.port;
+    if (!port) return undefined;
+    const host = this.config.restHost && this.config.restHost !== '0.0.0.0' ? this.config.restHost : '127.0.0.1';
+    return `http://${host}:${port}/proposals/${encodeURIComponent(proposalId)}/notarize`;
+  }
+
+  private async mintProposal(
+    proposalId: string,
+    signedBy: string,
+    edits: Record<string, unknown> | undefined,
+    opts: { agentSessionId?: string; notarized?: boolean }
+  ): Promise<TbEntry | UvEntry> {
     const proposal = this.store.truth.getEntry(proposalId) as ProposalEntry | null;
     const draft = { ...(proposal?.body.draft ?? {}), ...(edits ?? {}) };
     const text = (draft.claim as string) ?? (draft.assertion as string) ?? '';
@@ -650,7 +714,8 @@ export class Stenographer implements StenographerAPI {
 
     const entry = this.store.truth.signProposal(proposalId, signedBy, edits, {
       embedding,
-      agentSessionId,
+      agentSessionId: opts.agentSessionId,
+      notarized: opts.notarized,
     });
 
     const meta = proposal?.body.meta;
