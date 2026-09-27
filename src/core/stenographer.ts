@@ -193,8 +193,11 @@ export class Stenographer implements StenographerAPI {
       const filePath = join(dirPath, name);
       if (this.tailers.has(filePath)) return;
       if (!existsSync(filePath)) return;
-      // One session per log file, named after it
-      await this.startFileTailer(filePath, `session_${basename(name, '.jsonl')}`, true);
+      // One session per log file, named after it. Claude Code names each
+      // session log after its session id, and receivers (smallchat's
+      // messenger) route objections by that id — so the bare basename is the
+      // session id, with no prefix.
+      await this.startFileTailer(filePath, basename(name, '.jsonl'), true);
     };
 
     // Tail files already present, then watch for new ones

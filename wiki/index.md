@@ -37,4 +37,6 @@ Last updated: 2026-06-09
 
 ## Ecosystem Evaluation
 
+- [`docs/prd/2026-09-testimonial-gap.md`](../docs/prd/2026-09-testimonial-gap.md) — claim-by-claim verification of the stenographer testimonial against shipped code, cross-repo drift/overlap findings, and the requirements (R1–R9) that close the gaps.
+
 - [`docs/ecosystem/executive-summary.md`](../docs/ecosystem/executive-summary.md) — cross-repo evaluation from Stenographer's vantage point: what's actually wired vs. aspirational across the four-project stack, with a companion [engineering guide](../docs/ecosystem/engineering-guide.md).

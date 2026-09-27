@@ -132,7 +132,9 @@ describe('Stenographer engine', () => {
 
     const messages = await engine.getRecentMessages(10);
     const sessions = new Set(messages.map((m) => m.sessionId));
-    expect(sessions).toEqual(new Set(['session_a', 'session_b']));
+    // Session ids are the log basenames: for Claude Code that's the session
+    // id receivers route objections by.
+    expect(sessions).toEqual(new Set(['a', 'b']));
   });
 
   it('rejects watch mode on a non-directory', async () => {
