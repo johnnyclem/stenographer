@@ -86,6 +86,23 @@ describe('ClaudeCodeAdapter', () => {
     expect(adapter.detect([line])).toBe(true);
     expect(adapter.detect(['{"role":"user","content":"hi"}'])).toBe(false);
   });
+
+  it('detects a real session log that opens with bookkeeping records', () => {
+    // Shape observed in ~/.claude/projects/<proj>/<session>.jsonl: the first
+    // lines are queue/title records, and turns carry parentUuid + sessionId.
+    const sample = [
+      '{"type":"queue-operation","operation":"enqueue","timestamp":"2026-09-27T17:43:49Z","sessionId":"s-1","content":"do the thing"}',
+      '{"type":"ai-title","sessionId":"s-1","title":"Do the thing"}',
+      '{"type":"last-prompt","sessionId":"s-1","lastPrompt":"do the thing"}',
+      '{"parentUuid":null,"isSidechain":false,"type":"user","message":{"role":"user","content":"do the thing"},"uuid":"u-1","timestamp":"2026-09-27T17:43:50Z","sessionId":"s-1"}',
+    ];
+    expect(adapter.detect(sample)).toBe(true);
+    expect(detectAdapterFromLines(sample)).toBeInstanceOf(ClaudeCodeAdapter);
+    // Even a sample that never reaches a turn is recognisable by its envelope
+    expect(adapter.detect(sample.slice(0, 2))).toBe(true);
+    // A truncated (unparseable) line in the sample doesn't break detection
+    expect(adapter.detect([sample[3].slice(0, 40), sample[3]])).toBe(true);
+  });
 });
 
 describe('GenericAdapter', () => {

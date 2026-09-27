@@ -96,6 +96,66 @@ describe('proposal-draft intake (short-hand seam)', () => {
     expect(store.truth.getOpenUvs()).toHaveLength(1);
   });
 
+  // The same seam as smallchat's vendored compactor emits it
+  // (`proposeInvariants` / `appendProposalsFile`, mirrored in smallchat-swift's
+  // `InvariantProposal`): a PROPOSAL envelope around the same draft body.
+  function smallchatEnvelopeLine(name = 'database', session = 'sess-42'): string {
+    return JSON.stringify({
+      type: 'PROPOSAL',
+      kind: 'uv',
+      id: '01J9SMALLCHATULID000000000',
+      ts: '2026-09-23T13:58:31.000Z',
+      author: 'smallchat:compactor',
+      draft: {
+        assertion: `The invariant "${name}" holds: PostgreSQL.`,
+        basis: 'Survived compaction to L4.',
+        verifyBy: {
+          kind: 'inspect',
+          value: 'message:msg-9',
+          detail: 'confirm the compacted value still holds in the source conversation',
+        },
+      },
+      signal: { source: 'shorthand-compaction', detail: `level 4, round 2, session ${session}` },
+      targetRef: `entity:${session}:${name}`,
+      agentSessionId: session,
+    });
+  }
+
+  it("accepts smallchat's PROPOSAL envelope dialect and files it as a compaction candidate", () => {
+    const result = importProposalDrafts(store.truth, { lines: [smallchatEnvelopeLine()] });
+    expect(result.errors).toHaveLength(0);
+    expect(result.filed).toHaveLength(1);
+
+    const [p] = result.filed;
+    expect(p.author).toBe(COMPACTION_DETECTOR);
+    expect(p.body.kind).toBe('uv');
+    expect(p.body.signal.source).toBe('compaction-candidate');
+    expect(p.body.signal.detail).toContain('level 4');
+    expect(p.body.targetRef).toBe('entity:sess-42:database');
+    // The envelope's own identity travels as bookkeeping, never as authorship
+    expect(p.body.meta).toMatchObject({
+      intake: { source: 'shorthand-compaction', id: '01J9SMALLCHATULID000000000', author: 'smallchat:compactor' },
+    });
+    expect(p.agentSessionId).toBe('sess-42');
+    expect(p.createdAt).toBe('2026-09-23T13:58:31.000Z');
+    expect(store.truth.getTruth('all')).toHaveLength(0);
+  });
+
+  it('dedupes across dialects by targetRef', () => {
+    importProposalDrafts(store.truth, { lines: [smallchatEnvelopeLine('cache')] });
+    const again = importProposalDrafts(store.truth, { lines: [smallchatEnvelopeLine('cache')] });
+    expect(again.deduped).toBe(1);
+    expect(store.truth.listProposals('open')).toHaveLength(1);
+  });
+
+  it('still rejects an unknown signal source', () => {
+    const line = JSON.parse(smallchatEnvelopeLine());
+    line.signal.source = 'somebody-else';
+    const result = importProposalDrafts(store.truth, { lines: [JSON.stringify(line)] });
+    expect(result.filed).toHaveLength(0);
+    expect(result.errors).toHaveLength(1);
+  });
+
   it('the detector cannot sign its own intake (one hat, not two)', () => {
     const { filed } = importProposalDrafts(store.truth, { lines: [uvDraftLine()] });
     expect(() => store.truth.signProposal(filed[0].id, COMPACTION_DETECTOR)).toThrow();

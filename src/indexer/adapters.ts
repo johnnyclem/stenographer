@@ -191,13 +191,43 @@ export class ClaudeCodeAdapter implements LogAdapter {
     }
   }
 
+  /**
+   * Real session logs open with bookkeeping records (`queue-operation`,
+   * `ai-title`, `last-prompt`, `summary`, …) before the first turn, so the
+   * first line alone can't identify the format: any sampled line that is a
+   * Claude Code turn, or carries the session envelope, is enough.
+   */
   detect(lines: string[]): boolean {
-    return detectBy(lines, (obj) =>
-      (obj.type === 'user' || obj.type === 'assistant' || obj.type === 'summary') &&
-      (obj.message !== undefined || obj.type === 'summary')
-    );
+    return lines.some((line) => {
+      try {
+        const obj = JSON.parse(line);
+        if (!obj || typeof obj !== 'object') return false;
+        const isTurn =
+          (obj.type === 'user' || obj.type === 'assistant') &&
+          obj.message !== undefined &&
+          typeof obj.message === 'object';
+        const hasEnvelope =
+          typeof obj.type === 'string' &&
+          typeof obj.sessionId === 'string' &&
+          (typeof obj.uuid === 'string' || 'parentUuid' in obj || CLAUDE_CODE_RECORD_TYPES.has(obj.type));
+        return isTurn || hasEnvelope || obj.type === 'summary';
+      } catch {
+        return false;
+      }
+    });
   }
 }
+
+/** Non-turn record types Claude Code writes into a session log. */
+const CLAUDE_CODE_RECORD_TYPES = new Set([
+  'queue-operation',
+  'ai-title',
+  'last-prompt',
+  'summary',
+  'system',
+  'attachment',
+  'file-history-snapshot',
+]);
 
 // ─────────────────────────────────────────────────────────────
 // Generic best-effort: find role-ish and content-ish fields
@@ -268,16 +298,20 @@ export function detectAdapterFromLines(lines: string[]): LogAdapter {
   return adapters.get('jsonl')!;
 }
 
+/** Bytes sampled for format detection — Claude Code lines routinely exceed 10KB. */
+const DETECTION_SAMPLE_BYTES = 256 * 1024;
+const DETECTION_SAMPLE_LINES = 8;
+
 export function detectAdapter(filePath: string): Promise<LogAdapter> {
   return new Promise((resolve) => {
-    const stream = createReadStream(filePath, { end: 1024 * 10 });
+    const stream = createReadStream(filePath, { end: DETECTION_SAMPLE_BYTES - 1 });
     const rl = createInterface({ input: stream });
     const lines: string[] = [];
 
     rl.on('line', (line) => {
       if (line.trim()) {
         lines.push(line);
-        if (lines.length >= 5) rl.close();
+        if (lines.length >= DETECTION_SAMPLE_LINES) rl.close();
       }
     });
 

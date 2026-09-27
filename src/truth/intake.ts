@@ -34,20 +34,44 @@ const UvDraftSchema = z.object({
   contests: z.string().nullable().optional(),
 });
 
+/**
+ * Two emitters share this seam and their lines differ only in dressing:
+ * - short-hand's `exportProposalDrafts`: bare `{kind, draft, signal, targetRef?, provenance?}`
+ *   with `signal.source: 'compaction-candidate'`.
+ * - smallchat's vendored compactor (`proposeInvariants`, also mirrored in
+ *   smallchat-swift): the same body inside a `PROPOSAL` envelope —
+ *   `{type: 'PROPOSAL', id, ts, author, agentSessionId?, …}` with
+ *   `signal.source: 'shorthand-compaction'`.
+ * Both file as `PROPOSAL(signal.source: 'compaction-candidate')`; the
+ * envelope's own id/author/source are kept under `meta` for traceability.
+ */
+const CompactionSignalSchema = z.object({
+  source: z.enum(['compaction-candidate', 'shorthand-compaction']),
+  detail: z.string().optional(),
+});
+
+const EnvelopeFields = {
+  type: z.literal('PROPOSAL').optional(),
+  id: z.string().optional(),
+  ts: z.string().optional(),
+  author: z.string().optional(),
+  agentSessionId: z.string().nullable().optional(),
+  targetRef: z.string().nullable().optional(),
+  provenance: z.object({ kind: z.literal('sourceMessageId'), ref: z.string() }).optional(),
+};
+
 const ProposalDraftLineSchema = z.discriminatedUnion('kind', [
   z.object({
     kind: z.literal('tombstone'),
     draft: TombstoneDraftSchema,
-    signal: z.object({ source: z.literal('compaction-candidate'), detail: z.string().optional() }),
-    targetRef: z.string().optional(),
-    provenance: z.object({ kind: z.literal('sourceMessageId'), ref: z.string() }).optional(),
+    signal: CompactionSignalSchema,
+    ...EnvelopeFields,
   }),
   z.object({
     kind: z.literal('uv'),
     draft: UvDraftSchema,
-    signal: z.object({ source: z.literal('compaction-candidate'), detail: z.string().optional() }),
-    targetRef: z.string().optional(),
-    provenance: z.object({ kind: z.literal('sourceMessageId'), ref: z.string() }).optional(),
+    signal: CompactionSignalSchema,
+    ...EnvelopeFields,
   }),
 ]);
 
@@ -83,18 +107,31 @@ export function importProposalDrafts(
       continue;
     }
 
+    const fromEnvelope =
+      draft.type === 'PROPOSAL' || draft.id || draft.author || draft.signal.source !== 'compaction-candidate';
     const proposal = ledger.addProposal(
       {
         kind: draft.kind,
         draft: draft.draft as Record<string, unknown>,
-        signal: draft.signal,
+        signal: { source: 'compaction-candidate', ...(draft.signal.detail ? { detail: draft.signal.detail } : {}) },
         targetRef: draft.targetRef ?? null,
+        ...(fromEnvelope
+          ? {
+              meta: {
+                intake: {
+                  source: draft.signal.source,
+                  ...(draft.id ? { id: draft.id } : {}),
+                  ...(draft.author ? { author: draft.author } : {}),
+                },
+              },
+            }
+          : {}),
       },
       {
         author: ctx?.author ?? COMPACTION_DETECTOR,
         provenance: draft.provenance ?? { kind: 'manual' },
-        agentSessionId: ctx?.agentSessionId ?? null,
-        timestamp: ctx?.timestamp,
+        agentSessionId: ctx?.agentSessionId ?? draft.agentSessionId ?? null,
+        timestamp: ctx?.timestamp ?? draft.ts,
       }
     );
 

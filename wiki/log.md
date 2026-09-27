@@ -37,3 +37,10 @@ Append-only chronological record of wiki activity.
 - Created source: `wiki/raw/sources/stenographer.md`
 - Created wiki page: `wiki/wiki/stenographer.md`
 - Summary: Streaming companion observer for real-time conversation indexing. Background process that tails JSONL, builds entity graph, scores importance, provides warm start for short-hand compaction. Uses Gemma 4 for structured extraction.
+
+## [2026-09-27] verify | testimonial claims vs. shipped behavior; family alignment
+
+- Ran the suite (143 → 147 green), an end-to-end claim check (`docs/prd/verification/testimonial-claims.e2e.mjs`), and a real Claude Code session log through the adapter
+- Read smallchat `4cf0740`, short-hand `f3ee576`, smallchat-swift `ceb47a1`, smallchat-website `567ed0f` for stenographer-facing contracts
+- Fixed three drifts: smallchat's `PROPOSAL`-envelope proposal lines were rejected by intake; Claude Code logs auto-detected as `generic`; watch-mode session ids carried a `session_` prefix smallchat's messenger can't route
+- Wrote `docs/prd/2026-09-testimonial-gap.md`: verdicts per claim, sibling gaps, overlaps, requirements R1–R9
