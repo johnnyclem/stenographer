@@ -26,7 +26,8 @@ Point it at a JSONL log, and it gives your agent stack a semantic memory: entiti
 - **Importance Scoring** — a three-signal model (state delta, reference frequency, trajectory discontinuity) flags which messages matter, so retrieval and context-framing can prioritize signal over noise
 - **Decision Supersession (Tombstones)** — decisions are append-only; a newer decision or an "actually, …" correction closes the old record onto its successor, keeping full provenance
 - **Four Modes** — `live`, `catchup`, `watch` (a directory of session logs), `daemon` (live + REST API)
-- **Provider Adapters** — `jsonl`, `claude-code`, `anthropic`, `openai`, `generic`, auto-detected from file content
+- **Provider Adapters** — `jsonl`, `claude-code`, `anthropic`, `openai`, `generic`, auto-detected from the first lines written (a log created empty waits for its first line)
+- **Resumable Ingestion** — a per-log checkpoint commits with each message, so a restart picks up where the last run stopped instead of re-reading the log (see [Restarts and log rotation](#restarts-and-log-rotation))
 - **Two Query Surfaces** — MCP over stdio, REST over HTTP (GraphQL: roadmap)
 
 ## Requirements
@@ -75,6 +76,14 @@ npx stenographer start ./conversation.jsonl --embeddings hashed
 | `--rest-host` | hostname/IP | `127.0.0.1` | Interface for the REST API to bind to. The API has no authentication, so it stays loopback-only unless you explicitly opt into wider exposure (e.g. `0.0.0.0` behind a trusted network boundary) |
 
 Positional args: `stenographer start <log-path> [state-path]` — `state-path` defaults to `./stenographer.db`.
+
+### Restarts and log rotation
+
+Each log has a checkpoint in the state database: the byte offset after the last indexed line, plus what identifies the file (device/inode and a hash of its first 4 KB). The checkpoint is written in the same SQLite transaction as the message and everything derived from it (entities, decisions, supersessions, proposals, objections), so after a crash or restart a line has either been applied completely or not at all, and indexing resumes right after the last applied line. A log keeps its session id across restarts.
+
+Scope of the idempotency: within one state database, a line whose message id and content are already indexed is skipped for every derived record, whether it is re-read after a truncate-and-rewrite or copied into another session's log (the message moves to the newer session; nothing is re-derived). Decisions and supersession tombstones get ids hashed (128-bit) from the line they came from, and so do messages whose format has no id of its own (`openai`, `anthropic`, `generic`): log path, byte offset and line content. Two identical `continue` turns therefore stay two messages.
+
+The tailer holds back a partially written line until its newline arrives (`catchup` indexes a final unterminated line but leaves the checkpoint before it). It strips a UTF-8 BOM. It waits for a log that doesn't exist yet. When a log is deleted it waits for the log to reappear (in `watch` mode it drops that session), and it follows the path through a rename rotation or atomic replace after draining the old file. If the file is truncated or rewritten, it reads it again from the top, where the lines it has already indexed are skipped. State databases record their schema version (`PRAGMA user_version`), migrate in place on start and run in WAL mode.
 
 ### Offline mode
 
@@ -216,7 +225,7 @@ v1 is precision over recall: exact tokens (`30` never matches `300`), the subjec
 
 Every objection ships the objection, the exhibit (the full TB, plus any contesting UVs), and the transcript line. The judge rules via `rule_on_objection`: **sustained** lands as an ordinary `RULING` (`kind: objection`) corroborating the TB; **overruled** is signal. The **sustain rate** (`get_status` → `objections`) is the tuning dial — a falling rate means tighten the matcher.
 
-`--objections shadow` (default) records objections without emitting them, so they can be shadow-judged against real MR catches; `deliver` pushes them (below) and serves them on `GET /flags` (poll with the last id as `since`); `off` disables the detector. Catch-up replays are always recorded as shadow.
+`--objections shadow` (default) records objections without emitting them, so they can be shadow-judged against real MR catches; `deliver` pushes them (below) and serves them on `GET /flags` (poll with the last id as `since`); `off` disables the detector. Replays are always recorded as shadow, in every mode: only lines appended after stenographer started, or lines in a session log that appeared after it started, are delivered. Whatever a log already held at startup is history, including lines written while stenographer was stopped.
 
 **Delivery (webhooks).** In `deliver` mode, objections are pushed to every configured receiver:
 
