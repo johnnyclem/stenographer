@@ -5,6 +5,7 @@
 
 import { z } from 'zod';
 import type { ObjectionSinkConfig } from './truth/delivery.js';
+import type { SignerRegistryFile } from './truth/identity.js';
 
 // ─────────────────────────────────────────────────────────────
 // Message Schema (input from JSONL tailer)
@@ -225,10 +226,37 @@ export interface StenographerConfig {
    */
   notarySecret?: string;
   /**
-   * Agents must go through `propose_tombstone`: the MCP `assert_tombstone`
-   * tool is refused, so every agent-authored TB is notarized by a person.
+   * Which MCP tools this server exposes, and who its writes are attributed to.
+   * - 'agent' (default): read tools plus propose_tombstone, assert_uv and a
+   *   resolve_uv that cannot mint TBs. Every write is attributed to
+   *   `agentIdentity`; tool arguments cannot name anyone. No tool in this
+   *   profile mints a TB, signs, dismisses, overrides, strikes or rules.
+   * - 'operator': the judicial and destructive tools (sign_proposal,
+   *   dismiss_proposal, override_tombstone, file_ruling, rule_on_objection,
+   *   assert_tombstone, wiki import/export, backfill), for a notary UI or
+   *   CLI a person drives. Identities come from the caller and are checked
+   *   against `signerRegistry`. Never give this profile to an agent.
    */
-  requireNotary?: boolean;
+  profile?: 'agent' | 'operator';
+  /**
+   * The identity agent-profile writes are attributed to (`--agent-identity`).
+   * Default: `agent:<name>` from the MCP client's clientInfo.
+   */
+  agentIdentity?: string;
+  /**
+   * Single-user opt-out (`--allow-agent-assert`): the agent profile also
+   * exposes assert_tombstone and lets resolve_uv mint TBs from `command`
+   * evidence, signed by the agent identity (never a person's name). Off by
+   * default, so every agent-authored TB is notarized by a person.
+   */
+  allowAgentAssert?: boolean;
+  /**
+   * Signer registry (`--signer-registry`): a JSON file path, or the parsed
+   * file — `{"signers": [{"id", "role": "human"|"agent"|"detector", "aliases"?}]}`.
+   * When set, operator paths accept only listed identities with a role that
+   * may perform the act (people sign, notarize, rule; agents draft).
+   */
+  signerRegistry?: string | SignerRegistryFile;
   /** Port for the REST API. Defaults to 8787 in daemon mode, off otherwise. */
   restPort?: number;
   /**

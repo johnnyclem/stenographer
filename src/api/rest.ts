@@ -17,7 +17,9 @@
  *   GET /context-frame?budget=2000
  *   GET /proposals?status=open&kind=tombstone  (the review inbox)
  *
- * Notary routes (§15) — require X-Notary-Secret; disabled when no secret is set:
+ * Notary routes (§15) — require X-Notary-Secret; disabled when no secret is set.
+ * The notary/dismisser name is checked against the signer registry when one
+ * is configured (it must be a person):
  *   POST /proposals/:id/notarize  {notary, edits?}
  *   POST /proposals/:id/dismiss   {dismissedBy, reason}
  */
@@ -212,8 +214,9 @@ export class RestServer {
 
   /**
    * The notary routes: a person approving (or declining) a proposal from a UI
-   * that holds the notary secret. Agents are never given the secret, so this
-   * is the path their MCP tools can't take.
+   * that holds the notary secret. The agent MCP profile has no tool that
+   * reaches them; the secret itself is only as private as this process's
+   * environment (see the README's threat model).
    */
   private async handleNotary(req: IncomingMessage, res: ServerResponse, path: string): Promise<void> {
     const match = path.match(/^\/proposals\/([^/]+)\/(notarize|dismiss)$/);

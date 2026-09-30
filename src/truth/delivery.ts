@@ -89,7 +89,7 @@ export function formatObjection(o: Objection): string {
     lines.push(`Contested by: ${o.exhibit.contestedBy.map((uv) => `${uv.id} — ${uv.body.assertion}`).join('; ')}`);
   }
   lines.push(
-    `If the objection is right, correct course. Rule with rule_on_objection(objectionId: "${o.id}", outcome: "sustained" | "overruled", opinion, author).`
+    `If the objection is right, correct course; if it is wrong or immaterial, say so. A person rules on it with rule_on_objection(objectionId: "${o.id}") in the operator profile.`
   );
   return lines.join('\n');
 }

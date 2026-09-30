@@ -38,8 +38,8 @@ Stenographer 🤖 MCP court reporter
 Usage:
   stenographer start <log-path> [state-path] [options]  Start the MCP server
   stenographer proposals [state-path]                   List open proposals
-  stenographer notarize <id> --as <name> [--state <path>] [--decline <reason>]
-                                                        Approve (or decline) an agent-drafted
+  stenographer notarize <id> --as <name> [--state <path>] [--signer-registry <path>]
+                       [--decline <reason>]             Approve (or decline) an agent-drafted
                                                         tombstone — interactive terminal only
   stenographer init [name]                              Initialize a new project
   stenographer -h, --help                               Show help
@@ -73,9 +73,25 @@ Options (start):
                            batch size for --objection-webhook (default: 3)
       --no-mcp-channel     don't push objections to the attached MCP client
                            as Claude Code channel events
-      --require-notary     agents can't assert tombstones directly: they draft
-                           with propose_tombstone and a person notarizes
-                           (REST notary routes use STENOGRAPHER_NOTARY_SECRET)
+      --profile <name>     agent | operator  (default: agent)
+                           agent:    read tools + propose_tombstone, assert_uv,
+                                     resolve_uv (no minting); writes carry the
+                                     agent identity, never a caller-named one
+                           operator: sign/dismiss/override/rule/strike, direct
+                                     TBs, wiki import/export, backfill — for a
+                                     notary UI or CLI a person drives, never
+                                     an agent
+      --agent-identity <id>
+                           who agent-profile writes are attributed to
+                           (default: agent:<MCP client name>)
+      --allow-agent-assert single-user opt-out: the agent profile may assert
+                           TBs, signed by the agent identity (off: agents
+                           draft and a person notarizes; REST notary routes
+                           use STENOGRAPHER_NOTARY_SECRET)
+      --signer-registry <path>
+                           JSON allowlist of signers and roles
+                           ({"signers": [{"id", "role": "human"|"agent"}]});
+                           operator paths accept only listed identities
 
 Examples:
   stenographer start ./conversation.jsonl

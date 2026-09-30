@@ -23,6 +23,8 @@ import type { TruthFilter } from '../truth/ledger.js';
 import type { Objection, ObjectionMode, ObjectionStatus, ObjectionStats } from '../truth/objections.js';
 import { createSinkTransport, type ObjectionTransport } from '../truth/delivery.js';
 import { formatProposalNotice, raiseForNotarization } from '../truth/notary.js';
+import { ContemptError } from '../truth/ledger.js';
+import { SignerRegistry, resolveIdentity, type SignerRole } from '../truth/identity.js';
 import type {
   Evidence,
   VerifyBy,
@@ -33,6 +35,7 @@ import type {
   RulingEntry,
   ProposalBody,
   TombstonedLiteral,
+  FiledRulingKind,
 } from '../truth/types.js';
 import type {
   StenographerAPI,
@@ -69,6 +72,7 @@ export class Stenographer implements StenographerAPI {
   private truthMode: 'shadow' | 'assert';
   private objectionMode: ObjectionMode;
   private sinkTransports: ObjectionTransport[];
+  private signers: SignerRegistry | null;
 
   constructor(config: StenographerConfig) {
     this.config = config;
@@ -82,6 +86,7 @@ export class Stenographer implements StenographerAPI {
     // Validate sinks up front: a bad or non-loopback URL fails at startup,
     // not at the first objection
     this.sinkTransports = (config.objectionSinks ?? []).map(createSinkTransport);
+    this.signers = config.signerRegistry ? SignerRegistry.load(config.signerRegistry) : null;
   }
 
   /** Session scope for queries: single session in file modes, all in watch mode. */
@@ -628,6 +633,15 @@ export class Stenographer implements StenographerAPI {
     return this.truthMode;
   }
 
+  /**
+   * Validates an identity for an act only `roles` may perform: canonical,
+   * never anonymous or reserved, and — when a signer registry is configured
+   * — listed with one of those roles. Returns the canonical spelling.
+   */
+  resolveIdentity(raw: string, roles: SignerRole[], what: string): string {
+    return resolveIdentity(raw, roles, what, this.signers);
+  }
+
   /** The review inbox. */
   async listProposals(
     status?: ProposalBody['status'],
@@ -639,7 +653,8 @@ export class Stenographer implements StenographerAPI {
   /**
    * Mints the TB/UV from a proposal under an accountable signer, and closes
    * the superseded decision the proposal targeted (idempotent in shadow
-   * mode, where auto-close already did it).
+   * mode, where auto-close already did it). Agent drafts are refused here:
+   * they mint only through notarizeProposal.
    */
   async signProposal(
     proposalId: string,
@@ -647,7 +662,8 @@ export class Stenographer implements StenographerAPI {
     edits?: Record<string, unknown>,
     agentSessionId?: string
   ): Promise<TbEntry | UvEntry> {
-    return this.mintProposal(proposalId, signedBy, edits, { agentSessionId });
+    const signer = this.resolveIdentity(signedBy, ['human'], 'signer');
+    return this.mintProposal(proposalId, signer, edits, { agentSessionId });
   }
 
   /**
@@ -663,13 +679,32 @@ export class Stenographer implements StenographerAPI {
     targetRef?: string;
     proposedBy: string;
     agentSessionId?: string;
-  }): Promise<{ proposal: ProposalEntry; raisedTo: string[]; undelivered: Array<{ url: string; error?: string }> }> {
+  }): Promise<{
+    proposal: ProposalEntry;
+    /** Set when the drafter already had an open draft for this targetRef: that one is returned, unchanged. */
+    dedupedInto?: string;
+    raisedTo: string[];
+    undelivered: Array<{ url: string; error?: string }>;
+  }> {
+    const proposedBy = this.resolveIdentity(input.proposedBy, ['agent', 'human'], 'drafter');
+    const prior = input.targetRef
+      ? this.store.truth.findOpenProposal({
+          kind: 'tombstone',
+          targetRef: input.targetRef,
+          author: proposedBy,
+          requiresNotary: true,
+        })
+      : null;
     const embedding = await (await this.ensureEmbedder()).embed(input.claim);
     const proposal = this.store.truth.draftTombstone(input, {
-      author: input.proposedBy,
+      author: proposedBy,
       agentSessionId: input.agentSessionId ?? null,
       embedding,
     });
+    // Already raised when it was first drafted — don't page the notary twice
+    if (prior && prior.id === proposal.id) {
+      return { proposal, dedupedInto: proposal.id, raisedTo: [], undelivered: [] };
+    }
     console.error(formatProposalNotice(proposal));
     const results = await raiseForNotarization(
       this.config.objectionSinks ?? [],
@@ -693,7 +728,8 @@ export class Stenographer implements StenographerAPI {
     notary: string,
     edits?: Record<string, unknown>
   ): Promise<TbEntry | UvEntry> {
-    return this.mintProposal(proposalId, notary, edits, { notarized: true });
+    const signer = this.resolveIdentity(notary, ['human'], 'notary');
+    return this.mintProposal(proposalId, signer, edits, { notarized: true });
   }
 
   /** Where a notary approves a proposal over REST, when the API is up. */
@@ -736,10 +772,15 @@ export class Stenographer implements StenographerAPI {
     dismissedBy: string,
     reason: string
   ): Promise<ProposalEntry> {
-    return this.store.truth.dismissProposal(proposalId, dismissedBy, reason);
+    const dismisser = this.resolveIdentity(dismissedBy, ['human'], 'dismisser');
+    return this.store.truth.dismissProposal(proposalId, dismisser, reason);
   }
 
-  /** Direct TB, skipping the proposal path — for authors who already know. */
+  /**
+   * Direct TB, skipping the proposal path — for authors who already know.
+   * The signer may be a person or (single-user setups) an agent identity;
+   * a registry decides which, when configured.
+   */
   async assertTombstone(input: {
     claim: string;
     evidence: Evidence[];
@@ -748,11 +789,13 @@ export class Stenographer implements StenographerAPI {
     author?: string;
     agentSessionId?: string;
   }): Promise<TbEntry> {
+    const signedBy = this.resolveIdentity(input.signedBy, ['human', 'agent'], 'signer');
+    const author = input.author ? this.resolveIdentity(input.author, ['human', 'agent'], 'author') : signedBy;
     const embedding = await (await this.ensureEmbedder()).embed(input.claim);
     return this.store.truth.assertTombstone(
-      { claim: input.claim, evidence: input.evidence, signedBy: input.signedBy, literals: input.literals },
+      { claim: input.claim, evidence: input.evidence, signedBy, literals: input.literals },
       {
-        author: input.author ?? input.signedBy,
+        author,
         agentSessionId: input.agentSessionId ?? null,
         embedding,
       }
@@ -763,10 +806,11 @@ export class Stenographer implements StenographerAPI {
     assertion: string;
     basis: string;
     verifyBy: VerifyBy;
-    contests?: string;
+    contests?: string | null;
     author: string;
     agentSessionId?: string;
   }): Promise<UvEntry> {
+    const author = this.resolveIdentity(input.author, ['human', 'agent'], 'author');
     const embedding = await (await this.ensureEmbedder()).embed(input.assertion);
     return this.store.truth.assertUv(
       {
@@ -775,7 +819,7 @@ export class Stenographer implements StenographerAPI {
         verifyBy: input.verifyBy,
         contests: input.contests,
       },
-      { author: input.author, agentSessionId: input.agentSessionId ?? null, embedding }
+      { author, agentSessionId: input.agentSessionId ?? null, embedding }
     );
   }
 
@@ -789,6 +833,8 @@ export class Stenographer implements StenographerAPI {
       opinion?: string;
       mintTombstone?: string;
       agentSessionId?: string;
+      /** False refuses any resolution that would mint a TB (the MCP agent profile). */
+      allowMint?: boolean;
     }
   ): Promise<{
     uv: UvEntry;
@@ -796,34 +842,38 @@ export class Stenographer implements StenographerAPI {
     tombstone: TbEntry | null;
     ruling: RulingEntry | null;
   }> {
+    const author = this.resolveIdentity(opts.author, ['human', 'agent'], 'resolver');
+    const signedBy = opts.signedBy ? this.resolveIdentity(opts.signedBy, ['human'], 'signer') : undefined;
     const uv = this.store.truth.getEntry(uvId) as UvEntry | null;
     const embedding = uv
       ? await (await this.ensureEmbedder()).embed(uv.body.assertion)
       : undefined;
     return this.store.truth.resolveUv(uvId, resolution, evidence, {
-      author: opts.author,
-      signedBy: opts.signedBy,
+      author,
+      signedBy,
       opinion: opts.opinion,
       mintTombstone: opts.mintTombstone,
       agentSessionId: opts.agentSessionId ?? null,
+      allowMint: opts.allowMint,
       embedding,
     });
   }
 
-  /** The force path — fails without evidence. */
+  /** The force path — fails without evidence. A person's act. */
   async overrideTombstone(
     tbId: string,
     addendum: { evidence: Evidence[]; note?: string },
     opts: { author: string; agentSessionId?: string }
   ): Promise<{ tombstone: TbEntry; addendum: AddendumEntry }> {
     return this.store.truth.overrideTombstone(tbId, addendum, {
-      author: opts.author,
+      author: this.resolveIdentity(opts.author, ['human'], 'author'),
       agentSessionId: opts.agentSessionId ?? null,
     });
   }
 
+  /** Rulings are judgments: a person's act. */
   async fileRuling(input: {
-    kind: 'strike' | 'promotion' | 'contempt';
+    kind: FiledRulingKind;
     opinion: string;
     target: string;
     author: string;
@@ -831,7 +881,10 @@ export class Stenographer implements StenographerAPI {
   }): Promise<{ ruling: RulingEntry; conductTombstone: TbEntry | null }> {
     return this.store.truth.fileRuling(
       { kind: input.kind, opinion: input.opinion, target: input.target },
-      { author: input.author, agentSessionId: input.agentSessionId ?? null }
+      {
+        author: this.resolveIdentity(input.author, ['human'], 'ruling author'),
+        agentSessionId: input.agentSessionId ?? null,
+      }
     );
   }
 
@@ -941,21 +994,29 @@ export class Stenographer implements StenographerAPI {
    * The judge rules. Sustained lands in the record as corroboration for
    * the TB; overruled is signal for tightening the matcher. Either way the
    * ruling is an ordinary RULING in the ledger, with a written opinion.
+   * The judge is a person, and never the session the objection was raised
+   * against: the defendant doesn't rule on its own objection.
    */
   async ruleOnObjection(
     objectionId: string,
     outcome: 'sustained' | 'overruled',
     opts: { author: string; opinion: string; agentSessionId?: string }
   ): Promise<{ objection: Objection; ruling: RulingEntry }> {
+    const author = this.resolveIdentity(opts.author, ['human'], 'judge');
     const objection = this.store.objections.get(objectionId);
     if (!objection) throw new Error(`no such objection: ${objectionId}`);
     if (objection.status !== 'pending') {
       throw new Error(`objection ${objectionId} was already ${objection.status}`);
     }
+    if (opts.agentSessionId && opts.agentSessionId.trim() === objection.sessionId.trim()) {
+      throw new ContemptError(
+        `contempt of corpus: session ${objection.sessionId} cannot rule on objection ${objectionId} raised against it`
+      );
+    }
     const ruling = this.store.truth.fileObjectionRuling(
       { objectionId, tbId: objection.tbId, outcome, opinion: opts.opinion },
       {
-        author: opts.author,
+        author,
         agentSessionId: opts.agentSessionId ?? null,
         provenance: { kind: 'sourceMessageId', ref: objection.messageId },
       }

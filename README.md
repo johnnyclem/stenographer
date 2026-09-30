@@ -71,7 +71,10 @@ npx stenographer start ./conversation.jsonl --embeddings hashed
 | `--objection-webhook` | URL (repeatable) | — | Webhook for harnesses that can't be interrupted: objections arrive in batches. HMAC key from `STENOGRAPHER_WEBHOOK_SECRET` |
 | `--objection-batch-size` | number | `3` | Batch size for `--objection-webhook` |
 | `--no-mcp-channel` | — | — | Don't push objections to the attached MCP client as Claude Code channel events |
-| `--require-notary` | — | off | Agents can't assert tombstones directly: they draft with `propose_tombstone` and a person notarizes (see [Agent-drafted tombstones](#agent-drafted-tombstones-notarization)). REST notary routes need `STENOGRAPHER_NOTARY_SECRET` |
+| `--profile` | `agent` \| `operator` | `agent` | Which MCP tools are served. `agent`: read tools plus drafting (`propose_tombstone`, `assert_uv`, a `resolve_uv` that can't mint TBs). `operator`: the judicial and destructive tools, for a notary UI or CLI a person drives — never an agent. See [Notarization, identity and the threat model](#notarization-identity-and-the-threat-model) |
+| `--agent-identity` | identity | `agent:<MCP client name>` | Who agent-profile writes are attributed to. Tool arguments can't override it |
+| `--allow-agent-assert` | — | off | Single-user opt-out: the agent profile also serves `assert_tombstone` and lets `resolve_uv` mint TBs from `command` evidence, signed by the agent identity (never a person's name). Off, every agent-authored TB is notarized by a person |
+| `--signer-registry` | path | — | JSON allowlist of signers and roles; operator paths (MCP operator profile, REST notary routes, `stenographer notarize`) accept only listed identities in a role that may act |
 | `--rest-host` | hostname/IP | `127.0.0.1` | Interface for the REST API to bind to. The API has no authentication, so it stays loopback-only unless you explicitly opt into wider exposure (e.g. `0.0.0.0` behind a trusted network boundary) |
 
 Positional args: `stenographer start <log-path> [state-path]` — `state-path` defaults to `./stenographer.db`.
@@ -98,24 +101,28 @@ By default, Stenographer downloads a ~25MB embedding model on first run and does
 
 ### Truth-layer tools (TB/UV v2)
 
-| Tool | Description |
-|------|-------------|
-| `list_proposals` | The review inbox: machine-drafted candidates awaiting sign/dismiss |
-| `sign_proposal` | Mint a TB/UV from a proposal under an accountable signer (`edits` supported). Refuses agent drafts — those need a notary |
-| `propose_tombstone` | An agent drafts a TB (claim, evidence, literals, rationale); it's raised to a person and never mints until they notarize it |
-| `dismiss_proposal` | Dismiss with a required reason (kept as detector training data) |
-| `assert_tombstone` | Direct TB for authors who already know — evidence required |
-| `assert_uv` | Assert an unverified belief with a machine-actionable `verifyBy`; `contests` disputes a TB |
-| `resolve_uv` | Verify/refute a UV with evidence; `command` evidence self-signs |
-| `override_tombstone` | The force path: override a TB with a proven addendum |
-| `get_verification_queue` | Open UVs ranked for opportunistic verification |
-| `get_contested` | All TB+UV disputes |
-| `get_truth` / `search_truth` | Truth entries by filter / by embedding relevance |
-| `file_ruling` | Strike, promotion, or contempt ruling with a written opinion |
-| `export_wiki_entries` / `import_wiki_entries` | Lossless team llm-wiki JSONL interop |
-| `backfill_legacy_tombstones` | Phase-1 migration of pre-assertion supersessions |
-| `list_objections` | Real-time objections (objection + exhibit + transcript line); `includeShadow` for shadow judging |
-| `rule_on_objection` | Sustain or overrule an objection with a written opinion — files a `RULING` |
+Which tools a server serves depends on its `--profile`. Every tool's arguments are validated against a strict schema before anything runs (unknown arguments, out-of-set enums and wrong types are rejected; limits are clamped), and the advertised `inputSchema` is derived from that same schema.
+
+| Tool | Profile | Description |
+|------|---------|-------------|
+| `list_proposals` | both | The review inbox: drafted candidates awaiting a person's sign/dismiss |
+| `get_verification_queue` | both | Open UVs ranked for opportunistic verification |
+| `get_contested` | both | All TB+UV disputes |
+| `get_truth` / `search_truth` | both | Truth entries by filter / by embedding relevance |
+| `list_objections` | both | Real-time objections (objection + exhibit + transcript line); `includeShadow` for shadow judging |
+| `propose_tombstone` | agent | Draft a TB (claim, evidence, literals, rationale); it's raised to a person and never mints until they notarize it. `targetRef` dedupes only against the same agent's open drafts |
+| `assert_uv` | agent, operator | Assert an unverified belief with a machine-actionable `verifyBy`; `contests` disputes a TB. In the agent profile the author is the agent identity |
+| `resolve_uv` | agent, operator | Verify/refute a UV with evidence. In the agent profile a resolution that would mint a TB (verifying a contest) is refused; in the operator profile `command` evidence self-signs and other evidence needs a person's `signedBy` |
+| `assert_tombstone` | operator (agent with `--allow-agent-assert`) | Direct TB, evidence required. With `--allow-agent-assert` it is signed by the agent identity |
+| `sign_proposal` | operator | Notarize a proposal under a person's identity (`edits` supported) — signs agent drafts too |
+| `dismiss_proposal` | operator | Dismiss with a required reason (kept as detector training data) |
+| `override_tombstone` | operator | The force path: override a TB with a proven addendum |
+| `file_ruling` | operator | Strike, promotion, or contempt ruling with a written opinion; any other `kind` is rejected |
+| `rule_on_objection` | operator | Sustain or overrule an objection with a written opinion — files a `RULING` |
+| `export_wiki_entries` / `import_wiki_entries` | operator | Lossless team llm-wiki JSONL interop |
+| `backfill_legacy_tombstones` | operator | Phase-1 migration of pre-assertion supersessions |
+
+Tools carry MCP annotations: read tools are `readOnlyHint`, and the ones that close, flip or strike records (`sign_proposal`, `dismiss_proposal`, `override_tombstone`, `file_ruling`, operator `resolve_uv`, `export_wiki_entries`) are `destructiveHint`.
 
 ## REST API (daemon mode or `--rest-port`)
 
@@ -133,7 +140,7 @@ POST /proposals/:id/notarize  {notary, edits?}      X-Notary-Secret required
 POST /proposals/:id/dismiss   {dismissedBy, reason} X-Notary-Secret required
 ```
 
-There's no authentication on these routes, so the server binds to `127.0.0.1` by default — pass `--rest-host` if you deliberately want it reachable from elsewhere.
+There's no authentication on the GET routes, so the server binds to `127.0.0.1` by default — pass `--rest-host` if you deliberately want it reachable from elsewhere. The notary routes check `notary`/`dismissedBy` like any operator path: canonicalized, never anonymous or reserved, and a registered person when `--signer-registry` is set (otherwise `422`).
 
 ## Importance Scoring
 
@@ -174,9 +181,9 @@ Five record types live in one append-only ledger (`truth_entries`, mirrored to w
 - **`ADDENDUM`** — evidence attached after the fact (UV resolutions, TB overrides).
 - **`RULING`** — a signed judgment with a required written opinion: `strike` (inadmissible, never deleted), `promotion` (evidence ruled sufficient), `contempt` (self-corroboration called out — mints one conduct TB, no karma system).
 
-**Override protocol** (force semantics, enforced at the storage layer): flipping an active TB requires either a contesting UV (`contests` — TB becomes `contested` but stays truth) or a proven addendum with evidence (`overrides`). There is no third path, and no path at all for anonymous writes — generic identities (`system`, `assistant`, …) are rejected at the schema level.
+**Override protocol** (force semantics, enforced at the storage layer): flipping an active TB requires either a contesting UV (`contests` — TB becomes `contested` but stays truth) or a proven addendum with evidence (`overrides`). There is no third path, and no path at all for anonymous writes — generic identities (`system`, `assistant`, …) and identities with control characters are rejected at the schema level, and `migration` and `detector:*` are reserved for the backfill and detector paths, as author and as signer.
 
-**Contempt of corpus**: corroboration must be provenance-independent. A `verifies`/`signs` whose actor shares the author or agent session of its target is rejected at write time — three subagents affirming their parent's UV is one opinion wearing three hats.
+**Contempt of corpus**: corroboration must be provenance-independent. A `verifies`/`signs`/`refutes` whose actor — the resolver *and* any signer — shares the author, signer, drafter or agent session of its target is rejected at write time — three subagents affirming their parent's UV is one opinion wearing three hats. Identities compare canonically (Unicode NFKC, invisible characters removed, trimmed, case-folded), so `Alice`, ` alice ` and `ａｌｉｃｅ` are one person. Refuting a contest restores its TB, so the TB's own author, signer or drafter can't be the one to refute it (conceding, by verifying the contest, is allowed).
 
 **Rollout** is governed by `truthMode`:
 - `shadow` (default, Phase 0): auto-close keeps working *and* every detection lands as a proposal — observe quality, tune.
@@ -186,17 +193,42 @@ Downstream consumers get the confidence type in every result, with the consumpti
 
 **Proposal intake** (`importProposalDrafts`): external tools — today [short-hand](https://github.com/johnnyclem/short-hand)'s compactor, which exports its L4 candidate invariants and detected corrections as draft JSONL — can file candidates into the ledger. Every line lands as a `PROPOSAL` under a detector identity (`detector:short-hand`); there is no external write path to TB or UV, the detector cannot sign its own intake, and `targetRef` dedupe makes re-imports idempotent. This is the Option B seam from the TB/UV v2 handoff (§13 Q6): format-level interop, no code dependency in either direction. Both dialects of the line are accepted: short-hand's bare `{kind, draft, signal: {source: "compaction-candidate"}}` and the `PROPOSAL` envelope smallchat's vendored compactor (and smallchat-swift) writes — `{type: "PROPOSAL", id, ts, author, agentSessionId, …, signal: {source: "shorthand-compaction"}}`. The envelope's own id and author are kept under `meta.intake` for traceability; authorship stays with the detector identity.
 
-### Agent-drafted tombstones (notarization)
+### Notarization, identity and the threat model
 
-Agents often find the dead value first — the config that was bumped, the class that was deleted. `propose_tombstone` lets them draft the TB: claim, evidence, the literals to object to, and why. They can't sign it. The draft is a `PROPOSAL` marked `requiresNotary`, and only a person turns it into truth:
+Agents often find the dead value first — the config that was bumped, the class that was deleted. They can draft the tombstone, but a person signs it. Two mechanisms carry that: **tool profiles**, which decide what an MCP client can do at all, and **server-bound identity**, which decides whose name lands on each write.
 
-1. **Raised.** The draft goes to the same receivers as objections — smallchat's channel bridge (`meta.kind: "proposal"`, with a `notarize_url`) and operator webhooks (`type: "stenographer.proposal"`) — never to the attached MCP client, which is the drafter. It's also printed to stderr and stays in `GET /proposals?status=open`.
-2. **Notarized.** A person approves or declines it through a path agents' tools don't reach:
+**Profiles.** A stenographer MCP server runs one profile (`--profile`, default `agent`):
+
+- **`agent`** — what you put in an agent's MCP config. Read tools, plus `propose_tombstone`, `assert_uv`, and a `resolve_uv` that refuses any resolution that would mint a TB. Nothing in this profile signs, notarizes, dismisses, overrides, strikes, rules, imports, or asserts a TB. Every path the 0.x audit found to mint a TB without a person — `sign_proposal` with edits, `resolve_uv` with `mintTombstone` or a verified contest, `file_ruling` with an unknown kind, `import_wiki_entries`, `assert_tombstone` — is either absent from this profile or refused by it.
+- **`operator`** — for a notary UI or CLI that a person drives (smallchat-swift's approval view, a terminal). It serves `sign_proposal` (the notary act, which also signs agent drafts), `dismiss_proposal`, `override_tombstone`, `file_ruling`, `rule_on_objection`, `assert_tombstone`, wiki import/export and the backfill. Never give it to an agent.
+
+`--allow-agent-assert` is the explicit opt-out for single-user setups: the agent profile also serves `assert_tombstone`, and `resolve_uv` may mint from `command` evidence. Those TBs are signed by the agent identity, never by a person's name, and a judgment call (non-`command` evidence) still needs a person's signature.
+
+**Identity.** In the agent profile the server binds identity: every write carries `--agent-identity` (default `agent:<name the MCP client sent in clientInfo>`) and this server's session id. Agent tools take no `author`, `signedBy`, `proposedBy`, `dismissedBy` or `agentSessionId` argument; passing one is a validation error. Subagents that share the connection share the session, so they can't corroborate each other. Operator paths take the signer's name from the caller and check it: canonicalized, never anonymous or reserved (`migration`, `detector:*`), and — with `--signer-registry` — listed in a role that may act:
+
+```json
+{ "signers": [
+    { "id": "johnnyclem", "role": "human", "aliases": ["johnny"] },
+    { "id": "agent:*",    "role": "agent" } ] }
+```
+
+People sign, notarize, dismiss, override, strike and rule; agents draft and assert UVs. An alias resolves to its `id`, `agent:*` matches any identity with that prefix, and an agent identity the registry lists as a person is refused at startup.
+
+**The notary flow.**
+
+1. **Drafted.** `propose_tombstone` files a `PROPOSAL` marked `requiresNotary`, authored by the agent identity. `targetRef` dedupes only against the same agent's open drafts (the result says `dedupedInto`); it never folds a draft into someone else's proposal.
+2. **Raised.** The draft goes to the same receivers as objections — smallchat's channel bridge (`meta.kind: "proposal"`, with a `notarize_url`) and operator webhooks (`type: "stenographer.proposal"`) — never to the attached MCP client, which is the drafter. It's also printed to stderr and stays in `GET /proposals?status=open`.
+3. **Notarized.** A person approves or declines it through a path the agent profile doesn't serve:
    - REST `POST /proposals/:id/notarize` / `dismiss` with `X-Notary-Secret` — the secret in `STENOGRAPHER_NOTARY_SECRET`, shared with your approval UI (smallchat) and not with agents. Unset, the routes answer 403.
-   - `stenographer notarize <id> --as <name> [--state <path>]` (or `--decline "<reason>"`), which needs an interactive terminal and a typed confirmation.
-3. **Minted.** The TB is signed by the notary, keeps the draft's literals (so it can object immediately), and links back to the draft. Contempt of corpus still applies: the drafting identity can't notarize its own draft.
+   - `sign_proposal` / `dismiss_proposal` on an `--profile operator` server.
+   - `stenographer notarize <id> --as <name> [--state <path>] [--signer-registry <path>]` (or `--decline "<reason>"`), which needs an interactive terminal and typing back a random code it prints there.
+4. **Minted.** The TB is signed by the notary, keeps the draft's literals (so it can object immediately), and links back to the draft. Contempt of corpus still applies: the drafting identity can't notarize its own draft.
 
-`sign_proposal` over MCP refuses agent drafts, and `--require-notary` also disables `assert_tombstone`, so with it on every agent-authored tombstone has a person's name on it. This guards against an agent approving itself through its tools; it isn't a sandbox — an agent with the operator's shell and secrets can do what the operator can.
+**What this protects, and what it doesn't.** The property: an agent whose only access to the ledger is an agent-profile MCP connection cannot mint an active TB, attach a person's name to anything, or neutralize a signed TB or an objection (override, strike, dismiss, rule). It can contest a TB with a UV, which marks the TB contested and leaves it truth. The boundary is the MCP connection:
+
+- **Anything that can run commands or read files as the operator's user is the operator.** It can read `STENOGRAPHER_NOTARY_SECRET` from the environment of the process serving REST — usually the agent-spawned MCP server itself, configured in the agent host's MCP config — edit that config to `--profile operator`, open the SQLite file directly, or drive `stenographer notarize` through a pseudo-terminal (`script`, `expect`): the typed code stops blind or pre-scripted approval, not a program that reads the terminal. Separating those needs OS-level separation: run the agent as another user or in a sandbox without access to the operator's config, environment, state file and terminal.
+- **The signer registry is an allowlist, not authentication.** Whoever reaches an operator path can use any listed person's name; the registry stops typos, unlisted names, and agent identities on person-only acts. Key-based signing, where the notary signs with a key the server doesn't hold, is planned for 1.x.
+- Without `--signer-registry`, operator paths accept any non-anonymous, non-reserved name, and `--agent-identity` accepts any non-reserved identity the operator configures.
 
 ### Real-time objections
 
@@ -214,7 +246,7 @@ Only TBs that declare `literals` can object — an objection can only cite what 
 
 v1 is precision over recall: exact tokens (`30` never matches `300`), the subject tolerates naming drift (`LOG_BUDGET` / `logBudget` / "log budget") but must sit next to the value, a bare value without a `subject` is rejected at write time, and a line that also mentions `current` ("bumped from 30 to 100") is discussion, not assertion. Counsel doesn't repeat itself within a session while an objection is pending or after it's overruled.
 
-Every objection ships the objection, the exhibit (the full TB, plus any contesting UVs), and the transcript line. The judge rules via `rule_on_objection`: **sustained** lands as an ordinary `RULING` (`kind: objection`) corroborating the TB; **overruled** is signal. The **sustain rate** (`get_status` → `objections`) is the tuning dial — a falling rate means tighten the matcher.
+Every objection ships the objection, the exhibit (the full TB, plus any contesting UVs), and the transcript line. A person rules via `rule_on_objection` (operator profile; the session an objection was raised against can't rule on it): **sustained** lands as an ordinary `RULING` (`kind: objection`) corroborating the TB; **overruled** is signal. The **sustain rate** (`get_status` → `objections`) is the tuning dial — a falling rate means tighten the matcher.
 
 `--objections shadow` (default) records objections without emitting them, so they can be shadow-judged against real MR catches; `deliver` pushes them (below) and serves them on `GET /flags` (poll with the last id as `since`); `off` disables the detector. Catch-up replays are always recorded as shadow.
 

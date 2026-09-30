@@ -63,9 +63,9 @@ Notes on the edges:
 
 **Runtime (optional, later).** If smallchat runs beside a live stenographer, the MCP tools `get_truth(truthFilter: "current")` and `search_truth(query)` serve the same entries with the §7 consumption rules embedded in the tool descriptions. Compile-time JSONL should come first — it's deterministic and testable.
 
-**Write-back (the interesting loop).** Dispatch telemetry is a truth *source*: a tool that failed the same way ten times is a UV waiting to be written. Smallchat may file these under a registered identity (e.g. `smallchat:compiler` — generic names like `system`/`assistant` are rejected at the schema level) with a `verifyBy` of kind `command` (the repro invocation). Two hard rules from the ledger, enforced at write time:
+**Write-back (the interesting loop).** Dispatch telemetry is a truth *source*: a tool that failed the same way ten times is a UV waiting to be written. Smallchat may file these under its own identity with a `verifyBy` of kind `command` (the repro invocation). Over MCP that identity is bound by the server, not passed per call: start the stenographer smallchat talks to with `--agent-identity smallchat:compiler` (the agent profile's tools take no author argument; generic names like `system`/`assistant` and the reserved `migration`/`detector:*` are rejected). Two hard rules from the ledger, enforced at write time:
 
-- Smallchat can **assert UVs and file proposals, not TBs** — minting truth needs an accountable signer, and `command`-evidence resolutions are the only self-signing path.
+- Smallchat can **assert UVs and draft tombstones (`propose_tombstone`), not mint TBs** — in the default agent profile no tool mints a TB without a person's notarization, including `resolve_uv` on a contest. Only a single-user server started with `--allow-agent-assert` lets `command`-evidence resolutions self-sign, under the agent identity.
 - **Contempt of corpus:** smallchat cannot verify or sign its own UVs, and neither can anything sharing its agent session. Its telemetry proposes; someone (or some independent check) else confirms.
 
 ## The consumption contract (short form)

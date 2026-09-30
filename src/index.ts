@@ -1,6 +1,6 @@
 // Stenographer — Main Entry Point
 export { Stenographer } from './core/stenographer.js';
-export { StenographerServer, runCLI } from './mcp/server.js';
+export { StenographerServer, runCLI, type ToolProfile } from './mcp/server.js';
 export { RestServer } from './api/rest.js';
 export { StateStore, type StateStoreOptions } from './store/index.js';
 export { Tailer, JsonlAdapter, type LogAdapter, type TailerOptions } from './indexer/tailer.js';

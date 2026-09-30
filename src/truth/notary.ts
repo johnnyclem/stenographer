@@ -7,15 +7,20 @@
  * webhooks, never the attached MCP client, which is the drafting agent —
  * and only mints once that person notarizes it.
  *
- * The notary paths are the ones an agent's tools don't reach:
+ * The notary paths are the ones the agent MCP profile doesn't serve:
  * - REST `POST /proposals/:id/notarize` with `X-Notary-Secret`, the secret
  *   the operator shares with their approval UI (smallchat) and not with
  *   agents;
+ * - `sign_proposal` in the operator MCP profile, for a notary UI;
  * - `stenographer notarize <id>`, which requires an interactive terminal.
  *
  * This is a guard against an agent approving its own draft through its
- * tools, not a sandbox: an agent with arbitrary shell access and the
- * operator's secrets can do anything the operator can.
+ * MCP tools, not a sandbox. The secret lives in the environment of the
+ * process that serves REST — typically the agent-spawned MCP server — so an
+ * agent that can read that environment or its MCP config, edit that config
+ * to the operator profile, or drive a terminal as the operator can do what
+ * the operator can. Separating those needs OS-level separation (the agent
+ * runs as another user or in a sandbox); see the README's threat model.
  */
 
 import { createHmac, timingSafeEqual } from 'node:crypto';
