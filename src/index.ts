@@ -2,8 +2,16 @@
 export { Stenographer } from './core/stenographer.js';
 export { StenographerServer, runCLI } from './mcp/server.js';
 export { RestServer } from './api/rest.js';
-export { StateStore, type StateStoreOptions } from './store/index.js';
-export { Tailer, JsonlAdapter, type LogAdapter, type TailerOptions } from './indexer/tailer.js';
+export { StateStore, type StateStoreOptions, type IngestCheckpoint } from './store/index.js';
+export {
+  Tailer,
+  JsonlAdapter,
+  type LogAdapter,
+  type LineContext,
+  type TailerOptions,
+  type TailPosition,
+  type IngestPosition,
+} from './indexer/tailer.js';
 export {
   OpenAIAdapter,
   AnthropicAdapter,
@@ -13,6 +21,7 @@ export {
   getAdapter,
   detectAdapter,
   detectAdapterFromLines,
+  matchAdapterFromLines,
 } from './indexer/adapters.js';
 export { ImportanceDetector, extractStructure, extractEntities, type ExtractedStructure } from './indexer/importance.js';
 export {

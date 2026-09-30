@@ -7,8 +7,10 @@
  * cosine over stored embeddings.
  */
 
+import { resolve } from 'node:path';
 import Database from 'better-sqlite3';
 import * as sqliteVec from 'sqlite-vec';
+import { migrate } from './migrations.js';
 import { cosineSimilarity, EMBEDDING_DIMENSIONS } from '../indexer/embeddings.js';
 import { TruthLedger } from '../truth/ledger.js';
 import { ObjectionLog } from '../truth/objections.js';
@@ -23,6 +25,27 @@ import type {
 
 export interface StateStoreOptions {
   dimensions?: number;
+}
+
+/**
+ * How far a log has been indexed. `offset` is the byte just past the last
+ * line whose records are committed; `dev`/`inode` and the hash of the first
+ * `headLength` bytes identify the file, so a restart can tell the same log
+ * grown from a truncated, rotated or replaced one.
+ */
+export interface IngestCheckpoint {
+  /** Absolute path of the log. */
+  source: string;
+  dev: string;
+  inode: string;
+  headHash: string;
+  headLength: number;
+  offset: number;
+  /** Lines consumed up to `offset`. */
+  seq: number;
+  /** Session the log's messages are indexed under. */
+  sessionId: string | null;
+  updatedAt: string;
 }
 
 export class StateStore {
@@ -78,92 +101,15 @@ export class StateStore {
   }
 
   private init(): void {
-    // Messages table with embedding
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS messages (
-        id TEXT PRIMARY KEY,
-        session_id TEXT NOT NULL,
-        role TEXT NOT NULL,
-        content TEXT NOT NULL,
-        timestamp TEXT NOT NULL,
-        embedding BLOB,
-        importance_state_delta REAL,
-        importance_reference_freq REAL,
-        importance_trajectory_disc REAL,
-        entity_ids TEXT
-      )
-    `);
+    // WAL: readers (the notary CLI, a second process on the same state) don't
+    // block the indexer's writes, and each message's commit is one append.
+    // In-memory databases stay in 'memory' mode.
+    this.db.pragma('journal_mode = WAL');
+    this.db.pragma('busy_timeout = 5000');
+    migrate(this.db);
 
-    // Decisions table — append-only with supersession chain.
-    // A superseded decision is never deleted: it keeps its provenance and
-    // points at its successor (the "current version of the fact").
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS decisions (
-        id TEXT PRIMARY KEY,
-        session_id TEXT NOT NULL,
-        description TEXT NOT NULL,
-        timestamp TEXT NOT NULL,
-        superseded INTEGER DEFAULT 0,
-        superseded_by TEXT,
-        source_message_id TEXT
-      )
-    `);
-
-    // Tombstones (supersession/correction records with provenance)
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS tombstones (
-        id TEXT PRIMARY KEY,
-        session_id TEXT NOT NULL,
-        superseded TEXT NOT NULL,
-        corrected_to TEXT NOT NULL,
-        reason TEXT,
-        timestamp TEXT NOT NULL,
-        source_message_id TEXT,
-        superseded_decision_id TEXT
-      )
-    `);
-
-    // Migrate pre-existing databases that lack the provenance columns
-    this.addColumnIfMissing('decisions', 'source_message_id', 'TEXT');
-    this.addColumnIfMissing('tombstones', 'source_message_id', 'TEXT');
-    this.addColumnIfMissing('tombstones', 'superseded_decision_id', 'TEXT');
-
-    // Entities (knowledge graph nodes)
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS entities (
-        id TEXT PRIMARY KEY,
-        type TEXT NOT NULL,
-        value TEXT NOT NULL,
-        first_seen TEXT NOT NULL,
-        last_seen TEXT NOT NULL,
-        ref_count INTEGER DEFAULT 1
-      )
-    `);
-
-    // Entity relations (edges)
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS entity_relations (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        entity_from TEXT NOT NULL,
-        entity_to TEXT NOT NULL,
-        relation TEXT NOT NULL,
-        first_seen TEXT NOT NULL,
-        last_seen TEXT NOT NULL,
-        UNIQUE(entity_from, entity_to, relation)
-      )
-    `);
-
-    // Sessions table
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS sessions (
-        id TEXT PRIMARY KEY,
-        started_at TEXT NOT NULL,
-        ended_at TEXT,
-        message_count INTEGER DEFAULT 0
-      )
-    `);
-
-    // Vector index (sqlite-vec virtual table)
+    // Vector index (sqlite-vec virtual table). Outside the migrations: it
+    // exists only when the extension loads on this machine.
     if (this.vecEnabled) {
       this.db.exec(`
         CREATE VIRTUAL TABLE IF NOT EXISTS message_vectors USING vec0(
@@ -172,21 +118,65 @@ export class StateStore {
         )
       `);
     }
-
-    // Create indexes
-    this.db.exec(`
-      CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
-      CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp);
-      CREATE INDEX IF NOT EXISTS idx_decisions_session ON decisions(session_id);
-      CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(type);
-    `);
   }
 
-  private addColumnIfMissing(table: string, column: string, type: string): void {
-    const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
-    if (!columns.some((c) => c.name === column)) {
-      this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
-    }
+  /**
+   * Runs `fn` in one transaction (a savepoint when already inside one), so
+   * a message and everything derived from it commit, or roll back, together.
+   */
+  transaction<T>(fn: () => T): T {
+    return this.db.transaction(fn)();
+  }
+
+  // ─────────────────────────────────────────────────────────
+  // Ingest checkpoints
+  // ─────────────────────────────────────────────────────────
+
+  getCheckpoint(source: string): IngestCheckpoint | null {
+    const row = this.db
+      .prepare('SELECT * FROM ingest_checkpoints WHERE source = ?')
+      .get(resolve(source)) as any;
+    if (!row) return null;
+    return {
+      source: row.source,
+      dev: row.dev,
+      inode: row.inode,
+      headHash: row.head_hash,
+      headLength: row.head_length,
+      offset: row.offset,
+      seq: row.seq,
+      sessionId: row.session_id ?? null,
+      updatedAt: row.updated_at,
+    };
+  }
+
+  saveCheckpoint(checkpoint: Omit<IngestCheckpoint, 'updatedAt'>): void {
+    this.db
+      .prepare(`
+        INSERT INTO ingest_checkpoints (source, dev, inode, head_hash, head_length, offset, seq,
+          session_id, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(source) DO UPDATE SET
+          dev = excluded.dev,
+          inode = excluded.inode,
+          head_hash = excluded.head_hash,
+          head_length = excluded.head_length,
+          offset = excluded.offset,
+          seq = excluded.seq,
+          session_id = excluded.session_id,
+          updated_at = excluded.updated_at
+      `)
+      .run(
+        resolve(checkpoint.source),
+        checkpoint.dev,
+        checkpoint.inode,
+        checkpoint.headHash,
+        checkpoint.headLength,
+        checkpoint.offset,
+        checkpoint.seq,
+        checkpoint.sessionId,
+        new Date().toISOString()
+      );
   }
 
   // ─────────────────────────────────────────────────────────
@@ -194,8 +184,9 @@ export class StateStore {
   // ─────────────────────────────────────────────────────────
 
   addMessage(msg: IndexedMessage): void {
-    // OR REPLACE: the tailer may re-deliver lines (e.g. on restart or
-    // partial-write re-reads), so inserts must be idempotent by id.
+    // OR REPLACE: a message whose content changed under the same id (an
+    // edited or colliding line) replaces the old row. Unchanged re-deliveries
+    // never get here — the engine skips them.
     const stmt = this.db.prepare(`
       INSERT OR REPLACE INTO messages (id, session_id, role, content, timestamp,
         embedding, importance_state_delta, importance_reference_freq,
@@ -225,6 +216,31 @@ export class StateStore {
         .prepare('INSERT INTO message_vectors (message_id, embedding) VALUES (?, ?)')
         .run(msg.id, Buffer.from(new Float32Array(msg.embedding).buffer));
     }
+  }
+
+  getMessage(id: string): IndexedMessage | null {
+    const row = this.db.prepare('SELECT * FROM messages WHERE id = ?').get(id);
+    return row ? this.rowToMessage(row) : null;
+  }
+
+  /**
+   * Moves an indexed message, and the decisions and tombstones it produced,
+   * to another session — when the same line reappears in a different log
+   * (e.g. a resumed session's copy of its history). Nothing is re-derived.
+   */
+  reattributeMessage(id: string, sessionId: string): void {
+    this.db.prepare('UPDATE messages SET session_id = ? WHERE id = ?').run(sessionId, id);
+    this.db.prepare('UPDATE decisions SET session_id = ? WHERE source_message_id = ?').run(sessionId, id);
+    this.db.prepare('UPDATE tombstones SET session_id = ? WHERE source_message_id = ?').run(sessionId, id);
+  }
+
+  /** Every indexed message (optionally one session's), oldest first. */
+  *iterateMessages(sessionId: string | null): IterableIterator<IndexedMessage> {
+    const stmt = sessionId
+      ? this.db.prepare('SELECT * FROM messages WHERE session_id = ? ORDER BY timestamp ASC')
+      : this.db.prepare('SELECT * FROM messages ORDER BY timestamp ASC');
+    const rows = (sessionId ? stmt.iterate(sessionId) : stmt.iterate()) as IterableIterator<any>;
+    for (const row of rows) yield this.rowToMessage(row);
   }
 
   getRecentMessages(sessionId: string | null, n: number): IndexedMessage[] {
@@ -319,8 +335,9 @@ export class StateStore {
     sessionId: string,
     decision: { id: string; description: string; sourceMessageId?: string; timestamp?: string }
   ): void {
+    // Ids are derived from the source line: a re-derived decision is the same row
     const stmt = this.db.prepare(`
-      INSERT INTO decisions (id, session_id, description, timestamp, source_message_id)
+      INSERT OR IGNORE INTO decisions (id, session_id, description, timestamp, source_message_id)
       VALUES (?, ?, ?, ?, ?)
     `);
 
@@ -422,7 +439,7 @@ export class StateStore {
     timestamp?: string;
   }): void {
     const stmt = this.db.prepare(`
-      INSERT INTO tombstones (id, session_id, superseded, corrected_to, reason, timestamp,
+      INSERT OR IGNORE INTO tombstones (id, session_id, superseded, corrected_to, reason, timestamp,
         source_message_id, superseded_decision_id)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `);
