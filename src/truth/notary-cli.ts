@@ -103,6 +103,14 @@ export async function runNotaryCLI(
 
   const store = new StateStore(values.state || DEFAULT_STATE);
   try {
+    // Nothing is signed onto a ledger that fails its integrity check
+    const integrity = store.truth.verify();
+    if (!integrity.ok) {
+      throw new Error(
+        `the truth ledger failed its integrity check (${integrity.failure!.message}) — nothing was signed; ` +
+          `run 'stenographer verify ${values.state || DEFAULT_STATE}'`
+      );
+    }
     const proposal = store.truth.getEntry(proposalId) as ProposalEntry | null;
     if (!proposal || proposal.type !== 'PROPOSAL') throw new Error(`no proposal ${proposalId}`);
     io.print(formatProposalNotice(proposal));

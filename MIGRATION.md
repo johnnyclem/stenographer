@@ -31,7 +31,7 @@ Don't give the operator profile to an agent.
 
 ### Single-user setups that let the agent assert TBs
 
-0.x without `--require-notary` let an agent call `assert_tombstone` with any `signedBy`. The closest 1.0 equivalent is `--allow-agent-assert`: the agent profile serves `assert_tombstone` (no `signedBy` argument), and `resolve_uv` may mint from `command` evidence. Both are signed by the agent identity. A TB that should carry a person's name goes through the notary paths or the operator profile.
+0.x without `--require-notary` let an agent call `assert_tombstone` with any `signedBy`. The closest 1.0 equivalent is `--allow-agent-assert`: the agent profile serves `assert_tombstone` (no `signedBy` argument), signed by the agent identity. `resolve_uv` can't mint there: command evidence no longer self-signs (see [Command evidence](#command-evidence)). A TB that should carry a person's name goes through the notary paths or the operator profile.
 
 ### Library users (`Stenographer`, `TruthLedger`, `StenographerServer`)
 
@@ -58,3 +58,32 @@ Pass it with `--signer-registry signers.json` to `stenographer start`, and to `s
 ### Terminal notary
 
 `stenographer notarize` prints a random code; type that back. The last four characters of the proposal id no longer confirm.
+
+## Truth ledger: derived status, hash chain and evidence
+
+### Existing state files
+
+Nothing to run. The first time a 1.0 stenographer opens a pre-1.0 state file (`start`, `verify`, `notarize`, `proposals`), it adds the chain columns and chains the existing truth entries as they are, in insertion order. A `MARKER` entry (`chained-at-migration`, author `migration`) closes the run. For those entries the chain shows that they have not changed since the migration, not since they were written. Statuses are re-derived from links, and the marker lists any that change: typically a TB the 0.x contest bookkeeping had set back to active after it was overridden (STENO-T-06), which is now overridden again and stops objecting.
+
+Run `stenographer verify <state-path>` after upgrading. Keep the head hash it prints somewhere other than the state file, for example in a commit. Then a truncated or rewritten ledger shows up as a different head.
+
+Don't point a 0.x stenographer at a migrated file. Its writes aren't chained, and its status updates rewrite rows, so `verify` fails and `start` refuses to serve the ledger until you pass `--skip-verify`.
+
+### `stenographer start` checks the ledger
+
+`start` runs the same check as `verify` and exits if the ledger fails it. To serve it anyway while you investigate, pass `--skip-verify`.
+
+### Command evidence
+
+Evidence of kind `command` is recorded as `claimed-command`. It no longer self-signs a TB minted by `resolve_uv`.
+
+- Operator `resolve_uv` calls, and `TruthLedger.resolveUv`/`Stenographer.resolveUv`, that verify a contest or pass `mintTombstone` need `signedBy` (a person) and an `opinion`. They file a promotion ruling.
+- On an `--allow-agent-assert` server, the agent's `resolve_uv` can no longer mint a TB from command evidence. Use `assert_tombstone` for TBs the agent signs, or leave the UV open for a person.
+- If you grade entries by evidence kind (smallchat's handoff), `claimed-command` grades asserted, not verified.
+
+### Library users
+
+- Don't write to `truth_entries` or `truth_links` directly. Any row inserted, updated or deleted outside `TruthLedger` fails `verify`, and so does any change to the `status` or `struck` columns.
+- `body.status` on returned entries is derived. Stored bodies no longer contain it, so a raw `SELECT body` won't show it.
+- A dismissed proposal is closed by a `RULING` with `body.kind === 'dismissal'` and a `dismisses` link. Code that lists rulings may want to skip that kind. `dismissProposal` takes an optional fourth `ctx` argument (timestamp, provenance, session).
+- New union members: `TruthEntryType` includes `'MARKER'`, `LinkType` includes `'dismisses'`, `RulingKind` includes `'dismissal'`, and `EvidenceSchema`'s `kind` includes `'claimed-command'`. Exhaustive `switch`es over these need a new case.

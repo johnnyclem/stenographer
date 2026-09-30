@@ -187,7 +187,13 @@ export function importWikiEntries(
       continue;
     }
 
-    const outcome = ledger.importEntry(entry);
+    let outcome: ReturnType<TruthLedger['importEntry']>;
+    try {
+      outcome = ledger.importEntry(entry);
+    } catch (err) {
+      result.errors.push({ line: i + 1, error: err instanceof Error ? err.message : String(err) });
+      continue;
+    }
     if (outcome === 'inserted') {
       result.inserted++;
     } else if (outcome === 'unchanged') {

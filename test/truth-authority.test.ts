@@ -344,7 +344,8 @@ describe('identity is bound by the server (STENO-T-18)', () => {
     expect(tb.author).toBe('agent:solo');
     expect(tb.body.signedBy).toBe('agent:solo');
 
-    // Command evidence may self-sign a successor TB here, as the bound identity
+    // Command output the agent says it saw is a claim, not an executed check:
+    // it no longer self-signs a successor TB, even here
     const contest = await engine.assertUv({
       assertion: 'LOG_BUDGET is 100 now.',
       basis: 'config.ts',
@@ -353,9 +354,10 @@ describe('identity is bound by the server (STENO-T-18)', () => {
       author: 'sam',
     });
     const res = await call('resolve_uv', { uvId: contest.id, resolution: 'verified', evidence: [{ kind: 'command', ref: 'grep LOG_BUDGET config.ts' }] });
-    expect(res.tombstone.body.signedBy).toBe('agent:solo');
+    expect(res.error).toMatch(/signedBy|person|human/);
+    expect((engine.store.truth.getEntry(tb.id) as TbEntry).body.status).toBe('contested');
 
-    // ...but a judgment call still needs a person's signature
+    // ...and a judgment call still needs a person's signature
     const other = await call('assert_tombstone', { claim: 'fetchV1 is dead', evidence: [{ kind: 'commit', ref: 'b' }] });
     const contest2 = await engine.assertUv({
       assertion: 'fetchV1 is still used.',

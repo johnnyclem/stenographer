@@ -37,6 +37,7 @@ import {
   FILED_RULING_KINDS,
 } from '../truth/types.js';
 import { createMcpChannelTransport, type ObjectionSinkConfig } from '../truth/delivery.js';
+import { startupLedgerCheck } from '../truth/verify-cli.js';
 import type { StenographerConfig, StenographerMode } from '../types.js';
 
 const VERSION = '0.1.0-alpha.2';
@@ -113,7 +114,10 @@ const limit = (description: string, fallback: number, max: number, min = 1) =>
 const Evidence = z
   .array(EvidenceSchema.strict())
   .min(1)
-  .describe('At least one piece of evidence: {kind: commit|file|test|command|wiki|message, ref, detail?}');
+  .describe(
+    'At least one piece of evidence: {kind: commit|file|test|command|wiki|message, ref, detail?}. Command output ' +
+      'you report is recorded as kind claimed-command: stenographer did not run it, so it never signs for itself.'
+  );
 const Literals = z
   .array(StrictTombstonedLiteralSchema)
   .describe(
@@ -582,11 +586,11 @@ export class StenographerServer {
         description:
           'Resolve an open UV as verified or refuted, filing an evidence-bearing ADDENDUM. You must be ' +
           'provenance-independent of the UV: not its author, not the same session (contempt of corpus). A refuted ' +
-          'contest restores its TB to active. ' +
+          'contest closes: its TB is active again unless another contest is open or it has been overridden. ' +
           (allowAssert
-            ? 'A verified contest overrides its TB and mints a successor: command evidence self-signs it under this ' +
-              'server\'s agent identity (mintTombstone supplies the claim for other mints); non-command evidence needs a ' +
-              'person\'s signature and is refused here. '
+            ? 'A verified contest overrides its TB and mints a successor, which needs a person\'s signature — evidence ' +
+              'you submit (command output included) is a claim, not an executed check — so it is refused here, as is ' +
+              'mintTombstone. Leave the UV open with your findings, or assert the successor with assert_tombstone. '
             : 'Resolutions that would mint a TB — verifying a UV that contests a TB, which overrides it — are refused: ' +
               'they need a person. Leave the UV open with your findings, or draft the successor with propose_tombstone. ') +
           bound,
@@ -689,14 +693,15 @@ export class StenographerServer {
         name: 'resolve_uv',
         description:
           'Resolve an open UV as verified or refuted, filing an evidence-bearing ADDENDUM. ' +
-          'command evidence is self-signing (reproducible by anyone); any resolution that mints a TB from ' +
-          'other evidence requires a person\'s signedBy and files a promotion RULING. ' +
+          'Any resolution that mints a TB requires a person\'s signedBy and files a promotion RULING: submitted ' +
+          'command output is recorded as claimed-command and does not self-sign, since stenographer did not run it. ' +
           'Resolver and signer must be provenance-independent of the UV author (contempt of corpus). ' +
-          'A verified contesting UV overrides its TB; a refuted one restores the TB to active.',
+          'A verified contesting UV overrides its TB; a refuted one closes its contest, and the TB is active again ' +
+          'unless another contest is open or it has been overridden (an override is never undone).',
         input: args({
           ...ResolveFields,
           author: Signer('The resolving identity'),
-          signedBy: Signer('The person signing, required when non-command evidence mints a TB').optional(),
+          signedBy: Signer('The person signing, required when the resolution mints a TB').optional(),
           mintTombstone: z
             .string()
             .min(1)
@@ -840,6 +845,7 @@ export async function runCLI(args: string[]): Promise<void> {
       'signer-registry': { type: 'string' },
       // Accepted for 0.x configs: notarization is now the agent-profile default
       'require-notary': { type: 'boolean' },
+      'skip-verify': { type: 'boolean' },
     },
     allowPositionals: true,
   });
@@ -926,6 +932,12 @@ export async function runCLI(args: string[]): Promise<void> {
           : ' — agents draft, a person notarizes'
         : ' — judicial tools exposed; for a notary UI or CLI, never an agent')
   );
+
+  // A ledger that fails its integrity check is not served as ground truth
+  // unless the operator says so
+  const ledgerCheck = startupLedgerCheck(statePath, { skipVerify: Boolean(values['skip-verify']) });
+  for (const line of ledgerCheck.lines) console.error(line);
+  if (ledgerCheck.refuse) process.exit(1);
 
   let server: StenographerServer;
   try {

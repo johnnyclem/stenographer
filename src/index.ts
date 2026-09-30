@@ -42,6 +42,18 @@ export {
   type TruthFilter,
 } from './truth/ledger.js';
 export {
+  verifyLedger,
+  chainRecord,
+  recordHash,
+  CHAIN_VERSION,
+  type IntegrityReport,
+  type IntegrityFailure,
+  type IntegrityFailureKind,
+} from './truth/chain.js';
+export { deriveStatus, deriveStruck, deriveAll, type InboundLink, type DerivedState } from './truth/status.js';
+export { canonicalize, sha256Hex, CanonicalizationError } from './truth/jcs.js';
+export { runVerifyCLI, verifyStateFile, formatLedgerCheck, startupLedgerCheck, type LedgerCheck } from './truth/verify-cli.js';
+export {
   exportWikiEntries,
   importWikiEntries,
   entryToWikiLine,

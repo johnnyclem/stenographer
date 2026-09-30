@@ -18,6 +18,10 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
     const { runNotaryCLI } = await import('../dist/index.js');
     await runNotaryCLI('notarize', args);
   },
+  verify: async (args) => {
+    const { runVerifyCLI } = await import('../dist/index.js');
+    process.exitCode = await runVerifyCLI(args);
+  },
   init: async (args) => {
     const [name = 'stenographer'] = args;
     console.log(`Initializing ${name}...`);
@@ -41,6 +45,10 @@ Usage:
   stenographer notarize <id> --as <name> [--state <path>] [--signer-registry <path>]
                        [--decline <reason>]             Approve (or decline) an agent-drafted
                                                         tombstone — interactive terminal only
+  stenographer verify [state-path] [--json]             Check the truth ledger: hash chain, links,
+                                                        and every status re-derived from links
+                                                        (exit 0 intact, 1 integrity failure,
+                                                        2 could not run)
   stenographer init [name]                              Initialize a new project
   stenographer -h, --help                               Show help
 
@@ -92,6 +100,9 @@ Options (start):
                            JSON allowlist of signers and roles
                            ({"signers": [{"id", "role": "human"|"agent"}]});
                            operator paths accept only listed identities
+      --skip-verify        serve even if the truth ledger fails its integrity
+                           check (by default start refuses; see
+                           'stenographer verify')
 
 Examples:
   stenographer start ./conversation.jsonl

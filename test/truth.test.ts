@@ -180,13 +180,21 @@ describe('TruthLedger', () => {
       { author: 'sam' }
     );
 
-    const result = ledger.resolveUv(uv.id, 'verified', commandEvidence, { author: 'alex' });
+    // Command output the resolver says it saw is a claim: it doesn't self-sign
+    expect(() => ledger.resolveUv(uv.id, 'verified', commandEvidence, { author: 'alex' })).toThrow(/signedBy/);
+    expect((ledger.getEntry(tombstone.id) as TbEntry).body.status).toBe('contested');
+
+    const result = ledger.resolveUv(uv.id, 'verified', commandEvidence, {
+      author: 'alex',
+      signedBy: 'johnny',
+      opinion: 'reran the suite myself; the window slides',
+    });
     expect(result.uv.body.status).toBe('verified');
     expect((ledger.getEntry(tombstone.id) as TbEntry).body.status).toBe('overridden');
-    // Command evidence self-signs: a successor TB is minted without a human signer
-    expect(result.tombstone).not.toBeNull();
-    expect(result.tombstone!.body.signedBy).toBe('alex');
-    expect(result.ruling).toBeNull();
+    expect(result.tombstone!.body.signedBy).toBe('johnny');
+    expect(result.tombstone!.body.evidence).toEqual([{ ...commandEvidence[0], kind: 'claimed-command' }]);
+    expect(result.addendum.body.evidence[0].kind).toBe('claimed-command');
+    expect(result.ruling!.body.kind).toBe('promotion');
     // Overridden TB drops out of current truth
     expect(ledger.getTruth('current').map((e) => e.id)).not.toContain(tombstone.id);
   });
@@ -382,7 +390,7 @@ describe('TruthLedger', () => {
       },
       { author: 'sam' }
     );
-    ledger.resolveUv(uv.id, 'verified', commandEvidence, { author: 'alex' });
+    ledger.resolveUv(uv.id, 'verified', commandEvidence, { author: 'alex', signedBy: 'lee', opinion: 'reproduced' });
 
     // Audit: who changed the TB and on what basis always has an answer
     const flipped = ledger.getEntry(tombstone.id) as TbEntry;
@@ -467,7 +475,9 @@ describe('TruthLedger authority invariants', () => {
     const uv = uvBy('sam', { contests: tombstone.id });
     expect(() => ledger.resolveUv(uv.id, 'refuted', commandEvidence, { author: 'Johnny' })).toThrow(ContemptError);
     // Conceding is not corroboration: the TB's author may verify the contest
-    expect(() => ledger.resolveUv(uv.id, 'verified', commandEvidence, { author: 'johnny' })).not.toThrow();
+    expect(() =>
+      ledger.resolveUv(uv.id, 'verified', commandEvidence, { author: 'johnny', signedBy: 'lee', opinion: 'conceded' })
+    ).not.toThrow();
   });
 
   it('a resolution that would mint a TB is refused when minting is not allowed', () => {

@@ -1,7 +1,8 @@
 /**
  * Stenographer — TB/UV v2 Asserted Truth Layer: Types
  *
- * Five record types in one append-only ledger. Every entry carries two
+ * Five record types in one append-only, hash-chained ledger (plus the
+ * MARKERs the ledger writes about itself). Every entry carries two
  * axes: provenance (where did this come from) and confidence type
  * (how much should you trust it). TB and UV are the two values of the
  * second axis — collapsing them back into one field is a regression.
@@ -109,8 +110,20 @@ export const ProvenanceSchema = z.object({
 });
 export type Provenance = z.infer<typeof ProvenanceSchema>;
 
+export const EVIDENCE_KINDS = ['commit', 'file', 'test', 'command', 'claimed-command', 'wiki', 'message'] as const;
+export type EvidenceKind = (typeof EVIDENCE_KINDS)[number];
+
+/**
+ * Evidence as a caller submits it. A `command` the caller says it ran, with
+ * the output it says it saw, is a claim: it is recorded as
+ * `claimed-command`. `command` in the ledger is reserved for a check
+ * stenographer executed itself — and 1.0 ships no runner, so nothing a
+ * caller submits is recorded as `command`.
+ */
 export const EvidenceSchema = z.object({
-  kind: z.enum(['commit', 'file', 'test', 'command', 'wiki', 'message']),
+  kind: z
+    .enum(EVIDENCE_KINDS)
+    .transform((kind): EvidenceKind => (kind === 'command' ? 'claimed-command' : kind)),
   /** Commit sha, file/line, test name, command line, wiki entry id, or message id. */
   ref: z.string().min(1),
   /** What the evidence shows (e.g. captured command output). */
@@ -118,7 +131,11 @@ export const EvidenceSchema = z.object({
 });
 export type Evidence = z.infer<typeof EvidenceSchema>;
 
-/** `command` results are reproducible by anyone, so they self-sign (§6). */
+/**
+ * Evidence that signs for itself (summary judgment, §6): only a check
+ * stenographer ran. Caller-submitted command output is `claimed-command`
+ * after parsing, so it never self-signs: an unexecuted claim cannot mint truth.
+ */
 export function isSelfSigningEvidence(evidence: Evidence[]): boolean {
   return evidence.some((e) => e.kind === 'command');
 }
@@ -183,6 +200,7 @@ export const LINK_TYPES = [
   'signs',
   'overrides',
   'strikes',
+  'dismisses',
 ] as const;
 export type LinkType = (typeof LINK_TYPES)[number];
 
@@ -196,11 +214,17 @@ export interface TruthLink {
 // Record types
 // ─────────────────────────────────────────────────────────────
 
-export type TruthEntryType = 'TB' | 'UV' | 'PROPOSAL' | 'ADDENDUM' | 'RULING';
+export type TruthEntryType = 'TB' | 'UV' | 'PROPOSAL' | 'ADDENDUM' | 'RULING' | 'MARKER';
 
 export type TbStatus = 'active' | 'contested' | 'overridden';
 export type UvStatus = 'open' | 'verified' | 'refuted';
 export type ProposalStatus = 'open' | 'signed' | 'dismissed';
+
+/**
+ * Statuses are derived, never stored: each is a fold over the entry's
+ * inbound links (see status.ts). `body.status` on a returned entry is that
+ * derivation.
+ */
 
 /** Shared envelope for every ledger entry. */
 export interface TruthEnvelope {
@@ -274,6 +298,7 @@ export interface ProposalBody {
    */
   requiresNotary?: boolean;
   status: ProposalStatus;
+  /** From the dismissal RULING that closed it (read-side; the proposal itself is never rewritten). */
   dismissedBy?: string | null;
   dismissReason?: string | null;
 }
@@ -285,7 +310,7 @@ export interface AddendumBody {
 }
 
 /** RULING — a signed judgment about an existing entry (§11). */
-export type RulingKind = 'strike' | 'promotion' | 'contempt' | 'objection';
+export type RulingKind = 'strike' | 'promotion' | 'contempt' | 'objection' | 'dismissal';
 
 /** Ruling kinds filed through fileRuling; objection rulings have their own path. */
 export const FILED_RULING_KINDS = ['strike', 'promotion', 'contempt'] as const;
@@ -302,7 +327,24 @@ export interface RulingBody {
   outcome?: 'sustained' | 'overruled';
 }
 
-export type TruthBody = TbBody | UvBody | ProposalBody | AddendumBody | RulingBody;
+/**
+ * MARKER — a note the ledger writes about itself. `chained-at-migration`
+ * closes the one-time migration of a pre-1.0 ledger: the entries before it
+ * were hash-chained when it was written, not when they were.
+ */
+export interface MarkerBody {
+  kind: 'chained-at-migration';
+  note: string;
+  /** Entries and links that existed before the ledger was chained. */
+  entries: number;
+  links: number;
+  /** Hash of the last entry chained at migration. */
+  through: string | null;
+  /** Cached statuses the pre-1.0 bookkeeping got wrong, corrected by derivation. */
+  statusCorrections: Array<{ id: string; field: 'status' | 'struck'; was: string | null; now: string | null }>;
+}
+
+export type TruthBody = TbBody | UvBody | ProposalBody | AddendumBody | RulingBody | MarkerBody;
 
 export interface TruthEntry extends TruthEnvelope {
   body: TruthBody;
@@ -313,6 +355,7 @@ export type UvEntry = TruthEnvelope & { type: 'UV'; body: UvBody };
 export type ProposalEntry = TruthEnvelope & { type: 'PROPOSAL'; body: ProposalBody };
 export type AddendumEntry = TruthEnvelope & { type: 'ADDENDUM'; body: AddendumBody };
 export type RulingEntry = TruthEnvelope & { type: 'RULING'; body: RulingBody };
+export type MarkerEntry = TruthEnvelope & { type: 'MARKER'; body: MarkerBody };
 
 // ─────────────────────────────────────────────────────────────
 // Write-time validation schemas

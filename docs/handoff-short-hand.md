@@ -61,7 +61,7 @@ Pragmatic recommendation: **start with B.** It's an afternoon of work against a 
 From §13, unresolved as of this handoff:
 
 1. **UV TTL** — open UVs currently live forever (no expiry, no staleness marker). If you ingest UVs into compaction, assume the pile can grow.
-2. **Who counts as a signer** — the floor is: `command` evidence (reproducible executable checks) self-signs; everything else needs a human. Whether trusted agents get signing rights for some entry kinds is undecided. Relevant if short-hand's compactor would want to sign its own promotions (today it can't, and the contempt check would reject the obvious workaround).
+2. **Who counts as a signer** — the floor is: only a check stenographer executed itself self-signs (1.0 ships no runner, and submitted command output is recorded as `claimed-command`); everything else needs a human. Whether trusted agents get signing rights for some entry kinds is undecided. Relevant if short-hand's compactor would want to sign its own promotions (today it can't, and the contempt check would reject the obvious workaround).
 3. **Contested-TB posture** — contested TBs stay authoritative-with-asterisk (stability over caution). If that flips to UV-grade trust, your compaction weighting changes.
 
 ## Pointers

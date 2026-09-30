@@ -1,15 +1,22 @@
 /**
- * Stenographer — Truth Ledger (append-only, supersede-only)
+ * Stenographer — Truth Ledger (append-only, supersede-only, hash-chained)
  *
  * The storage layer for TB/UV v2. No entry is ever mutated or deleted;
- * state changes are new entries linking backward. The one apparent
- * exception — the cached `status` column — is derived state, updated only
- * inside the same transaction that appends the legal artifact justifying
- * the change. There is no public API to flip a status without one:
- * the override protocol is enforced here, not by convention.
+ * state changes are new entries linking backward. Status is not stored:
+ * it is derived from an entry's inbound links (status.ts). The `status`
+ * and `struck` columns cache that derivation, recomputed in the same
+ * transaction as every append and checked by `stenographer verify` — there
+ * is no statement here that sets a status, only links that imply one: the
+ * override protocol is enforced here, not by convention.
+ *
+ * Every entry is chained to the one before it (prevHash, hash over its RFC
+ * 8785 canonical form, chain.ts), so an edit made around the ledger shows.
  */
 
 import type Database from 'better-sqlite3';
+import { CHAIN_VERSION, chainRecord, recordHash, linkKey, verifyLedger, type IntegrityReport, type LedgerRow } from './chain.js';
+import { canonicalize } from './jcs.js';
+import { deriveAll, deriveStatus, deriveStruck, recordedStatus, type InboundLink } from './status.js';
 import {
   ulid,
   canonicalIdentity,
@@ -34,6 +41,9 @@ import {
   type ProposalEntry,
   type AddendumEntry,
   type RulingEntry,
+  type MarkerBody,
+  type TruthLink,
+  type TruthEntryType,
   type TbBody,
   type UvBody,
   type ProposalBody,
@@ -61,6 +71,17 @@ export type TruthFilter = 'current' | 'all' | 'contested';
 
 const MANUAL: Provenance = { kind: 'manual' };
 
+/** Columns a pre-1.0 truth_entries table lacks. */
+const CHAIN_COLUMNS: Array<[string, string]> = [
+  ['seq', 'INTEGER'],
+  ['prev_hash', 'TEXT'],
+  ['hash', 'TEXT'],
+  ['appended_links', 'TEXT'],
+];
+
+/** An entry as it is stored: the body as written, without the derived status. */
+type NewEntry = Omit<TruthEntry, 'links' | 'body'> & { body: object };
+
 export class TruthLedger {
   private db: Database.Database;
   /** Bumped on every write through this instance — cheap cache invalidation. */
@@ -72,6 +93,9 @@ export class TruthLedger {
   }
 
   private init(): void {
+    // status and struck are caches of the derivation from links; seq,
+    // prev_hash and hash are the chain; appended_links are the links each
+    // entry's append wrote (part of what its hash covers).
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS truth_entries (
         id TEXT PRIMARY KEY,
@@ -85,7 +109,11 @@ export class TruthLedger {
         status TEXT,
         target_ref TEXT,
         struck INTEGER NOT NULL DEFAULT 0,
-        embedding BLOB
+        embedding BLOB,
+        seq INTEGER,
+        prev_hash TEXT,
+        hash TEXT,
+        appended_links TEXT
       )
     `);
 
@@ -99,10 +127,138 @@ export class TruthLedger {
     `);
 
     this.db.exec(`
+      CREATE TABLE IF NOT EXISTS truth_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      )
+    `);
+
+    const columns = new Set(
+      (this.db.prepare('PRAGMA table_info(truth_entries)').all() as Array<{ name: string }>).map((c) => c.name)
+    );
+    for (const [name, type] of CHAIN_COLUMNS) {
+      if (!columns.has(name)) this.db.exec(`ALTER TABLE truth_entries ADD COLUMN ${name} ${type}`);
+    }
+
+    this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_truth_type_status ON truth_entries(type, status);
       CREATE INDEX IF NOT EXISTS idx_truth_target_ref ON truth_entries(target_ref);
       CREATE INDEX IF NOT EXISTS idx_truth_links_to ON truth_links(to_id);
+      CREATE INDEX IF NOT EXISTS idx_truth_links_from ON truth_links(from_id);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_truth_seq ON truth_entries(seq);
     `);
+
+    this.chainExistingEntries();
+  }
+
+  /**
+   * One-time migration of a pre-1.0 ledger. Its rows are chained in
+   * insertion order exactly as they are (bodies included — nothing is
+   * rewritten), each link is assigned to the entry that wrote it, and a
+   * MARKER written by 'migration' closes the run: the chain attests to those
+   * entries from the marker on, not from when they were written. Cached
+   * statuses are then re-derived from links; the ones that change (e.g. a
+   * TB the 0.x contest bookkeeping had resurrected, STENO-T-06) are listed
+   * in the marker.
+   */
+  private chainExistingEntries(): void {
+    const chained = () => Boolean(this.db.prepare(`SELECT 1 FROM truth_meta WHERE key = 'chain_version'`).get());
+    if (chained()) return;
+
+    this.tx(() => {
+      // Checked again under the write lock: another process may have just migrated
+      if (chained()) return;
+      // Chained rows without the version record aren't a pre-1.0 ledger: leave
+      // them for verify to report rather than re-chain over whatever changed.
+      if (this.db.prepare('SELECT 1 FROM truth_entries WHERE hash IS NOT NULL LIMIT 1').get()) return;
+
+      const rows = this.db.prepare('SELECT * FROM truth_entries ORDER BY rowid').all() as LedgerRow[];
+      if (rows.length > 0) {
+        const ids = new Set(rows.map((r) => r.id));
+        const owned = new Map<string, TruthLink[]>();
+        const orphans: TruthLink[] = [];
+        const links = this.db.prepare('SELECT from_id, to_id, link_type FROM truth_links ORDER BY rowid').all() as Array<{
+          from_id: string;
+          to_id: string;
+          link_type: string;
+        }>;
+        for (const l of links) {
+          const link: TruthLink = { fromId: l.from_id, toId: l.to_id, type: l.link_type as LinkType };
+          // Links are written with the entry they come from; a wiki import
+          // also carries links whose source it didn't bring along.
+          const owner = ids.has(link.fromId) ? link.fromId : ids.has(link.toId) ? link.toId : null;
+          if (owner) owned.set(owner, [...(owned.get(owner) ?? []), link]);
+          else orphans.push(link);
+        }
+
+        let prevHash: string | null = null;
+        let seq = 0;
+        const update = this.db.prepare(
+          'UPDATE truth_entries SET seq = ?, prev_hash = ?, hash = ?, appended_links = ? WHERE id = ?'
+        );
+        for (const row of rows) {
+          const appended = JSON.stringify(owned.get(row.id) ?? []);
+          let hash: string;
+          try {
+            hash = recordHash(chainRecord({ ...row, appended_links: appended, prev_hash: prevHash }));
+          } catch {
+            // Unreadable or uncanonicalizable (e.g. a lone surrogate): left out
+            // of the chain, where verify reports it, rather than unopenable
+            continue;
+          }
+          update.run(++seq, prevHash, hash, appended, row.id);
+          prevHash = hash;
+        }
+
+        const parse = (body: string): unknown => {
+          try {
+            return JSON.parse(body);
+          } catch {
+            return undefined;
+          }
+        };
+        const derived = deriveAll(
+          rows.map((r) => ({ id: r.id, type: r.type as TruthEntryType, recorded: recordedStatus(parse(r.body)) })),
+          links.map((l) => ({ fromId: l.from_id, toId: l.to_id, type: l.link_type as LinkType }))
+        );
+        const statusCorrections: MarkerBody['statusCorrections'] = [];
+        for (const row of rows) {
+          const want = derived.get(row.id)!;
+          if ((row.status ?? null) !== want.status) {
+            statusCorrections.push({ id: row.id, field: 'status', was: row.status ?? null, now: want.status });
+          }
+          if (Boolean(row.struck) !== want.struck) {
+            statusCorrections.push({ id: row.id, field: 'struck', was: String(Boolean(row.struck)), now: String(want.struck) });
+          }
+        }
+
+        this.append(
+          {
+            id: ulid(),
+            type: 'MARKER',
+            createdAt: new Date().toISOString(),
+            author: MIGRATION_AUTHOR,
+            provenance: { kind: 'migration' },
+            agentSessionId: null,
+            origin: 'local',
+            body: {
+              kind: 'chained-at-migration',
+              note:
+                'The entries before this marker were written before the ledger was hash-chained. Their hashes were ' +
+                'computed when this marker was written, so the chain shows they have not changed since then — not ' +
+                'since they were written.',
+              entries: seq,
+              links: links.length,
+              through: prevHash,
+              statusCorrections,
+            } satisfies MarkerBody,
+          },
+          orphans
+        );
+        this.refresh(rows.map((r) => r.id));
+      }
+      this.db.prepare(`INSERT INTO truth_meta (key, value) VALUES ('chain_version', ?)`).run(CHAIN_VERSION);
+    });
   }
 
   // ─────────────────────────────────────────────────────────
@@ -194,56 +350,114 @@ export class TruthLedger {
     return `${this.writes}:${dataVersion}`;
   }
 
-  private insertEntry(
-    entry: Omit<TruthEntry, 'links'>,
-    embedding?: number[]
-  ): void {
-    this.writes++;
-    const status = (entry.body as { status?: string }).status ?? null;
-    const targetRef = (entry.body as { targetRef?: string | null }).targetRef ?? null;
-    this.db
-      .prepare(`
-        INSERT INTO truth_entries (id, type, created_at, author, provenance,
-          agent_session_id, origin, body, status, target_ref, embedding)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `)
-      .run(
-        entry.id,
-        entry.type,
-        entry.createdAt,
-        entry.author,
-        JSON.stringify(entry.provenance),
-        entry.agentSessionId ?? null,
-        entry.origin,
-        JSON.stringify(entry.body),
-        status,
-        targetRef,
-        embedding && embedding.length > 0
-          ? Buffer.from(new Float32Array(embedding).buffer)
-          : null
+  /**
+   * Runs `fn` in one write transaction. The outermost one begins IMMEDIATE,
+   * so the chain head it reads can't move under it from another connection.
+   */
+  private tx<T>(fn: () => T): T {
+    return this.db.inTransaction ? fn() : this.db.transaction(fn).immediate();
+  }
+
+  /**
+   * The only way anything enters the ledger: chains the entry to the current
+   * head, writes the links it carries, and re-derives the cached status of
+   * everything those links touch.
+   */
+  private append(entry: NewEntry, links: TruthLink[] = [], opts: { embedding?: number[]; targetRef?: string | null } = {}): void {
+    this.tx(() => {
+      this.writes++;
+      const unique = [...new Map(links.map((l) => [linkKey(l), { fromId: l.fromId, toId: l.toId, type: l.type }])).values()];
+      const head = this.db
+        .prepare('SELECT seq, hash FROM truth_entries WHERE seq IS NOT NULL ORDER BY seq DESC LIMIT 1')
+        .get() as { seq: number; hash: string } | undefined;
+      const row = {
+        id: entry.id,
+        type: entry.type,
+        created_at: entry.createdAt,
+        author: entry.author,
+        provenance: JSON.stringify(entry.provenance),
+        agent_session_id: entry.agentSessionId ?? null,
+        origin: entry.origin,
+        body: JSON.stringify(entry.body),
+        target_ref: opts.targetRef !== undefined ? opts.targetRef : ((entry.body as { targetRef?: string | null }).targetRef ?? null),
+        appended_links: JSON.stringify(unique),
+        prev_hash: head?.hash ?? null,
+      };
+      let hash: string;
+      try {
+        hash = recordHash(chainRecord(row));
+      } catch (err) {
+        // e.g. a lone surrogate: what can't be canonicalized can't be chained
+        throw new TruthWriteError(`entry ${entry.id} can't be hashed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      this.db
+        .prepare(`
+          INSERT INTO truth_entries (id, type, created_at, author, provenance, agent_session_id, origin,
+            body, target_ref, embedding, seq, prev_hash, hash, appended_links)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `)
+        .run(
+          row.id,
+          row.type,
+          row.created_at,
+          row.author,
+          row.provenance,
+          row.agent_session_id,
+          row.origin,
+          row.body,
+          row.target_ref,
+          opts.embedding && opts.embedding.length > 0 ? Buffer.from(new Float32Array(opts.embedding).buffer) : null,
+          (head?.seq ?? 0) + 1,
+          row.prev_hash,
+          hash,
+          row.appended_links
+        );
+      const insertLink = this.db.prepare('INSERT OR IGNORE INTO truth_links (from_id, to_id, link_type) VALUES (?, ?, ?)');
+      for (const link of unique) insertLink.run(link.fromId, link.toId, link.type);
+      this.refresh([entry.id, ...unique.flatMap((l) => [l.fromId, l.toId])]);
+    });
+  }
+
+  /**
+   * Re-derives the cached status of `ids` from their inbound links, plus
+   * the TBs contested by any of them (a TB's status reads its contesting
+   * UVs'). The only writer of the status and struck columns.
+   */
+  private refresh(ids: Iterable<string>): void {
+    const pending = new Set(ids);
+    const contested = this.db.prepare(`SELECT to_id FROM truth_links WHERE from_id = ? AND link_type = 'contests'`);
+    for (const id of [...pending]) {
+      for (const r of contested.all(id) as Array<{ to_id: string }>) pending.add(r.to_id);
+    }
+    const select = this.db.prepare('SELECT id, type, body, status, struck FROM truth_entries WHERE id = ?');
+    const rows = [...pending]
+      .map((id) => select.get(id) as Pick<LedgerRow, 'id' | 'type' | 'body' | 'status' | 'struck'> | undefined)
+      .filter((r): r is Pick<LedgerRow, 'id' | 'type' | 'body' | 'status' | 'struck'> => Boolean(r))
+      // TBs last: they read the status just derived for their contests
+      .sort((a, b) => Number(a.type === 'TB') - Number(b.type === 'TB'));
+
+    const inbound = this.db.prepare(`
+      SELECT l.link_type, e.type AS from_type, e.status AS from_status
+      FROM truth_links l LEFT JOIN truth_entries e ON e.id = l.from_id
+      WHERE l.to_id = ?
+    `);
+    const update = this.db.prepare('UPDATE truth_entries SET status = ?, struck = ? WHERE id = ?');
+    for (const row of rows) {
+      const links = (inbound.all(row.id) as Array<{ link_type: string; from_type: string | null; from_status: string | null }>).map(
+        (l): InboundLink => ({
+          type: l.link_type as LinkType,
+          from: l.from_type ? { type: l.from_type as TruthEntryType, status: l.from_status } : null,
+        })
       );
+      const status = deriveStatus(row.type as TruthEntryType, recordedStatus(JSON.parse(row.body)), links);
+      const struck = deriveStruck(links) ? 1 : 0;
+      if (status !== (row.status ?? null) || struck !== row.struck) update.run(status, struck, row.id);
+    }
   }
 
-  private addLink(fromId: string, toId: string, type: LinkType): void {
-    this.writes++;
-    this.db
-      .prepare('INSERT OR IGNORE INTO truth_links (from_id, to_id, link_type) VALUES (?, ?, ?)')
-      .run(fromId, toId, type);
-  }
-
-  /** Derived-state cache update — only ever called inside a legal transition. */
-  private setStatus(id: string, status: string): void {
-    this.writes++;
-    // The body JSON is the exported record; keep its status in sync with the column.
-    const row = this.db.prepare('SELECT body FROM truth_entries WHERE id = ?').get(id) as
-      | { body: string }
-      | undefined;
-    if (!row) throw new TruthWriteError(`no such entry: ${id}`);
-    const body = JSON.parse(row.body);
-    body.status = status;
-    this.db
-      .prepare('UPDATE truth_entries SET status = ?, body = ? WHERE id = ?')
-      .run(status, JSON.stringify(body), id);
+  /** Validates the hash chain, the links, and every cached status (see chain.ts). */
+  verify(): IntegrityReport {
+    return verifyLedger(this.db);
   }
 
   private mustGet(id: string): TruthEntry {
@@ -287,8 +501,11 @@ export class TruthLedger {
       if (existing) return existing;
     }
 
+    // No status or dismissal fields: those are derived (open until a signs or
+    // dismisses link arrives), whatever a caller passed
+    const { status: _s, dismissedBy: _d, dismissReason: _r, ...stored } = body as ProposalBody;
     const id = ulid();
-    this.insertEntry(
+    this.append(
       {
         id,
         type: 'PROPOSAL',
@@ -297,9 +514,10 @@ export class TruthLedger {
         provenance: ctx.provenance ?? MANUAL,
         agentSessionId: ctx.agentSessionId ?? null,
         origin: 'local',
-        body: { ...body, status: 'open' } satisfies ProposalBody,
+        body: stored satisfies Omit<ProposalBody, 'status'>,
       },
-      ctx.embedding
+      [],
+      { embedding: ctx.embedding }
     );
     return this.getEntry(id) as ProposalEntry;
   }
@@ -399,25 +617,26 @@ export class TruthLedger {
       timestamp: ctx?.timestamp,
     };
 
-    const mint = this.db.transaction((): TbEntry | UvEntry => {
-      let minted: TbEntry | UvEntry;
-      if (proposal.body.kind === 'tombstone') {
-        const input = TbInputSchema.parse({ ...draft, signedBy });
-        minted = this.insertTb(input, writeCtx);
-      } else {
-        const input = UvInputSchema.parse(draft);
-        minted = this.insertUv(input, writeCtx);
-      }
-      this.addLink(minted.id, proposalId, 'signs');
-      this.setStatus(proposalId, 'signed');
-      return minted;
-    });
-    // Re-fetch: the entry snapshot inside the transaction predates its links
-    return this.getEntry(mint().id) as TbEntry | UvEntry;
+    // The signs link closes the proposal: it derives as signed from here on
+    const signs = [{ toId: proposalId, type: 'signs' as const }];
+    if (proposal.body.kind === 'tombstone') {
+      return this.insertTb(TbInputSchema.parse({ ...draft, signedBy }), writeCtx, signs);
+    }
+    return this.insertUv(UvInputSchema.parse(draft), writeCtx, signs);
   }
 
-  /** Dismissal reasons are kept — they are training data for the detector. */
-  dismissProposal(proposalId: string, dismissedBy: string, reason: string): ProposalEntry {
+  /**
+   * Dismissal reasons are kept — they are training data for the detector.
+   * A dismissal is an appended RULING (kind 'dismissal') with a `dismisses`
+   * link; the proposal itself is never rewritten. Its `dismissedBy` and
+   * `dismissReason` are read back from that ruling.
+   */
+  dismissProposal(
+    proposalId: string,
+    dismissedBy: string,
+    reason: string,
+    ctx: Partial<Omit<WriteContext, 'author'>> = {}
+  ): ProposalEntry {
     dismissedBy = this.accountable(dismissedBy, 'dismisser');
     if (!reason || reason.trim().length === 0) {
       throw new TruthWriteError('a dismissal requires a reason');
@@ -427,11 +646,11 @@ export class TruthLedger {
       throw new TruthWriteError(`proposal ${proposalId} is already ${proposal.body.status}`);
     }
 
-    const body = { ...proposal.body, status: 'dismissed' as const, dismissedBy, dismissReason: reason };
-    this.writes++;
-    this.db
-      .prepare('UPDATE truth_entries SET status = ?, body = ? WHERE id = ?')
-      .run('dismissed', JSON.stringify(body), proposalId);
+    this.insertRuling(
+      { kind: 'dismissal', opinion: reason, target: proposalId },
+      { ...ctx, author: dismissedBy },
+      [{ toId: proposalId, type: 'dismisses' }]
+    );
     return this.getEntry(proposalId) as ProposalEntry;
   }
 
@@ -457,12 +676,18 @@ export class TruthLedger {
     return this.insertUv(parsed, { ...ctx, author });
   }
 
+  /** Outbound links of a new entry, by target and type. */
+  private static outbound(fromId: string, links: Array<{ toId: string; type: LinkType }>): TruthLink[] {
+    return links.map((l) => ({ fromId, toId: l.toId, type: l.type }));
+  }
+
   private insertTb(
     input: { claim: string; evidence: Evidence[]; signedBy: string; literals?: TombstonedLiteral[] },
-    ctx: WriteContext
+    ctx: WriteContext,
+    links: Array<{ toId: string; type: LinkType }> = []
   ): TbEntry {
     const id = ulid();
-    this.insertEntry(
+    this.append(
       {
         id,
         type: 'TB',
@@ -471,25 +696,27 @@ export class TruthLedger {
         provenance: ctx.provenance ?? MANUAL,
         agentSessionId: ctx.agentSessionId ?? null,
         origin: 'local',
+        // No status: a TB is active until links say otherwise
         body: {
           claim: input.claim,
           evidence: input.evidence,
           signedBy: input.signedBy,
-          status: 'active',
           // Only present when given, so literal-free TBs keep their exact shape
           ...(input.literals && input.literals.length > 0 ? { literals: input.literals } : {}),
-        } satisfies TbBody,
+        } satisfies Omit<TbBody, 'status'>,
       },
-      ctx.embedding
+      TruthLedger.outbound(id, links),
+      { embedding: ctx.embedding }
     );
     return this.getEntry(id) as TbEntry;
   }
 
   private insertUv(
     input: { assertion: string; basis: string; verifyBy: VerifyBy; contests?: string | null },
-    ctx: WriteContext
+    ctx: WriteContext,
+    links: Array<{ toId: string; type: LinkType }> = []
   ): UvEntry {
-    const insert = this.db.transaction((): string => {
+    const insert = (): string => {
       let contests: string | null = null;
       if (input.contests) {
         const tb = this.mustGetTyped<TbEntry>(input.contests, 'TB');
@@ -500,7 +727,7 @@ export class TruthLedger {
       }
 
       const id = ulid();
-      this.insertEntry(
+      this.append(
         {
           id,
           type: 'UV',
@@ -514,21 +741,16 @@ export class TruthLedger {
             basis: input.basis,
             verifyBy: input.verifyBy,
             contests,
-            status: 'open',
-          } satisfies UvBody,
+          } satisfies Omit<UvBody, 'status'>,
         },
-        ctx.embedding
+        // Override protocol path 1 (contest): the contests link makes the TB
+        // contested while this UV is open; it remains active truth.
+        TruthLedger.outbound(id, [...(contests ? [{ toId: contests, type: 'contests' as const }] : []), ...links]),
+        { embedding: ctx.embedding }
       );
-
-      // Override protocol path 1 (contest): the TB becomes contested but
-      // remains active truth.
-      if (contests) {
-        this.addLink(id, contests, 'contests');
-        this.setStatus(contests, 'contested');
-      }
       return id;
-    });
-    return this.getEntry(insert()) as UvEntry;
+    };
+    return this.getEntry(this.tx(insert)) as UvEntry;
   }
 
   // ─────────────────────────────────────────────────────────
@@ -536,14 +758,16 @@ export class TruthLedger {
   // ─────────────────────────────────────────────────────────
 
   /**
-   * Resolves an open UV with an evidence-bearing ADDENDUM. `command`
-   * evidence is self-signing (reproducible by anyone — summary judgment);
-   * any other resolution that mints a TB requires a human `signedBy` plus
-   * a written `opinion`, recorded as a promotion RULING.
+   * Resolves an open UV with an evidence-bearing ADDENDUM. Only evidence
+   * stenographer executed self-signs (summary judgment); caller-submitted
+   * command output is a claim (`claimed-command`), so any resolution that
+   * mints a TB requires a human `signedBy` plus a written `opinion`,
+   * recorded as a promotion RULING.
    *
    * If the UV contests a TB:
-   * - verified → the TB is overridden (override protocol path 2, proven)
-   * - refuted  → the TB returns to active (unless still otherwise contested)
+   * - verified → the addendum overrides the TB (override protocol path 2, proven)
+   * - refuted  → the contest closes; the TB derives as active again unless
+   *              another contest is open or it was overridden meanwhile
    *
    * `allowMint: false` (the MCP agent profile) refuses any resolution that
    * would mint a TB, so an agent cannot turn its own resolution into truth:
@@ -591,26 +815,34 @@ export class TruthLedger {
     }
     if (mintsTb && !selfSigning && !signedBy) {
       throw new TruthWriteError(
-        'non-command evidence cannot self-sign a tombstone — a human signedBy is required (judgment calls are not summary judgment)'
+        'evidence stenographer did not execute cannot self-sign a tombstone — a human signedBy is required ' +
+          '(submitted command output is a claim, and judgment calls are not summary judgment)'
       );
     }
 
-    const run = this.db.transaction(() => {
+    const { addendumId, tombstoneId, rulingId } = this.tx(() => {
       const now = ctx.timestamp ?? new Date().toISOString();
 
+      // The addendum resolves the UV and, verifying a contest, overrides its
+      // TB. A refuted contest needs no link to the TB: with the UV no longer
+      // open, the contest stops counting, and an override never un-counts.
       const addendumId = ulid();
-      this.insertEntry({
-        id: addendumId,
-        type: 'ADDENDUM',
-        createdAt: now,
-        author: ctx.author,
-        provenance: ctx.provenance ?? MANUAL,
-        agentSessionId: ctx.agentSessionId ?? null,
-        origin: 'local',
-        body: { evidence: parsedEvidence, note: ctx.opinion ?? null },
-      });
-      this.addLink(addendumId, uvId, resolution === 'verified' ? 'verifies' : 'refutes');
-      this.setStatus(uvId, resolution);
+      this.append(
+        {
+          id: addendumId,
+          type: 'ADDENDUM',
+          createdAt: now,
+          author: ctx.author,
+          provenance: ctx.provenance ?? MANUAL,
+          agentSessionId: ctx.agentSessionId ?? null,
+          origin: 'local',
+          body: { evidence: parsedEvidence, note: ctx.opinion ?? null },
+        },
+        TruthLedger.outbound(addendumId, [
+          { toId: uvId, type: resolution === 'verified' ? 'verifies' : 'refutes' },
+          ...(contestedTb && resolution === 'verified' ? [{ toId: contestedTb.id, type: 'overrides' as const }] : []),
+        ])
+      );
 
       let tombstoneId: string | null = null;
       if (mintsTb) {
@@ -620,27 +852,18 @@ export class TruthLedger {
           (resolution === 'verified' && contestedTb
             ? `Overridden: "${contestedTb.body.claim}" — contradicted by verified assertion: ${uv.body.assertion}`
             : `Refuted: "${uv.body.assertion}"`);
+        const supersedes =
+          resolution === 'verified' && contestedTb
+            ? contestedTb.id
+            : resolution === 'refuted'
+              ? uvId // the correction is discoverable from the refuted UV
+              : null;
         const tb = this.insertTb(
           { claim, evidence: parsedEvidence, signedBy: signer },
-          { ...ctx, timestamp: now, embedding: ctx.embedding }
+          { ...ctx, timestamp: now, embedding: ctx.embedding },
+          supersedes ? [{ toId: supersedes, type: 'supersedes' }] : []
         );
         tombstoneId = tb.id;
-        if (resolution === 'verified' && contestedTb) {
-          this.addLink(tb.id, contestedTb.id, 'supersedes');
-        } else if (resolution === 'refuted') {
-          // The correction is discoverable from the refuted UV
-          this.addLink(tb.id, uvId, 'supersedes');
-        }
-      }
-
-      // Contested-TB bookkeeping (override protocol)
-      if (contestedTb) {
-        if (resolution === 'verified') {
-          this.addLink(addendumId, contestedTb.id, 'overrides');
-          this.setStatus(contestedTb.id, 'overridden');
-        } else if (!this.hasOpenContest(contestedTb.id, uvId)) {
-          this.setStatus(contestedTb.id, 'active');
-        }
       }
 
       // Promotion ruling: the gavel on a non-self-signing resolution (§11)
@@ -655,24 +878,12 @@ export class TruthLedger {
       return { addendumId, tombstoneId, rulingId };
     });
 
-    const { addendumId, tombstoneId, rulingId } = run();
     return {
       uv: this.getEntry(uvId) as UvEntry,
       addendum: this.getEntry(addendumId) as AddendumEntry,
       tombstone: tombstoneId ? (this.getEntry(tombstoneId) as TbEntry) : null,
       ruling: rulingId ? (this.getEntry(rulingId) as RulingEntry) : null,
     };
-  }
-
-  private hasOpenContest(tbId: string, excludeUvId?: string): boolean {
-    const rows = this.db
-      .prepare(`SELECT from_id FROM truth_links WHERE to_id = ? AND link_type = 'contests'`)
-      .all(tbId) as Array<{ from_id: string }>;
-    return rows.some((r) => {
-      if (r.from_id === excludeUvId) return false;
-      const uv = this.getEntry(r.from_id) as UvEntry | null;
-      return uv?.body.status === 'open';
-    });
   }
 
   // ─────────────────────────────────────────────────────────
@@ -701,10 +912,10 @@ export class TruthLedger {
       throw new TruthWriteError(`TB ${tbId} is already overridden`);
     }
 
-    const run = this.db.transaction((): string => {
-      const id = ulid();
-      this.insertEntry({
-        id,
+    const addendumId = ulid();
+    this.append(
+      {
+        id: addendumId,
         type: 'ADDENDUM',
         createdAt: ctx.timestamp ?? new Date().toISOString(),
         author: ctx.author,
@@ -712,13 +923,9 @@ export class TruthLedger {
         agentSessionId: ctx.agentSessionId ?? null,
         origin: 'local',
         body: { evidence: parsedEvidence, note: addendum.note ?? null },
-      });
-      this.addLink(id, tbId, 'overrides');
-      this.setStatus(tbId, 'overridden');
-      return id;
-    });
-
-    const addendumId = run();
+      },
+      TruthLedger.outbound(addendumId, [{ toId: tbId, type: 'overrides' }])
+    );
     return {
       tombstone: this.getEntry(tbId) as TbEntry,
       addendum: this.getEntry(addendumId) as AddendumEntry,
@@ -744,19 +951,19 @@ export class TruthLedger {
       throw new TruthWriteError('a ruling requires a written opinion — rulings are precedent');
     }
 
-    const run = this.db.transaction((): { rulingId: string; tbId: string | null } => {
-      const rulingId = this.insertRuling(input, ctx);
+    const { rulingId, tbId } = this.tx((): { rulingId: string; tbId: string | null } => {
+      let rulingId: string;
       let tbId: string | null = null;
 
       if (input.kind === 'strike') {
-        const target = this.mustGet(input.target);
-        this.addLink(rulingId, target.id, 'strikes');
         // Inadmissible for retrieval; nothing is deleted — append-only holds
-        this.writes++;
-        this.db.prepare('UPDATE truth_entries SET struck = 1 WHERE id = ?').run(target.id);
+        const target = this.mustGet(input.target);
+        rulingId = this.insertRuling(input, ctx, [{ toId: target.id, type: 'strikes' }]);
       } else if (input.kind === 'promotion') {
         this.mustGet(input.target);
-      } else if (input.kind === 'contempt') {
+        rulingId = this.insertRuling(input, ctx);
+      } else {
+        rulingId = this.insertRuling(input, ctx);
         // Contempt mints exactly one artifact: a TB about the conduct,
         // surfaced when that author's output is next reviewed. No karma.
         const tb = this.insertTb(
@@ -772,7 +979,6 @@ export class TruthLedger {
       return { rulingId, tbId };
     });
 
-    const { rulingId, tbId } = run();
     return {
       ruling: this.getEntry(rulingId) as RulingEntry,
       conductTombstone: tbId ? (this.getEntry(tbId) as TbEntry) : null,
@@ -800,7 +1006,7 @@ export class TruthLedger {
     }
     this.mustGetTyped<TbEntry>(input.tbId, 'TB');
     const id = ulid();
-    this.insertEntry(
+    this.append(
       {
         id,
         type: 'RULING',
@@ -817,7 +1023,8 @@ export class TruthLedger {
           outcome: input.outcome,
         },
       },
-      ctx.embedding
+      [],
+      { embedding: ctx.embedding }
     );
     return this.getEntry(id) as RulingEntry;
   }
@@ -836,11 +1043,12 @@ export class TruthLedger {
   }
 
   private insertRuling(
-    input: { kind: FiledRulingKind; opinion: string; target: string },
-    ctx: WriteContext
+    input: { kind: FiledRulingKind | 'dismissal'; opinion: string; target: string },
+    ctx: WriteContext,
+    links: Array<{ toId: string; type: LinkType }> = []
   ): string {
     const id = ulid();
-    this.insertEntry(
+    this.append(
       {
         id,
         type: 'RULING',
@@ -851,7 +1059,8 @@ export class TruthLedger {
         origin: 'local',
         body: { kind: input.kind, opinion: input.opinion, target: input.target },
       },
-      ctx.embedding
+      TruthLedger.outbound(id, links),
+      { embedding: ctx.embedding }
     );
     return id;
   }
@@ -878,45 +1087,58 @@ export class TruthLedger {
     if (existing) return null;
 
     const id = ulid();
-    this.db
-      .prepare(`
-        INSERT INTO truth_entries (id, type, created_at, author, provenance,
-          agent_session_id, origin, body, status, target_ref, embedding)
-        VALUES (?, ?, ?, ?, ?, NULL, 'local', ?, 'active', ?, NULL)
-      `)
-      .run(
+    this.append(
+      {
         id,
-        'TB',
-        legacy.timestamp,
-        MIGRATION_AUTHOR,
-        JSON.stringify({ kind: 'migration', ref: legacy.id } satisfies Provenance),
-        JSON.stringify({
+        type: 'TB',
+        createdAt: legacy.timestamp,
+        author: MIGRATION_AUTHOR,
+        provenance: { kind: 'migration', ref: legacy.id },
+        agentSessionId: null,
+        origin: 'local',
+        body: {
           claim: `Superseded: "${legacy.superseded}" → "${legacy.correctedTo}" (${legacy.reason})`,
           evidence: [{ kind: 'wiki', ref: `legacy:${legacy.id}`, detail: 'pre-assertion auto-close' }],
           signedBy: null,
-          status: 'active',
-        } satisfies TbBody),
-        `legacy:${legacy.id}`
-      );
+        } satisfies Omit<TbBody, 'status'>,
+      },
+      [],
+      { targetRef: `legacy:${legacy.id}` }
+    );
     return this.getEntry(id) as TbEntry;
   }
 
-  /** Used by wiki import: entries keep their original ids and authors. */
+  /**
+   * Used by wiki import: entries keep their original ids and authors, and
+   * their body as the wiki wrote it — including the status the line
+   * carried, which counts only as a terminal floor (status.ts). The entry is
+   * chained like any other, with the links the line carried about itself.
+   *
+   * Since links decide status, a line may only speak for itself: it keeps
+   * links into the entry (its own history) and the links a TB or UV writes —
+   * a UV's contest (the one its `contests` field names, which it implies),
+   * a TB's supersessions, and a TB's signature of a proposal this ledger
+   * doesn't hold. Anything else it carries, such as an `overrides` or
+   * `strikes` aimed at a local entry, is dropped.
+   */
   importEntry(entry: TruthEntry, embedding?: number[]): 'inserted' | 'unchanged' | 'conflict' {
     const existing = this.getEntry(entry.id);
     if (existing) {
-      const same =
-        JSON.stringify(existing.body) === JSON.stringify(entry.body) &&
-        existing.author === entry.author;
+      const same = canonicalize(existing.body) === canonicalize(entry.body) && existing.author === entry.author;
       return same ? 'unchanged' : 'conflict';
     }
-    const run = this.db.transaction(() => {
-      this.insertEntry(entry, embedding);
-      for (const link of entry.links) {
-        this.addLink(link.fromId, link.toId, link.type);
-      }
-    });
-    run();
+    const contests = entry.type === 'UV' ? ((entry.body as UvBody).contests ?? null) : null;
+    const ownLink = (link: TruthLink): boolean => {
+      if (link.toId === entry.id) return true;
+      if (link.fromId !== entry.id) return false;
+      if (entry.type === 'UV') return link.type === 'contests' && link.toId === contests;
+      return link.type === 'supersedes' || (link.type === 'signs' && !this.getEntry(link.toId));
+    };
+    this.append(
+      entry,
+      [...entry.links.filter(ownLink), ...(contests ? [{ fromId: entry.id, toId: contests, type: 'contests' as const }] : [])],
+      { embedding }
+    );
     return 'inserted';
   }
 
@@ -1034,10 +1256,37 @@ export class TruthLedger {
     };
   }
 
+  /**
+   * The stored entry as callers see it: its body carries the derived status,
+   * and a dismissed proposal carries who dismissed it and why, read from the
+   * dismissal ruling (0.x rows recorded both in the body itself).
+   */
   private rowToEntry(row: any): TruthEntry {
     const links = this.db
-      .prepare('SELECT * FROM truth_links WHERE from_id = ? OR to_id = ?')
+      .prepare('SELECT * FROM truth_links WHERE from_id = ? OR to_id = ? ORDER BY rowid')
       .all(row.id, row.id) as Array<{ from_id: string; to_id: string; link_type: string }>;
+    let body = JSON.parse(row.body);
+    if (row.status !== null && row.status !== undefined) {
+      if (row.type === 'TB' && !('status' in body) && 'literals' in body) {
+        // Where a TB body has always carried it: before its literals
+        const { literals, ...rest } = body;
+        body = { ...rest, status: row.status, literals };
+      } else {
+        body.status = row.status;
+      }
+    }
+    if (row.type === 'PROPOSAL' && row.status === 'dismissed' && body.dismissedBy === undefined) {
+      const ruling = this.db
+        .prepare(`
+          SELECT e.author, e.body FROM truth_links l JOIN truth_entries e ON e.id = l.from_id
+          WHERE l.to_id = ? AND l.link_type = 'dismisses' ORDER BY e.seq LIMIT 1
+        `)
+        .get(row.id) as { author: string; body: string } | undefined;
+      if (ruling) {
+        body.dismissedBy = ruling.author;
+        body.dismissReason = (JSON.parse(ruling.body) as RulingEntry['body']).opinion;
+      }
+    }
     return {
       id: row.id,
       type: row.type,
@@ -1046,7 +1295,7 @@ export class TruthLedger {
       provenance: JSON.parse(row.provenance),
       agentSessionId: row.agent_session_id ?? null,
       origin: row.origin,
-      body: JSON.parse(row.body),
+      body,
       links: links.map((l) => ({ fromId: l.from_id, toId: l.to_id, type: l.link_type as LinkType })),
     };
   }

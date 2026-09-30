@@ -73,9 +73,10 @@ npx stenographer start ./conversation.jsonl --embeddings hashed
 | `--no-mcp-channel` | — | — | Don't push objections to the attached MCP client as Claude Code channel events |
 | `--profile` | `agent` \| `operator` | `agent` | Which MCP tools are served. `agent`: read tools plus drafting (`propose_tombstone`, `assert_uv`, a `resolve_uv` that can't mint TBs). `operator`: the judicial and destructive tools, for a notary UI or CLI a person drives — never an agent. See [Notarization, identity and the threat model](#notarization-identity-and-the-threat-model) |
 | `--agent-identity` | identity | `agent:<MCP client name>` | Who agent-profile writes are attributed to. Tool arguments can't override it |
-| `--allow-agent-assert` | — | off | Single-user opt-out: the agent profile also serves `assert_tombstone` and lets `resolve_uv` mint TBs from `command` evidence, signed by the agent identity (never a person's name). Off, every agent-authored TB is notarized by a person |
+| `--allow-agent-assert` | — | off | Single-user opt-out: the agent profile also serves `assert_tombstone`, signed by the agent identity (never a person's name). Off, every agent-authored TB is notarized by a person |
 | `--signer-registry` | path | — | JSON allowlist of signers and roles; operator paths (MCP operator profile, REST notary routes, `stenographer notarize`) accept only listed identities in a role that may act |
 | `--rest-host` | hostname/IP | `127.0.0.1` | Interface for the REST API to bind to. The API has no authentication, so it stays loopback-only unless you explicitly opt into wider exposure (e.g. `0.0.0.0` behind a trusted network boundary) |
+| `--skip-verify` | — | off | Serve even if the truth ledger fails its integrity check. By default `start` runs the same check as `stenographer verify` and refuses to serve a ledger that fails it (see [Ledger integrity](#ledger-integrity)) |
 
 Positional args: `stenographer start <log-path> [state-path]` — `state-path` defaults to `./stenographer.db`.
 
@@ -112,7 +113,7 @@ Which tools a server serves depends on its `--profile`. Every tool's arguments a
 | `list_objections` | both | Real-time objections (objection + exhibit + transcript line); `includeShadow` for shadow judging |
 | `propose_tombstone` | agent | Draft a TB (claim, evidence, literals, rationale); it's raised to a person and never mints until they notarize it. `targetRef` dedupes only against the same agent's open drafts |
 | `assert_uv` | agent, operator | Assert an unverified belief with a machine-actionable `verifyBy`; `contests` disputes a TB. In the agent profile the author is the agent identity |
-| `resolve_uv` | agent, operator | Verify/refute a UV with evidence. In the agent profile a resolution that would mint a TB (verifying a contest) is refused; in the operator profile `command` evidence self-signs and other evidence needs a person's `signedBy` |
+| `resolve_uv` | agent, operator | Verify/refute a UV with evidence. In the agent profile a resolution that would mint a TB (verifying a contest) is refused; in the operator profile it needs a person's `signedBy` and files a promotion ruling. Submitted `command` output is recorded as `claimed-command` and never signs for itself |
 | `assert_tombstone` | operator (agent with `--allow-agent-assert`) | Direct TB, evidence required. With `--allow-agent-assert` it is signed by the agent identity |
 | `sign_proposal` | operator | Notarize a proposal under a person's identity (`edits` supported) — signs agent drafts too |
 | `dismiss_proposal` | operator | Dismiss with a required reason (kept as detector training data) |
@@ -173,17 +174,23 @@ Matching uses embedding similarity (`supersedeThreshold`, default 0.45, calibrat
 
 The tombstone pipeline is split into **detection** (automatic, proposal-only) and **assertion** (accountable, signed). Machines detect; authors assert — no inferred write ever lands as truth.
 
-Five record types live in one append-only ledger (`truth_entries`, mirrored to wiki JSONL):
+Five record types live in one append-only, hash-chained ledger (`truth_entries`, mirrored to wiki JSONL):
 
 - **`TB`** — asserted tombstone: a prior statement is provably stale/wrong. Requires evidence and a signer.
 - **`UV`** — unverified assertion ("there be dragons"): believed true, stated before verification exists, with a machine-actionable `verifyBy` hint.
 - **`PROPOSAL`** — what the supersession detector now emits. Signing mints the TB/UV; dismissing costs nothing, so thresholds can be tuned for recall.
 - **`ADDENDUM`** — evidence attached after the fact (UV resolutions, TB overrides).
-- **`RULING`** — a signed judgment with a required written opinion: `strike` (inadmissible, never deleted), `promotion` (evidence ruled sufficient), `contempt` (self-corroboration called out — mints one conduct TB, no karma system).
+- **`RULING`** — a signed judgment with a required written opinion: `strike` (inadmissible, never deleted), `promotion` (evidence ruled sufficient), `contempt` (self-corroboration called out — mints one conduct TB, no karma system), `dismissal` (a proposal declined, with the reason).
 
-**Override protocol** (force semantics, enforced at the storage layer): flipping an active TB requires either a contesting UV (`contests` — TB becomes `contested` but stays truth) or a proven addendum with evidence (`overrides`). There is no third path, and no path at all for anonymous writes — generic identities (`system`, `assistant`, …) and identities with control characters are rejected at the schema level, and `migration` and `detector:*` are reserved for the backfill and detector paths, as author and as signer.
+The ledger also writes `MARKER` entries about itself; today the only one is `chained-at-migration` (see [Ledger integrity](#ledger-integrity)).
 
-**Contempt of corpus**: corroboration must be provenance-independent. A `verifies`/`signs`/`refutes` whose actor — the resolver *and* any signer — shares the author, signer, drafter or agent session of its target is rejected at write time — three subagents affirming their parent's UV is one opinion wearing three hats. Identities compare canonically (Unicode NFKC, invisible characters removed, trimmed, case-folded), so `Alice`, ` alice ` and `ａｌｉｃｅ` are one person. Refuting a contest restores its TB, so the TB's own author, signer or drafter can't be the one to refute it (conceding, by verifying the contest, is allowed).
+**Status is derived, never stored.** A TB, UV or proposal's status is a fold over the links that point at it: `overrides` makes a TB overridden, and nothing takes that back; a TB is contested while at least one contesting UV is open; `verifies`/`refutes` resolve a UV; `signs`/`dismisses` close a proposal; `strikes` makes any entry struck. No write rewrites an entry — dismissing a proposal appends a `dismissal` ruling — so the ledger is append-only in the literal sense: rows are inserted, never updated. (A cached status column exists for queries; it is recomputed from links on every write and checked by `stenographer verify`.)
+
+**Evidence.** A `command` a caller says it ran, with the output it says it saw, is a claim: it is recorded as `claimed-command`. Only a check stenographer executed itself would be recorded as `command` and sign for itself, and 1.0 ships no runner — so every resolution that mints a TB needs a person's signature and a promotion ruling.
+
+**Override protocol** (force semantics, enforced at the storage layer): flipping an active TB requires either a contesting UV (`contests` — TB becomes `contested` but stays truth) or a proven addendum with evidence (`overrides`). Refuting a contest closes that contest only: an overridden TB stays overridden. There is no third path, and no path at all for anonymous writes — generic identities (`system`, `assistant`, …) and identities with control characters are rejected at the schema level, and `migration` and `detector:*` are reserved for the backfill and detector paths, as author and as signer.
+
+**Contempt of corpus**: corroboration must be provenance-independent. A `verifies`/`signs`/`refutes` whose actor — the resolver *and* any signer — shares the author, signer, drafter or agent session of its target is rejected at write time — three subagents affirming their parent's UV is one opinion wearing three hats. Identities compare canonically (Unicode NFKC, invisible characters removed, trimmed, case-folded), so `Alice`, ` alice ` and `ａｌｉｃｅ` are one person. Refuting a contest can return its TB to active, so the TB's own author, signer or drafter can't be the one to refute it (conceding, by verifying the contest, is allowed).
 
 **Rollout** is governed by `truthMode`:
 - `shadow` (default, Phase 0): auto-close keeps working *and* every detection lands as a proposal — observe quality, tune.
@@ -202,7 +209,7 @@ Agents often find the dead value first — the config that was bumped, the class
 - **`agent`** — what you put in an agent's MCP config. Read tools, plus `propose_tombstone`, `assert_uv`, and a `resolve_uv` that refuses any resolution that would mint a TB. Nothing in this profile signs, notarizes, dismisses, overrides, strikes, rules, imports, or asserts a TB. Every path the 0.x audit found to mint a TB without a person — `sign_proposal` with edits, `resolve_uv` with `mintTombstone` or a verified contest, `file_ruling` with an unknown kind, `import_wiki_entries`, `assert_tombstone` — is either absent from this profile or refused by it.
 - **`operator`** — for a notary UI or CLI that a person drives (smallchat-swift's approval view, a terminal). It serves `sign_proposal` (the notary act, which also signs agent drafts), `dismiss_proposal`, `override_tombstone`, `file_ruling`, `rule_on_objection`, `assert_tombstone`, wiki import/export and the backfill. Never give it to an agent.
 
-`--allow-agent-assert` is the explicit opt-out for single-user setups: the agent profile also serves `assert_tombstone`, and `resolve_uv` may mint from `command` evidence. Those TBs are signed by the agent identity, never by a person's name, and a judgment call (non-`command` evidence) still needs a person's signature.
+`--allow-agent-assert` is the explicit opt-out for single-user setups: the agent profile also serves `assert_tombstone`. Those TBs are signed by the agent identity, never by a person's name. A `resolve_uv` that would mint a TB still needs a person's signature: evidence the agent submits, command output included, is a claim, not a check stenographer ran.
 
 **Identity.** In the agent profile the server binds identity: every write carries `--agent-identity` (default `agent:<name the MCP client sent in clientInfo>`) and this server's session id. Agent tools take no `author`, `signedBy`, `proposedBy`, `dismissedBy` or `agentSessionId` argument; passing one is a validation error. Subagents that share the connection share the session, so they can't corroborate each other. Operator paths take the signer's name from the caller and check it: canonicalized, never anonymous or reserved (`migration`, `detector:*`), and — with `--signer-registry` — listed in a role that may act:
 
@@ -226,9 +233,28 @@ People sign, notarize, dismiss, override, strike and rule; agents draft and asse
 
 **What this protects, and what it doesn't.** The property: an agent whose only access to the ledger is an agent-profile MCP connection cannot mint an active TB, attach a person's name to anything, or neutralize a signed TB or an objection (override, strike, dismiss, rule). It can contest a TB with a UV, which marks the TB contested and leaves it truth. The boundary is the MCP connection:
 
-- **Anything that can run commands or read files as the operator's user is the operator.** It can read `STENOGRAPHER_NOTARY_SECRET` from the environment of the process serving REST — usually the agent-spawned MCP server itself, configured in the agent host's MCP config — edit that config to `--profile operator`, open the SQLite file directly, or drive `stenographer notarize` through a pseudo-terminal (`script`, `expect`): the typed code stops blind or pre-scripted approval, not a program that reads the terminal. Separating those needs OS-level separation: run the agent as another user or in a sandbox without access to the operator's config, environment, state file and terminal.
+- **Anything that can run commands or read files as the operator's user is the operator.** It can read `STENOGRAPHER_NOTARY_SECRET` from the environment of the process serving REST — usually the agent-spawned MCP server itself, configured in the agent host's MCP config — edit that config to `--profile operator`, open the SQLite file directly, or drive `stenographer notarize` through a pseudo-terminal (`script`, `expect`): the typed code stops blind or pre-scripted approval, not a program that reads the terminal. Separating those needs OS-level separation: run the agent as another user or in a sandbox without access to the operator's config, environment, state file and terminal. Editing the SQLite file shows up in `stenographer verify` unless the editor recomputes the chain from the edit on; only a head hash kept outside the file catches that (see [Ledger integrity](#ledger-integrity)).
 - **The signer registry is an allowlist, not authentication.** Whoever reaches an operator path can use any listed person's name; the registry stops typos, unlisted names, and agent identities on person-only acts. Key-based signing, where the notary signs with a key the server doesn't hold, is planned for 1.x.
 - Without `--signer-registry`, operator paths accept any non-anonymous, non-reserved name, and `--agent-identity` accepts any non-reserved identity the operator configures.
+
+### Ledger integrity
+
+Every ledger entry is chained to the one before it, in insertion order: it stores `prevHash` (the previous entry's hash, `null` for the first) and `hash = sha256hex(JCS(entry))`, where the hashed entry is its id, type, timestamp, author, provenance, agent session, origin, body, target ref, the links its append wrote, and `prevHash`, canonicalized with JCS ([RFC 8785](https://www.rfc-editor.org/rfc/rfc8785)). The cached status columns and embeddings are not hashed; status is re-derived instead.
+
+```bash
+stenographer verify ./stenographer.db          # exit 0 intact, 1 integrity failure, 2 could not run
+stenographer verify ./stenographer.db --json   # the same report, machine-readable
+```
+
+`verify` walks the chain, checks that the link table holds exactly the links entries wrote, re-derives every status from links, and reports the first divergence. It prints the head hash. `stenographer start` runs the same check before serving and refuses a ledger that fails it; `--skip-verify` serves it anyway. The terminal notary won't sign onto a ledger that fails it.
+
+What the chain shows, and what it doesn't:
+
+- **Detected:** an edited entry (body, author, provenance, target ref, links), an entry or link inserted or deleted anywhere but the end, reordered entries, a row written around the ledger (e.g. by a pre-1.0 stenographer), and a cached status its links don't justify.
+- **Not detected by the file alone:** deleting the newest entries, or rewriting everything from some entry on and recomputing the hashes — anyone who can write the file can do that. Record the head hash `verify` prints somewhere the state file isn't (a commit, a ticket, a teammate) and compare: a truncated or rewritten chain won't reproduce it.
+- **Not signatures.** A hash chain shows *that* the ledger changed, not *who* wrote an entry. Key-based signing is planned for 1.x.
+
+A pre-1.0 ledger is chained the first time a 1.0 stenographer opens it. Its rows are chained as they are, in insertion order, and a `MARKER` entry (`chained-at-migration`, author `migration`) closes the run: for those entries the chain attests to "unchanged since the migration", not "since written". Statuses are then re-derived from links; the marker lists any the 0.x bookkeeping had wrong (such as a TB that refuting a second contest had set back to active after it was overridden, STENO-T-06).
 
 ### Real-time objections
 
