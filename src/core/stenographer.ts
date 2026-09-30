@@ -613,22 +613,10 @@ export class Stenographer implements StenographerAPI {
     });
 
     if (match) {
-      // Detection is proposal-only: the detector may never write truth.
-      this.writeSupersessionProposal(sessionId, match, { id: newId, description }, msg);
-
-      if (this.truthMode === 'shadow') {
-        // Phase 0: auto-close continues alongside proposals
-        this.store.supersedeDecision(match.decision.id, newId);
-        this.store.addTombstone(sessionId, {
-          id: contentId('tombstone', 'decision', msg.id, String(index), description),
-          superseded: match.decision.description,
-          correctedTo: description,
-          reason: 'Superseded by newer decision',
-          sourceMessageId: msg.id,
-          supersededDecisionId: match.decision.id,
-          timestamp: msg.timestamp,
-        });
-      }
+      this.recordSupersession(sessionId, match, { id: newId, description, timestamp: msg.timestamp }, msg, {
+        id: contentId('tombstone', 'decision', msg.id, String(index), description),
+        reason: 'Superseded by newer decision',
+      });
     }
   }
 
@@ -641,47 +629,37 @@ export class Stenographer implements StenographerAPI {
   ): void {
     const correctedStatement = correction.to;
     const match = this.matchSuperseded(sessionId, correctedStatement, supersession);
-
-    let supersededDecisionId: string | undefined;
-    // What the correction replaces: the decision it matched, else what it names
-    let supersededText = correction.from;
-    let newId: string | undefined;
+    const tombstoneId = contentId('tombstone', 'correction', msg.id, String(index), correctedStatement);
 
     if (match) {
       // The correction is the fresher version of a settled decision:
       // record it as a new decision; closing the old one is truth-mode-gated.
-      newId = contentId('decision', 'correction', msg.id, String(index), correctedStatement);
+      const newId = contentId('decision', 'correction', msg.id, String(index), correctedStatement);
       this.store.addDecision(sessionId, {
         id: newId,
         description: correctedStatement,
         sourceMessageId: msg.id,
         timestamp: msg.timestamp,
       });
-      this.writeSupersessionProposal(
+      this.recordSupersession(
         sessionId,
         match,
-        { id: newId, description: correctedStatement },
-        msg
+        { id: newId, description: correctedStatement, timestamp: msg.timestamp },
+        msg,
+        { id: tombstoneId, reason: 'Correction superseded prior decision' }
       );
-      supersededDecisionId = match.decision.id;
-      supersededText = match.decision.description;
-    }
-
-    if (this.truthMode === 'shadow') {
-      // Phase 0: legacy auto-close + inferred tombstone continue
-      if (match && newId) {
-        this.store.supersedeDecision(match.decision.id, newId);
-      }
+    } else if (this.truthMode === 'shadow') {
+      // Phase 0: the inferred tombstone continues; it names what the
+      // correction replaces when the sentence does ("X instead of Y")
       this.store.addTombstone(sessionId, {
-        id: contentId('tombstone', 'correction', msg.id, String(index), correctedStatement),
-        superseded: supersededText,
+        id: tombstoneId,
+        superseded: correction.from,
         correctedTo: correctedStatement,
-        reason: match ? 'Correction superseded prior decision' : 'Correction detected',
+        reason: 'Correction detected',
         sourceMessageId: msg.id,
-        supersededDecisionId,
         timestamp: msg.timestamp,
       });
-    } else if (!match) {
+    } else {
       // Assert mode, unmatched correction: still worth a reviewable proposal
       this.store.truth.addProposal(
         {
@@ -703,32 +681,67 @@ export class Stenographer implements StenographerAPI {
   }
 
   /**
+   * A new decision and an active one are versions of one fact: the newer
+   * closes the older, whichever was indexed first — watch mode replays logs
+   * in directory order, not time order. Detection is proposal-only (the
+   * detector may never write truth); in shadow mode (Phase 0) the auto-close
+   * and the inferred tombstone continue alongside the proposal.
+   */
+  private recordSupersession(
+    sessionId: string,
+    match: { decision: IndexedDecision; score: number },
+    incoming: { id: string; description: string; timestamp: string },
+    msg: ConversationMessage,
+    tombstone: { id: string; reason: string }
+  ): void {
+    const late = isAfter(match.decision.timestamp, incoming.timestamp);
+    const [older, newer] = late ? [incoming, match.decision] : [match.decision, incoming];
+    this.writeSupersessionProposal(sessionId, older, newer, match.score, msg);
+
+    if (this.truthMode === 'shadow') {
+      this.store.supersedeDecision(older.id, newer.id);
+      this.store.addTombstone(sessionId, {
+        id: tombstone.id,
+        superseded: older.description,
+        correctedTo: newer.description,
+        reason: late ? 'Superseded by a newer version indexed earlier' : tombstone.reason,
+        sourceMessageId: msg.id,
+        supersededDecisionId: older.id,
+        timestamp: msg.timestamp,
+      });
+    }
+  }
+
+  /**
    * Writes a PROPOSAL(kind: tombstone) for a detected supersession — the
    * detector's only write surface into the truth layer. Signing it (an
    * accountable author) is what closes the superseded decision in assert
-   * mode; dismissing it costs nothing.
+   * mode; dismissing it costs nothing. Proposals are deduped per
+   * (superseded, successor) pair, so a second successor of one decision
+   * gets its own proposal instead of being swallowed by the first.
    */
   private writeSupersessionProposal(
     sessionId: string,
-    match: { decision: IndexedDecision; score: number },
+    superseded: { id: string; description: string },
     successor: { id: string; description: string },
+    score: number,
     msg: ConversationMessage
   ): void {
     this.store.truth.addProposal(
       {
         kind: 'tombstone',
         draft: {
-          claim: `"${match.decision.description}" is superseded by "${successor.description}"`,
+          claim: `"${superseded.description}" is superseded by "${successor.description}"`,
           evidence: [{ kind: 'message', ref: msg.id, detail: successor.description }],
         },
         signal: {
           source: 'supersession-detector',
-          score: match.score,
+          score,
           threshold: this.supersedeThreshold,
         },
-        targetRef: match.decision.id,
+        targetRef: `${superseded.id}->${successor.id}`,
         meta: {
-          supersededDecisionId: match.decision.id,
+          supersededDecisionId: superseded.id,
           successorDecisionId: successor.id,
           sessionId,
         },
@@ -739,6 +752,37 @@ export class Stenographer implements StenographerAPI {
         timestamp: msg.timestamp,
       }
     );
+  }
+
+  /**
+   * Applies a signed supersession. When the superseded decision was already
+   * closed by another version, the newer of that chain's current version
+   * and the signed successor closes the other — so signing every proposal
+   * against one decision, in any order, leaves one current version.
+   */
+  private applySupersession(supersededId: string, successorId: string): void {
+    const superseded = this.store.getDecision(supersededId);
+    const successor = this.store.getDecision(successorId);
+    if (!superseded || !successor || successor.superseded) return;
+    if (!superseded.superseded) {
+      this.store.supersedeDecision(supersededId, successorId);
+      return;
+    }
+    const chain = this.store.getDecisionChain(supersededId);
+    const current = chain[chain.length - 1];
+    if (!current || current.superseded || current.id === successorId) return;
+    const [older, newer] = isAfter(successor.timestamp, current.timestamp) ? [current, successor] : [successor, current];
+    this.store.supersedeDecision(older.id, newer.id);
+  }
+
+  /**
+   * Where a new decision looks for the versions it supersedes: its session
+   * in file modes; in watch mode every session in the database, because
+   * each conversation (and each /clear) is a new log, but one project's
+   * decisions supersede each other across them.
+   */
+  private supersessionScope(sessionId: string): string | null {
+    return this.config.mode === 'watch' ? null : sessionId;
   }
 
   /**
@@ -754,7 +798,9 @@ export class Stenographer implements StenographerAPI {
     const context: SupersessionContext = { candidates: [], embeddings: new Map() };
     if (texts.length === 0) return context;
 
-    const active = this.store.getActiveDecisions(sessionId).filter((d) => d.sourceMessageId !== messageId);
+    const active = this.store
+      .getActiveDecisions(this.supersessionScope(sessionId))
+      .filter((d) => d.sourceMessageId !== messageId);
     if (active.length === 0) return context;
 
     for (const decision of active) {
@@ -777,7 +823,7 @@ export class Stenographer implements StenographerAPI {
 
     // Re-read inside the transaction: an earlier text in this message (or a
     // signing while this one was being derived) may have closed a candidate
-    const active = new Set(this.store.getActiveDecisions(sessionId).map((d) => d.id));
+    const active = new Set(this.store.getActiveDecisions(this.supersessionScope(sessionId)).map((d) => d.id));
     let best: IndexedDecision | null = null;
     let bestScore = 0;
 
@@ -1005,10 +1051,7 @@ export class Stenographer implements StenographerAPI {
 
     const meta = proposal?.body.meta;
     if (meta?.supersededDecisionId && meta?.successorDecisionId) {
-      this.store.supersedeDecision(
-        meta.supersededDecisionId as string,
-        meta.successorDecisionId as string
-      );
+      this.applySupersession(meta.supersededDecisionId as string, meta.successorDecisionId as string);
     }
     return entry;
   }
@@ -1320,6 +1363,13 @@ function toDecision(d: IndexedDecision): Decision {
     supersededBy: d.supersededBy,
     sourceMessageId: d.sourceMessageId,
   };
+}
+
+/** Whether timestamp `a` is strictly later than `b`; unparseable timestamps are never later. */
+function isAfter(a: string, b: string): boolean {
+  const ta = Date.parse(a);
+  const tb = Date.parse(b);
+  return Number.isFinite(ta) && Number.isFinite(tb) && ta > tb;
 }
 
 function estimateTokens(text: string): number {

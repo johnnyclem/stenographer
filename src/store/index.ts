@@ -583,6 +583,11 @@ export class StateStore {
       .run(newId, oldId);
   }
 
+  getDecision(id: string): IndexedDecision | null {
+    const row = this.statement('SELECT * FROM decisions WHERE id = ?').get(id);
+    return row ? this.rowToDecision(row) : null;
+  }
+
   getActiveDecisions(sessionId: string | null): IndexedDecision[] {
     const stmt = sessionId
       ? this.db.prepare('SELECT * FROM decisions WHERE session_id = ? AND superseded = 0 ORDER BY timestamp ASC')
