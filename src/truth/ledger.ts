@@ -12,8 +12,14 @@
 import type Database from 'better-sqlite3';
 import {
   ulid,
+  canonicalIdentity,
+  identityKey,
   isAnonymousIdentity,
+  isReservedIdentity,
+  hasControlCharacters,
   isSelfSigningEvidence,
+  FILED_RULING_KINDS,
+  DETECTOR_PREFIX,
   TbInputSchema,
   TombstoneDraftInputSchema,
   UvInputSchema,
@@ -33,6 +39,7 @@ import {
   type ProposalBody,
   type VerifyBy,
   type TombstonedLiteral,
+  type FiledRulingKind,
 } from './types.js';
 
 export class TruthWriteError extends Error {}
@@ -102,36 +109,76 @@ export class TruthLedger {
   // Internal write primitives
   // ─────────────────────────────────────────────────────────
 
-  private requireAccountable(identity: string, role: string): void {
-    if (isAnonymousIdentity(identity)) {
+  /**
+   * The accountability floor for every write: no anonymous or generic
+   * identity, no control characters, and no reserved identity — 'migration'
+   * belongs to the backfill path and 'detector:*' to the pipelines that file
+   * proposals (`allowDetector`). Returns the canonical (stored) form.
+   */
+  private accountable(identity: string, role: string, opts: { allowDetector?: boolean } = {}): string {
+    if (typeof identity !== 'string' || isAnonymousIdentity(identity)) {
       throw new TruthWriteError(
         `${role} '${identity}' is not an accountable identity — anonymous writes are rejected at the schema level`
       );
     }
+    if (hasControlCharacters(identity)) {
+      throw new TruthWriteError(`${role} identity contains control characters`);
+    }
+    const detector = identityKey(identity).startsWith(DETECTOR_PREFIX);
+    if (isReservedIdentity(identity) && !(detector && opts.allowDetector)) {
+      throw new TruthWriteError(
+        `${role} '${identity}' is reserved for the ${detector ? 'detector' : 'backfill'} path`
+      );
+    }
+    return canonicalIdentity(identity);
+  }
+
+  /**
+   * Who and which agent session stand behind an entry: its author, a TB's
+   * signer, and the drafter of any proposal it was signed from.
+   */
+  private lineage(target: TruthEntry): { identities: string[]; sessions: string[] } {
+    const identities = [target.author];
+    const sessions = [target.agentSessionId];
+    if (target.type === 'TB') identities.push((target.body as TbBody).signedBy ?? '');
+    for (const link of target.links) {
+      if (link.type !== 'signs' || link.fromId !== target.id) continue;
+      const draft = this.getEntry(link.toId);
+      if (draft) {
+        identities.push(draft.author);
+        sessions.push(draft.agentSessionId);
+      }
+    }
+    return {
+      identities: identities.filter(Boolean).map(identityKey),
+      sessions: sessions.map((s) => s?.trim()).filter((s): s is string => Boolean(s)),
+    };
   }
 
   /**
    * Provenance-independence check (contempt of corpus, §11): evidence used
    * to verify or sign an entry may not share lineage with the assertion it
-   * supports. Repetition is not evidence.
+   * supports. Repetition is not evidence. Identities compare canonically
+   * (case, width, whitespace and invisible characters don't make a second
+   * person), and every identity acting — resolver and signer — is checked.
    */
   private requireIndependence(
-    actor: { author: string; agentSessionId?: string | null },
+    actor: { author: string; signedBy?: string | null; agentSessionId?: string | null },
     target: TruthEntry,
     action: string
   ): void {
-    if (actor.author === target.author) {
-      throw new ContemptError(
-        `contempt of corpus: '${actor.author}' cannot ${action} entry ${target.id} it authored — corroboration must be provenance-independent`
-      );
+    const { identities, sessions } = this.lineage(target);
+    for (const who of [actor.author, actor.signedBy]) {
+      if (who && identities.includes(identityKey(who))) {
+        throw new ContemptError(
+          `contempt of corpus: '${who}' cannot ${action} entry ${target.id} — they already stand behind it (as author, signer or drafter); corroboration must be provenance-independent`
+        );
+      }
     }
-    if (
-      actor.agentSessionId &&
-      target.agentSessionId &&
-      actor.agentSessionId === target.agentSessionId
-    ) {
+    const session = actor.agentSessionId?.trim();
+    if (session && sessions.includes(session)) {
       throw new ContemptError(
-        `contempt of corpus: ${action} of ${target.id} traces to the same agent session (${actor.agentSessionId}) as its target — one opinion wearing two hats is not two witnesses`
+        `contempt of corpus: ${action} of ${target.id} traces to the same agent session (${session}) as its target — one opinion wearing two hats is not two witnesses`
       );
     }
   }
@@ -219,26 +266,25 @@ export class TruthLedger {
 
   /**
    * Writes a machine-drafted proposal. Dedupes by target: an open proposal
-   * of the same kind against the same target is returned instead of
-   * duplicated (batching by target entity, §10).
+   * of the same kind against the same target, from the same author and with
+   * the same notary requirement, is returned instead of duplicated
+   * (batching by target entity, §10). Dedupe never crosses authors: one
+   * author's draft is never folded into another's.
    */
   addProposal(
     body: Omit<ProposalBody, 'status' | 'dismissedBy' | 'dismissReason'>,
     ctx: WriteContext
   ): ProposalEntry {
-    this.requireAccountable(ctx.author, 'proposal author');
+    const author = this.accountable(ctx.author, 'proposal author', { allowDetector: true });
 
     if (body.targetRef) {
-      const existing = this.db
-        .prepare(`
-          SELECT id FROM truth_entries
-          WHERE type = 'PROPOSAL' AND status = 'open' AND target_ref = ?
-        `)
-        .all(body.targetRef) as Array<{ id: string }>;
-      for (const row of existing) {
-        const entry = this.getEntry(row.id) as ProposalEntry;
-        if (entry.body.kind === body.kind) return entry;
-      }
+      const existing = this.findOpenProposal({
+        kind: body.kind,
+        targetRef: body.targetRef,
+        author,
+        requiresNotary: Boolean(body.requiresNotary),
+      });
+      if (existing) return existing;
     }
 
     const id = ulid();
@@ -247,7 +293,7 @@ export class TruthLedger {
         id,
         type: 'PROPOSAL',
         createdAt: ctx.timestamp ?? new Date().toISOString(),
-        author: ctx.author,
+        author,
         provenance: ctx.provenance ?? MANUAL,
         agentSessionId: ctx.agentSessionId ?? null,
         origin: 'local',
@@ -256,6 +302,34 @@ export class TruthLedger {
       ctx.embedding
     );
     return this.getEntry(id) as ProposalEntry;
+  }
+
+  /** The open proposal `addProposal` would dedupe into, if any. */
+  findOpenProposal(match: {
+    kind: ProposalBody['kind'];
+    targetRef: string;
+    author: string;
+    requiresNotary: boolean;
+  }): ProposalEntry | null {
+    const rows = this.db
+      .prepare(`
+        SELECT id FROM truth_entries
+        WHERE type = 'PROPOSAL' AND status = 'open' AND target_ref = ?
+        ORDER BY created_at ASC
+      `)
+      .all(match.targetRef) as Array<{ id: string }>;
+    const author = identityKey(match.author);
+    for (const row of rows) {
+      const entry = this.getEntry(row.id) as ProposalEntry;
+      if (
+        entry.body.kind === match.kind &&
+        identityKey(entry.author) === author &&
+        Boolean(entry.body.requiresNotary) === match.requiresNotary
+      ) {
+        return entry;
+      }
+    }
+    return null;
   }
 
   /**
@@ -268,6 +342,8 @@ export class TruthLedger {
     input: { claim: string; evidence: Evidence[]; literals?: TombstonedLiteral[]; rationale?: string; targetRef?: string },
     ctx: WriteContext
   ): ProposalEntry {
+    // Drafts come from agents and people, never from a reserved identity
+    this.accountable(ctx.author, 'drafter');
     const { claim, evidence, literals } = TombstoneDraftInputSchema.parse(input);
     return this.addProposal(
       {
@@ -295,7 +371,7 @@ export class TruthLedger {
     edits?: Record<string, unknown>,
     ctx?: Partial<WriteContext> & { notarized?: boolean }
   ): TbEntry | UvEntry {
-    this.requireAccountable(signedBy, 'signer');
+    signedBy = this.accountable(signedBy, 'signer');
     const proposal = this.mustGetTyped<ProposalEntry>(proposalId, 'PROPOSAL');
     if (proposal.body.status !== 'open') {
       throw new TruthWriteError(`proposal ${proposalId} is already ${proposal.body.status}`);
@@ -342,7 +418,7 @@ export class TruthLedger {
 
   /** Dismissal reasons are kept — they are training data for the detector. */
   dismissProposal(proposalId: string, dismissedBy: string, reason: string): ProposalEntry {
-    this.requireAccountable(dismissedBy, 'dismisser');
+    dismissedBy = this.accountable(dismissedBy, 'dismisser');
     if (!reason || reason.trim().length === 0) {
       throw new TruthWriteError('a dismissal requires a reason');
     }
@@ -368,17 +444,17 @@ export class TruthLedger {
     ctx: WriteContext
   ): TbEntry {
     const parsed = TbInputSchema.parse(input);
-    this.requireAccountable(ctx.author, 'author');
-    return this.insertTb(parsed, ctx);
+    const author = this.accountable(ctx.author, 'author');
+    return this.insertTb(parsed, { ...ctx, author });
   }
 
   assertUv(
-    input: { assertion: string; basis: string; verifyBy: VerifyBy; contests?: string },
+    input: { assertion: string; basis: string; verifyBy: VerifyBy; contests?: string | null },
     ctx: WriteContext
   ): UvEntry {
     const parsed = UvInputSchema.parse(input);
-    this.requireAccountable(ctx.author, 'author');
-    return this.insertUv(parsed, ctx);
+    const author = this.accountable(ctx.author, 'author');
+    return this.insertUv(parsed, { ...ctx, author });
   }
 
   private insertTb(
@@ -410,7 +486,7 @@ export class TruthLedger {
   }
 
   private insertUv(
-    input: { assertion: string; basis: string; verifyBy: VerifyBy; contests?: string },
+    input: { assertion: string; basis: string; verifyBy: VerifyBy; contests?: string | null },
     ctx: WriteContext
   ): UvEntry {
     const insert = this.db.transaction((): string => {
@@ -468,14 +544,20 @@ export class TruthLedger {
    * If the UV contests a TB:
    * - verified → the TB is overridden (override protocol path 2, proven)
    * - refuted  → the TB returns to active (unless still otherwise contested)
+   *
+   * `allowMint: false` (the MCP agent profile) refuses any resolution that
+   * would mint a TB, so an agent cannot turn its own resolution into truth:
+   * that stays a person's call.
    */
   resolveUv(
     uvId: string,
     resolution: 'verified' | 'refuted',
     evidence: Evidence[],
-    ctx: WriteContext & { signedBy?: string; opinion?: string; mintTombstone?: string }
+    ctx: WriteContext & { signedBy?: string; opinion?: string; mintTombstone?: string; allowMint?: boolean }
   ): { uv: UvEntry; addendum: AddendumEntry; tombstone: TbEntry | null; ruling: RulingEntry | null } {
-    this.requireAccountable(ctx.author, 'resolver');
+    const author = this.accountable(ctx.author, 'resolver');
+    const signedBy = ctx.signedBy ? this.accountable(ctx.signedBy, 'signer') : undefined;
+    ctx = { ...ctx, author, signedBy };
     const parsedEvidence = evidence.map((e) => EvidenceSchema.parse(e));
     if (parsedEvidence.length === 0) {
       throw new TruthWriteError('resolving a UV requires evidence');
@@ -488,18 +570,30 @@ export class TruthLedger {
 
     const selfSigning = isSelfSigningEvidence(parsedEvidence);
     const contestedTb = uv.body.contests ? this.mustGetTyped<TbEntry>(uv.body.contests, 'TB') : null;
+    // Refuting a contest restores the contested TB: its own authors can't be
+    // the ones to do that (conceding by verifying the contest is fine).
+    if (contestedTb && resolution === 'refuted') {
+      this.requireIndependence(ctx, contestedTb, 'refute the contest against');
+    }
     // Minting a TB happens when the resolution invalidates existing truth:
     // a verified contest overrides its TB; a refuted UV that propagated gets
     // a TB minted against the UV itself (mintTombstone carries the claim).
     const mintsTb = Boolean(
       (resolution === 'verified' && contestedTb) || ctx.mintTombstone
     );
-    if (mintsTb && !selfSigning && !ctx.signedBy) {
+    if (mintsTb && ctx.allowMint === false) {
+      throw new NotarizationRequiredError(
+        contestedTb && resolution === 'verified'
+          ? `verifying UV ${uvId} would override TB ${contestedTb.id} and mint its successor — that needs a person to notarize: ` +
+              'leave the UV open with your evidence, or draft the successor with propose_tombstone'
+          : `resolving UV ${uvId} with mintTombstone would mint a TB — that needs a person to notarize: draft it with propose_tombstone`
+      );
+    }
+    if (mintsTb && !selfSigning && !signedBy) {
       throw new TruthWriteError(
         'non-command evidence cannot self-sign a tombstone — a human signedBy is required (judgment calls are not summary judgment)'
       );
     }
-    if (ctx.signedBy) this.requireAccountable(ctx.signedBy, 'signer');
 
     const run = this.db.transaction(() => {
       const now = ctx.timestamp ?? new Date().toISOString();
@@ -553,8 +647,8 @@ export class TruthLedger {
       let rulingId: string | null = null;
       if (mintsTb && !selfSigning) {
         rulingId = this.insertRuling(
-          { kind: 'promotion', opinion: ctx.opinion ?? `Evidence ruled sufficient by ${ctx.signedBy}`, target: uvId },
-          { ...ctx, author: ctx.signedBy!, timestamp: now }
+          { kind: 'promotion', opinion: ctx.opinion ?? `Evidence ruled sufficient by ${signedBy}`, target: uvId },
+          { ...ctx, author: signedBy!, timestamp: now }
         );
       }
 
@@ -595,7 +689,7 @@ export class TruthLedger {
     addendum: { evidence: Evidence[]; note?: string },
     ctx: WriteContext
   ): { tombstone: TbEntry; addendum: AddendumEntry } {
-    this.requireAccountable(ctx.author, 'author');
+    ctx = { ...ctx, author: this.accountable(ctx.author, 'author') };
     const parsedEvidence = addendum.evidence.map((e) => EvidenceSchema.parse(e));
     if (parsedEvidence.length === 0) {
       throw new TruthWriteError(
@@ -636,10 +730,16 @@ export class TruthLedger {
   // ─────────────────────────────────────────────────────────
 
   fileRuling(
-    input: { kind: 'strike' | 'promotion' | 'contempt'; opinion: string; target: string },
+    input: { kind: FiledRulingKind; opinion: string; target: string },
     ctx: WriteContext
   ): { ruling: RulingEntry; conductTombstone: TbEntry | null } {
-    this.requireAccountable(ctx.author, 'ruling author');
+    ctx = { ...ctx, author: this.accountable(ctx.author, 'ruling author') };
+    // An unrecognized kind is a mistake, not contempt: contempt mints a TB
+    if (!(FILED_RULING_KINDS as readonly string[]).includes(input.kind)) {
+      throw new TruthWriteError(
+        `unknown ruling kind '${input.kind}' — expected one of ${FILED_RULING_KINDS.join(', ')}`
+      );
+    }
     if (!input.opinion || input.opinion.trim().length === 0) {
       throw new TruthWriteError('a ruling requires a written opinion — rulings are precedent');
     }
@@ -656,7 +756,7 @@ export class TruthLedger {
         this.db.prepare('UPDATE truth_entries SET struck = 1 WHERE id = ?').run(target.id);
       } else if (input.kind === 'promotion') {
         this.mustGet(input.target);
-      } else {
+      } else if (input.kind === 'contempt') {
         // Contempt mints exactly one artifact: a TB about the conduct,
         // surfaced when that author's output is next reviewed. No karma.
         const tb = this.insertTb(
@@ -694,7 +794,7 @@ export class TruthLedger {
     input: { objectionId: string; tbId: string; outcome: 'sustained' | 'overruled'; opinion: string },
     ctx: WriteContext
   ): RulingEntry {
-    this.requireAccountable(ctx.author, 'ruling author');
+    ctx = { ...ctx, author: this.accountable(ctx.author, 'ruling author') };
     if (!input.opinion || input.opinion.trim().length === 0) {
       throw new TruthWriteError('a ruling requires a written opinion — rulings are precedent');
     }
@@ -736,7 +836,7 @@ export class TruthLedger {
   }
 
   private insertRuling(
-    input: { kind: 'strike' | 'promotion' | 'contempt'; opinion: string; target: string },
+    input: { kind: FiledRulingKind; opinion: string; target: string },
     ctx: WriteContext
   ): string {
     const id = ulid();
@@ -893,6 +993,8 @@ export class TruthLedger {
       case 'all':
         where = `type IN ('TB', 'UV')`;
         break;
+      default:
+        throw new TruthWriteError(`unknown truth filter '${filter}' — expected current, all, or contested`);
     }
     const rows = this.db
       .prepare(`SELECT * FROM truth_entries WHERE ${where} ORDER BY (type = 'TB') DESC, created_at ASC`)

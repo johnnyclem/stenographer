@@ -18,8 +18,10 @@ import { z } from 'zod';
 
 /**
  * Identities that cannot stand behind anything. Writes carrying one are
- * rejected at the schema level — accountability requires a specific,
- * registered author (human handle or agent identity tied to an operator).
+ * rejected at the schema level — accountability requires a specific
+ * author (human handle or agent identity tied to an operator). This is a
+ * floor, not an allowlist: the signer registry (identity.ts) is the
+ * allowlist, when the operator configures one.
  */
 const ANONYMOUS_IDENTITIES = new Set([
   '',
@@ -41,20 +43,58 @@ const ANONYMOUS_IDENTITIES = new Set([
 /** Reserved identity for Phase-1 backfill of pre-assertion tombstones. */
 export const MIGRATION_AUTHOR = 'migration';
 
-export function isAnonymousIdentity(identity: string): boolean {
-  return ANONYMOUS_IDENTITIES.has(identity.trim().toLowerCase());
+/** Reserved prefix for the pipelines that file proposals (supersession, wiki sync, intake). */
+export const DETECTOR_PREFIX = 'detector:';
+
+/**
+ * The stored form of an identity: trimmed, Unicode NFC. Two spellings of
+ * the same handle store the same way; comparisons go through identityKey.
+ */
+export function canonicalIdentity(identity: string): string {
+  return identity.normalize('NFC').trim();
 }
 
-/** Author string: never blank, never a generic non-identity. */
+/**
+ * The comparison form of an identity: compatibility-normalized (NFKC, so
+ * full-width and ligature look-alikes fold), invisible code points
+ * removed, trimmed, case-folded. "Alice", " alice " and "ａｌｉｃｅ" are one
+ * person to the contempt check.
+ */
+export function identityKey(identity: string): string {
+  return identity
+    .normalize('NFKC')
+    .replace(/\p{Default_Ignorable_Code_Point}/gu, '')
+    .trim()
+    .toLowerCase();
+}
+
+export function isAnonymousIdentity(identity: string): boolean {
+  return ANONYMOUS_IDENTITIES.has(identityKey(identity));
+}
+
+/** 'migration' and 'detector:*' belong to internal write paths only. */
+export function isReservedIdentity(identity: string): boolean {
+  const key = identityKey(identity);
+  return key === MIGRATION_AUTHOR || key.startsWith(DETECTOR_PREFIX);
+}
+
+/** Control characters (newlines, escapes) have no place in a name someone stands behind. */
+export function hasControlCharacters(identity: string): boolean {
+  return /\p{Cc}/u.test(identity);
+}
+
+/** Author string: never blank, never a generic non-identity, never a reserved one. */
 export const AuthorSchema = z
   .string()
   .refine((s) => !isAnonymousIdentity(s), {
     message:
       'anonymous or generic identities cannot assert truth — use a registered human handle or agent identity',
   })
-  .refine((s) => s.trim().toLowerCase() !== MIGRATION_AUTHOR, {
-    message: `'${MIGRATION_AUTHOR}' is reserved for the backfill path`,
-  });
+  .refine((s) => !hasControlCharacters(s), { message: 'identities cannot contain control characters' })
+  .refine((s) => !isReservedIdentity(s), {
+    message: `'${MIGRATION_AUTHOR}' and '${DETECTOR_PREFIX}*' are reserved for the backfill and detector paths`,
+  })
+  .transform(canonicalIdentity);
 
 // ─────────────────────────────────────────────────────────────
 // Provenance & evidence
@@ -93,19 +133,25 @@ export function isSelfSigningEvidence(evidence: Evidence[]): boolean {
  * paraphrases — so a bare number is unmatchable without a `subject`
  * (the identifier it belongs to): "30" alone would object to everything.
  */
-export const TombstonedLiteralSchema = z
-  .object({
-    /** The dead value or identifier, e.g. "30" or "legacyRateLimit". */
-    dead: z.string().trim().min(1),
-    /** The identifier the value belongs to, e.g. "LOG_BUDGET". */
-    subject: z.string().trim().min(1).optional(),
-    /** What replaced it, if anything — cited in the objection. */
-    current: z.string().trim().min(1).optional(),
-  })
-  .refine((l) => l.subject !== undefined || isDistinctiveIdentifier(l.dead), {
-    message:
-      'a literal without a subject must be a distinctive identifier (≥4 chars, contains a letter) — name the subject of bare values',
-  });
+const TombstonedLiteralObject = z.object({
+  /** The dead value or identifier, e.g. "30" or "legacyRateLimit". */
+  dead: z.string().trim().min(1),
+  /** The identifier the value belongs to, e.g. "LOG_BUDGET". */
+  subject: z.string().trim().min(1).optional(),
+  /** What replaced it, if anything — cited in the objection. */
+  current: z.string().trim().min(1).optional(),
+});
+
+const MATCHABLE_LITERAL = {
+  message:
+    'a literal without a subject must be a distinctive identifier (≥4 chars, contains a letter) — name the subject of bare values',
+};
+const isMatchableLiteral = (l: { dead: string; subject?: string }) =>
+  l.subject !== undefined || isDistinctiveIdentifier(l.dead);
+
+export const TombstonedLiteralSchema = TombstonedLiteralObject.refine(isMatchableLiteral, MATCHABLE_LITERAL);
+/** The same literal with unknown keys rejected — what tool callers may send. */
+export const StrictTombstonedLiteralSchema = TombstonedLiteralObject.strict().refine(isMatchableLiteral, MATCHABLE_LITERAL);
 export type TombstonedLiteral = z.infer<typeof TombstonedLiteralSchema>;
 
 function isDistinctiveIdentifier(value: string): boolean {
@@ -222,8 +268,9 @@ export interface ProposalBody {
   meta?: Record<string, unknown>;
   /**
    * Agent-drafted proposals must be notarized by a person before they mint:
-   * no MCP tool can sign them, only the notary path (REST with the notary
-   * secret, or the interactive CLI).
+   * only the notary paths sign them (REST with the notary secret, the
+   * terminal notary, or sign_proposal in the operator profile) — never a
+   * tool in the agent profile.
    */
   requiresNotary?: boolean;
   status: ProposalStatus;
@@ -239,6 +286,10 @@ export interface AddendumBody {
 
 /** RULING — a signed judgment about an existing entry (§11). */
 export type RulingKind = 'strike' | 'promotion' | 'contempt' | 'objection';
+
+/** Ruling kinds filed through fileRuling; objection rulings have their own path. */
+export const FILED_RULING_KINDS = ['strike', 'promotion', 'contempt'] as const;
+export type FiledRulingKind = (typeof FILED_RULING_KINDS)[number];
 
 export interface RulingBody {
   kind: RulingKind;
@@ -285,7 +336,12 @@ export const UvInputSchema = z.object({
   assertion: z.string().min(1),
   basis: z.string().min(1),
   verifyBy: VerifyBySchema,
-  contests: z.string().optional(),
+  // Wiki lines and intake drafts carry `contests: null` for "contests nothing"
+  contests: z
+    .string()
+    .min(1)
+    .nullish()
+    .transform((v) => v ?? undefined),
 });
 
 // ─────────────────────────────────────────────────────────────

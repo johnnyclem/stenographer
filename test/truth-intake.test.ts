@@ -156,6 +156,15 @@ describe('proposal-draft intake (short-hand seam)', () => {
     expect(result.errors).toHaveLength(1);
   });
 
+  it('a UV draft carrying contests: null can be signed (STENO-T-08)', () => {
+    const line = JSON.parse(uvDraftLine('queue'));
+    line.draft.contests = null;
+    const { filed, errors } = importProposalDrafts(store.truth, { lines: [JSON.stringify(line)] });
+    expect(errors).toHaveLength(0);
+    const minted = store.truth.signProposal(filed[0].id, 'johnny');
+    expect(minted.type).toBe('UV');
+  });
+
   it('the detector cannot sign its own intake (one hat, not two)', () => {
     const { filed } = importProposalDrafts(store.truth, { lines: [uvDraftLine()] });
     expect(() => store.truth.signProposal(filed[0].id, COMPACTION_DETECTOR)).toThrow();
