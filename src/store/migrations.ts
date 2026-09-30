@@ -132,6 +132,36 @@ export const MIGRATIONS: Migration[] = [
     db.exec('CREATE INDEX IF NOT EXISTS idx_decisions_source ON decisions(source_message_id)');
     db.exec('CREATE INDEX IF NOT EXISTS idx_tombstones_source ON tombstones(source_message_id)');
   },
+
+  // 3 — retrieval. `seq` is the order messages were indexed in: provider
+  // timestamps are missing (anthropic) or parse-time (openai without
+  // `created`) for several formats, so "recent" can't be ordered by them.
+  // Record tags and tool calls, the importance total, and index_meta, which
+  // pins the embedder the stored vectors were made with.
+  (db) => {
+    addColumnIfMissing(db, 'messages', 'seq', 'INTEGER');
+    addColumnIfMissing(db, 'messages', 'tags', 'TEXT');
+    addColumnIfMissing(db, 'messages', 'tool_calls', 'TEXT');
+    addColumnIfMissing(db, 'messages', 'importance_total', 'REAL');
+    // Existing rows keep the order they were inserted in
+    db.exec('UPDATE messages SET seq = rowid WHERE seq IS NULL');
+    db.exec(`
+      UPDATE messages SET importance_total = MIN(1,
+        0.45 * COALESCE(importance_state_delta, 0) +
+        0.25 * COALESCE(importance_reference_freq, 0) +
+        0.30 * COALESCE(importance_trajectory_disc, 0))
+      WHERE importance_total IS NULL
+    `);
+    db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_seq ON messages(seq);
+      CREATE INDEX IF NOT EXISTS idx_messages_session_seq ON messages(session_id, seq);
+      CREATE INDEX IF NOT EXISTS idx_decisions_active ON decisions(superseded, session_id);
+      CREATE TABLE IF NOT EXISTS index_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+    `);
+  },
 ];
 
 /** The schema version this build writes. */

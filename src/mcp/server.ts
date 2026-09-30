@@ -625,6 +625,7 @@ export class StenographerServer {
           objections: await this.engine.getObjectionStats(),
           retriever: this.engine.retriever.getStats(),
           vectorBackend: this.engine.store.vectorSearchBackend,
+          embedder: this.engine.embedderIdentity,
           sessionId: this.engine.getSessionId(),
           mode: this.engine.config.mode,
           restPort: this.engine.restPort,
@@ -822,6 +823,8 @@ export async function runCLI(args: string[]): Promise<void> {
       'rest-port': { type: 'string' },
       'rest-host': { type: 'string' },
       embeddings: { type: 'string', short: 'e' },
+      reembed: { type: 'boolean' },
+      'supersede-threshold': { type: 'string' },
       objections: { type: 'string' },
       'objection-channel': { type: 'string', multiple: true },
       'objection-webhook': { type: 'string', multiple: true },
@@ -866,12 +869,21 @@ export async function runCLI(args: string[]): Promise<void> {
     })),
   ];
 
+  const supersedeThreshold =
+    values['supersede-threshold'] !== undefined ? Number(values['supersede-threshold']) : undefined;
+  if (supersedeThreshold !== undefined && !(supersedeThreshold > 0 && supersedeThreshold <= 1)) {
+    console.error(`--supersede-threshold must be a number in (0, 1], got '${values['supersede-threshold']}'`);
+    process.exit(1);
+  }
+
   const config: StenographerConfig = {
     logPath,
     statePath,
     mode,
     adapter: values.adapter as StenographerConfig['adapter'],
     embeddingModel: values.embeddings,
+    reembed: Boolean(values.reembed),
+    supersedeThreshold,
     restPort: values['rest-port'] ? Number.parseInt(values['rest-port'], 10) : undefined,
     restHost: values['rest-host'] as string | undefined,
     objectionMode,

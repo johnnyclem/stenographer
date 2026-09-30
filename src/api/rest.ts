@@ -98,6 +98,7 @@ export class RestServer {
           sessionId: this.engine.getSessionId(),
           retriever: this.engine.retriever.getStats(),
           vectorBackend: this.engine.store.vectorSearchBackend,
+          embedder: this.engine.embedderIdentity,
         });
         return;
 

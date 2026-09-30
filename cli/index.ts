@@ -52,8 +52,18 @@ Options (start):
                            daemon:  live + REST API (default port 8787)
   -a, --adapter <name>     jsonl | anthropic | openai | claude-code | generic
                            (default: auto-detect from file content)
-  -e, --embeddings <name>  Transformer model name, or 'hashed' for the
-                           offline lexical embedder
+  -e, --embeddings <name>  Transformer model name (default all-MiniLM-L6-v2;
+                           fails to start if it can't load), 'hashed' for
+                           the offline lexical embedder, or 'auto': the
+                           embedder the state database is pinned to, else
+                           the default model with a loud fallback to hashed
+      --reembed            re-embed every stored message and truth entry
+                           under the chosen embedder (the state database
+                           refuses to open under a different one otherwise)
+      --supersede-threshold <n>
+                           cosine similarity at which a new decision
+                           supersedes an active one (default: calibrated
+                           per embedder — MiniLM 0.45, hashed 0.75)
       --rest-port <port>   Serve the REST API on this port
       --rest-host <host>   Interface for the REST API to bind to
                            (default: 127.0.0.1 — the API has no auth,

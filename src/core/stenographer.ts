@@ -13,7 +13,14 @@ import { contentId } from '../indexer/ids.js';
 import { StateStore } from '../store/index.js';
 import { ImportanceDetector, extractStructure } from '../indexer/importance.js';
 import { GraphRAGRetriever, type QueryContext, type RetrievedChunk } from '../indexer/graphrag.js';
-import { createEmbedder, cosineSimilarity, type Embedder } from '../indexer/embeddings.js';
+import {
+  createEmbedder,
+  cosineSimilarity,
+  describeEmbedder,
+  sameEmbedder,
+  type Embedder,
+  type EmbedderIdentity,
+} from '../indexer/embeddings.js';
 import { RestServer } from '../api/rest.js';
 import {
   exportWikiEntries,
@@ -44,12 +51,37 @@ import type {
   EntityNode,
   EntityRelation,
   IndexedDecision,
+  IndexedMessage,
 } from '../types.js';
 
-// Calibrated against all-MiniLM-L6-v2: rewrites of the same decision score
-// ~0.46-0.94, unrelated decisions in the same conversation score ~0.06
+// Until the embedder is known; each embedder carries its calibrated threshold
 const DEFAULT_SUPERSEDE_THRESHOLD = 0.45;
 const DEFAULT_DAEMON_REST_PORT = 8787;
+
+/** index_meta key holding the identity of the embedder the vectors were made with. */
+const EMBEDDER_META_KEY = 'embedder';
+/** Messages re-embedded per transaction by --reembed. */
+const REEMBED_BATCH = 256;
+
+/**
+ * The state database holds vectors from another embedder. Mixing embedding
+ * spaces makes every similarity score meaningless, so the engine refuses to
+ * start rather than silently degrade.
+ */
+export class EmbedderMismatchError extends Error {
+  constructor(
+    readonly pinned: EmbedderIdentity,
+    readonly requested: EmbedderIdentity
+  ) {
+    super(
+      `state database is pinned to embedder ${describeEmbedder(pinned)}, but this run uses ` +
+        `${describeEmbedder(requested)}. Vectors from different embedders aren't comparable. Start with ` +
+        `--embeddings ${pinned.kind === 'hashed' ? 'hashed' : pinned.model} (or --embeddings auto), or pass ` +
+        '--reembed to re-embed every stored message and truth entry under the new embedder.'
+    );
+    this.name = 'EmbedderMismatchError';
+  }
+}
 
 /** Registered identity for the embedding-similarity supersession detector. */
 const DETECTOR_AUTHOR = 'detector:supersession';
@@ -115,8 +147,7 @@ export class Stenographer implements StenographerAPI {
       this.store.objectionDelivery.register(transport);
     }
 
-    this.embedder = await createEmbedder(this.config.embeddingModel);
-    this.retriever.setEmbedder(this.embedder);
+    await this.ensureEmbedder();
 
     // A log indexed before keeps its session across restarts
     if (this.config.mode !== 'watch') {
@@ -189,6 +220,82 @@ export class Stenographer implements StenographerAPI {
 
   get restPort(): number | null {
     return this.restServer?.port ?? null;
+  }
+
+  /** The embedder in use (and the state database is pinned to), once started. */
+  get embedderIdentity(): EmbedderIdentity | null {
+    return this.embedder?.identity ?? null;
+  }
+
+  /**
+   * Creates the embedder and pins the state database to it. A database
+   * whose vectors came from another embedder is refused — unless `reembed`
+   * is set, which recomputes every stored vector first. A database from
+   * before pinning is assumed to match (with a warning) unless re-embedded.
+   */
+  private async openEmbedder(): Promise<Embedder> {
+    const pinned = this.store.getMeta<EmbedderIdentity>(EMBEDDER_META_KEY);
+    const embedder = await createEmbedder(this.config.embeddingModel, { pinned });
+    const identity = embedder.identity;
+    const legacy = !pinned && this.store.hasEmbeddings();
+
+    if (pinned && !sameEmbedder(pinned, identity) && !this.config.reembed) {
+      throw new EmbedderMismatchError(pinned, identity);
+    }
+    this.store.configureVectors(identity.dimensions);
+    if (this.config.reembed) {
+      await this.reembed(embedder);
+    } else if (legacy) {
+      console.error(
+        `⚠️  ${this.config.statePath || './stenographer.db'} predates embedder pinning; assuming its vectors ` +
+          `came from ${describeEmbedder(identity)}. If they didn't, restart with --reembed.`
+      );
+    }
+    this.store.setMeta(EMBEDDER_META_KEY, identity);
+    if (this.config.supersedeThreshold === undefined) {
+      this.supersedeThreshold = embedder.supersedeThreshold;
+    }
+    this.retriever.setEmbedder(embedder);
+    return embedder;
+  }
+
+  /** Recomputes every stored vector — messages and truth entries — under `embedder`. */
+  private async reembed(embedder: Embedder): Promise<void> {
+    const started = Date.now();
+    let batch: Array<{ id: string; vectors: number[][] }> = [];
+    let count = 0;
+    const commit = () => {
+      const pending = batch;
+      batch = [];
+      this.store.transaction(() => {
+        for (const { id, vectors } of pending) this.store.setMessageEmbeddings(id, vectors);
+      });
+    };
+    for (const message of this.store.listMessageTexts()) {
+      batch.push({ id: message.id, vectors: await this.embedMessage(message, embedder) });
+      count++;
+      if (batch.length >= REEMBED_BATCH) commit();
+    }
+    commit();
+
+    const truth = this.store.listTruthEmbeddingTexts();
+    const vectors = await Promise.all(truth.map((entry) => embedder.embed(entry.text)));
+    this.store.transaction(() => {
+      truth.forEach((entry, i) => this.store.setTruthEmbedding(entry.id, vectors[i]));
+    });
+    console.error(
+      `🔁 Re-embedded ${count} messages and ${truth.length} truth entries under ` +
+        `${describeEmbedder(embedder.identity)} (${Date.now() - started} ms)`
+    );
+  }
+
+  /** A message's vectors: none for a message with no text to embed. */
+  private async embedMessage(
+    msg: { content: string },
+    embedder: Embedder = this.embedder!
+  ): Promise<number[][]> {
+    if (!msg.content.trim()) return [];
+    return [await embedder.embed(msg.content)];
   }
 
   /** Rebuilds the in-memory GraphRAG index from the store. */
@@ -373,21 +480,19 @@ export class Stenographer implements StenographerAPI {
       }));
     const score = this.detector.score(msg, history);
 
-    // Extract entities, decisions, corrections
+    // Extract entities, decisions, corrections — from user and assistant
+    // prose only; tool output and tagged records assert nothing
     const extracted = extractStructure(msg);
 
     // Embed once; shared by the vector store and the GraphRAG index
-    const embedding = await this.embedder!.embed(msg.content);
+    const vectors = await this.embedMessage(msg);
+    const embedding = vectors[0] ?? [];
 
-    // A message like "actually, we decided to use X" matches both the
-    // decision and correction patterns — skip corrections that restate a
-    // decision already extracted from this same message.
-    const corrections = extracted.corrections
-      .map((c) => c.from)
-      .filter((from) => !extracted.decisions.some((d) => from.includes(d) || d.includes(from)));
+    // Each sentence yields a decision or a correction, never both
+    const corrections = extracted.corrections;
     const supersession = await this.prepareSupersession(sessionId, msg.id, [
       ...extracted.decisions,
-      ...corrections,
+      ...corrections.map((c) => c.to),
     ]);
 
     // stop() closed the store while this message was being derived
@@ -430,8 +535,11 @@ export class Stenographer implements StenographerAPI {
         content: msg.content,
         timestamp: msg.timestamp,
         embedding,
+        ...(vectors.length > 1 ? { chunkEmbeddings: vectors } : {}),
         importanceScore: score,
         entityIds: nodes.map((n) => n.id),
+        tags: msg.tags,
+        toolCalls: msg.toolCalls ?? (msg.toolCall ? [msg.toolCall] : undefined),
       });
 
       raised = this.scanForObjections(msg, sessionId, replay);
@@ -526,15 +634,17 @@ export class Stenographer implements StenographerAPI {
 
   private recordCorrection(
     sessionId: string,
-    correctedStatement: string,
+    correction: { to: string; from: string },
     index: number,
     msg: ConversationMessage,
     supersession: SupersessionContext
   ): void {
+    const correctedStatement = correction.to;
     const match = this.matchSuperseded(sessionId, correctedStatement, supersession);
 
     let supersededDecisionId: string | undefined;
-    let supersededText = '';
+    // What the correction replaces: the decision it matched, else what it names
+    let supersededText = correction.from;
     let newId: string | undefined;
 
     if (match) {
@@ -690,13 +800,7 @@ export class Stenographer implements StenographerAPI {
   // ─────────────────────────────────────────────────────────
 
   async getRecentMessages(n: number): Promise<ConversationMessage[]> {
-    return this.store.getRecentMessages(this.scope, n).map((m) => ({
-      id: m.id,
-      role: m.role as ConversationMessage['role'],
-      content: m.content,
-      timestamp: m.timestamp,
-      sessionId: m.sessionId,
-    }));
+    return this.store.getRecentMessages(this.scope, n).map(toConversationMessage);
   }
 
   async getEntities(): Promise<EntityNode[]> {
@@ -734,17 +838,8 @@ export class Stenographer implements StenographerAPI {
   }
 
   async searchSimilar(query: string, k: number): Promise<ConversationMessage[]> {
-    if (!this.embedder) {
-      this.embedder = await createEmbedder(this.config.embeddingModel);
-    }
-    const embedding = await this.embedder.embed(query);
-    return this.store.searchSimilar(embedding, k, this.scope).map(({ message }) => ({
-      id: message.id,
-      role: message.role as ConversationMessage['role'],
-      content: message.content,
-      timestamp: message.timestamp,
-      sessionId: message.sessionId,
-    }));
+    const embedding = await (await this.ensureEmbedder()).embed(query);
+    return this.store.searchSimilar(embedding, k, this.scope).map(({ message }) => toConversationMessage(message));
   }
 
   /** Hybrid GraphRAG search (vector + entity graph traversal). */
@@ -806,7 +901,7 @@ export class Stenographer implements StenographerAPI {
 
   private async ensureEmbedder(): Promise<Embedder> {
     if (!this.embedder) {
-      this.embedder = await createEmbedder(this.config.embeddingModel);
+      this.embedder = await this.openEmbedder();
     }
     return this.embedder;
   }
@@ -1201,6 +1296,18 @@ export class Stenographer implements StenographerAPI {
     }
     return count;
   }
+}
+
+function toConversationMessage(m: IndexedMessage): ConversationMessage {
+  return {
+    id: m.id,
+    role: m.role as ConversationMessage['role'],
+    content: m.content,
+    timestamp: m.timestamp,
+    sessionId: m.sessionId,
+    ...(m.toolCalls ? { toolCalls: m.toolCalls } : {}),
+    ...(m.tags ? { tags: m.tags } : {}),
+  };
 }
 
 function toDecision(d: IndexedDecision): Decision {

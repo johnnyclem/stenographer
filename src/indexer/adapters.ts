@@ -9,7 +9,7 @@
 
 import { createReadStream } from 'node:fs';
 import { createInterface } from 'node:readline';
-import type { ConversationMessage } from '../types.js';
+import type { ConversationMessage, MessageTag } from '../types.js';
 import { JsonlAdapter, type LineContext, type LogAdapter } from './tailer.js';
 import { contentId } from './ids.js';
 
@@ -38,43 +38,88 @@ interface ToolCall {
   input: Record<string, unknown>;
 }
 
-/** Flattens provider content blocks into text + tool calls. */
-function flattenContent(content: unknown): { text: string; toolCalls: ToolCall[] } {
+/**
+ * Flattens provider content blocks: `text` is the turn's own prose,
+ * `toolCalls` its tool_use blocks, `toolOutput` the text of any tool_result
+ * blocks — output a tool produced, which nobody in the conversation said.
+ */
+function flattenContent(content: unknown): { text: string; toolCalls: ToolCall[]; toolOutput: string } {
   if (typeof content === 'string') {
-    return { text: content, toolCalls: [] };
+    return { text: content, toolCalls: [], toolOutput: '' };
   }
   if (!Array.isArray(content)) {
-    return { text: '', toolCalls: [] };
+    return { text: '', toolCalls: [], toolOutput: '' };
   }
 
   const parts: string[] = [];
+  const outputs: string[] = [];
   const toolCalls: ToolCall[] = [];
   for (const block of content) {
     if (typeof block === 'string') {
       parts.push(block);
     } else if (block && typeof block === 'object') {
       const b = block as Record<string, unknown>;
-      if (typeof b.text === 'string') {
-        parts.push(b.text);
+      if (b.type === 'tool_result') {
+        const inner = flattenContent(b.content);
+        const output = [inner.toolOutput, inner.text].filter(Boolean).join('\n');
+        if (output) outputs.push(output);
       } else if (b.type === 'tool_use' && typeof b.name === 'string') {
         toolCalls.push({ name: b.name, input: (b.input as Record<string, unknown>) ?? {} });
-      } else if (b.type === 'tool_result') {
-        const inner = flattenContent(b.content);
-        if (inner.text) parts.push(inner.text);
+      } else if (typeof b.text === 'string') {
+        parts.push(b.text);
       }
     }
   }
-  return { text: parts.join('\n'), toolCalls };
+  return { text: parts.join('\n'), toolCalls, toolOutput: outputs.join('\n') };
 }
 
+/** OpenAI-style `tool_calls: [{function: {name, arguments}}]`. */
+function openAIToolCalls(value: unknown): ToolCall[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((t: any) => typeof t?.function?.name === 'string')
+    .map((t: any) => ({ name: t.function.name, input: safeJson(t.function.arguments) }));
+}
+
+function safeJson(value: unknown): Record<string, unknown> {
+  if (typeof value !== 'string') return (value as Record<string, unknown>) ?? {};
+  try {
+    return JSON.parse(value);
+  } catch {
+    return { raw: value };
+  }
+}
+
+/**
+ * Builds a message from a role and provider content. A turn made only of
+ * tool results is the tool speaking, not its nominal role (the Messages API
+ * and Claude Code send tool output as `user` turns): it becomes role `tool`,
+ * tagged `tool_result`. A turn with prose of its own keeps its role and
+ * only its prose.
+ */
 function build(
   line: string,
   role: Role,
   content: unknown,
-  extras: { id?: string; timestamp?: string; model?: string; sessionId?: string } = {},
+  extras: {
+    id?: string;
+    timestamp?: string;
+    model?: string;
+    sessionId?: string;
+    toolCalls?: ToolCall[];
+    tags?: MessageTag[];
+  } = {},
   context?: LineContext
 ): ConversationMessage | null {
-  const { text, toolCalls } = flattenContent(content);
+  const flat = flattenContent(content);
+  const toolCalls = [...flat.toolCalls, ...(extras.toolCalls ?? [])];
+  const tags: MessageTag[] = [...(extras.tags ?? [])];
+  let text = flat.text;
+  if (!text.trim() && flat.toolOutput) {
+    role = 'tool';
+    text = flat.toolOutput;
+    tags.unshift('tool_result');
+  }
   if (!text && toolCalls.length === 0) return null;
 
   return {
@@ -85,7 +130,41 @@ function build(
     ...(toolCalls.length > 0 ? { toolCalls } : {}),
     ...(extras.model ? { model: extras.model } : {}),
     ...(extras.sessionId ? { sessionId: extras.sessionId } : {}),
+    ...(tags.length > 0 ? { tags: [...new Set(tags)] } : {}),
   };
+}
+
+/**
+ * One normalizer for both chat formats: OpenAI (`tool_calls`, `created`)
+ * and Anthropic Messages (string or block-array content). A log's first turn
+ * is often plain string content, which both formats allow, so detection
+ * can't always tell them apart — whichever adapter it picks reads every
+ * line the same way, and no tool_use block is dropped.
+ */
+function parseChatLine(line: string, context?: LineContext): ConversationMessage | null {
+  try {
+    const obj = JSON.parse(line);
+    if (!obj || typeof obj !== 'object' || !isRole(obj.role)) return null;
+    return build(
+      line,
+      obj.role,
+      obj.content,
+      {
+        id: typeof obj.id === 'string' ? obj.id : undefined,
+        timestamp:
+          typeof obj.timestamp === 'string'
+            ? obj.timestamp
+            : typeof obj.created === 'number'
+              ? new Date(obj.created * 1000).toISOString()
+              : undefined,
+        model: typeof obj.model === 'string' ? obj.model : undefined,
+        toolCalls: openAIToolCalls(obj.tool_calls),
+      },
+      context
+    );
+  } catch {
+    return null;
+  }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -94,37 +173,7 @@ function build(
 
 export class OpenAIAdapter implements LogAdapter {
   parseLine(line: string, context?: LineContext): ConversationMessage | null {
-    try {
-      const obj = JSON.parse(line);
-      if (!isRole(obj.role)) return null;
-
-      // OpenAI tool calls: {role: "assistant", tool_calls: [{function: {name, arguments}}]}
-      const toolCalls: ToolCall[] = Array.isArray(obj.tool_calls)
-        ? obj.tool_calls
-            .filter((t: any) => t?.function?.name)
-            .map((t: any) => ({
-              name: t.function.name,
-              input: safeJson(t.function.arguments),
-            }))
-        : [];
-
-      const { text } = flattenContent(obj.content ?? '');
-      if (!text && toolCalls.length === 0) return null;
-
-      return {
-        id: typeof obj.id === 'string' ? obj.id : syntheticId(line, context),
-        role: obj.role,
-        content: text,
-        timestamp:
-          typeof obj.created === 'number'
-            ? new Date(obj.created * 1000).toISOString()
-            : new Date().toISOString(),
-        ...(toolCalls.length > 0 ? { toolCalls } : {}),
-        ...(typeof obj.model === 'string' ? { model: obj.model } : {}),
-      };
-    } catch {
-      return null;
-    }
+    return parseChatLine(line, context);
   }
 
   detect(lines: string[]): boolean {
@@ -137,44 +186,24 @@ export class OpenAIAdapter implements LogAdapter {
   }
 }
 
-function safeJson(value: unknown): Record<string, unknown> {
-  if (typeof value !== 'string') return (value as Record<string, unknown>) ?? {};
-  try {
-    return JSON.parse(value);
-  } catch {
-    return { raw: value };
-  }
-}
-
 // ─────────────────────────────────────────────────────────────
 // Anthropic messages format: content as block arrays
 // ─────────────────────────────────────────────────────────────
 
 export class AnthropicAdapter implements LogAdapter {
   parseLine(line: string, context?: LineContext): ConversationMessage | null {
-    try {
-      const obj = JSON.parse(line);
-      if (!isRole(obj.role)) return null;
-      return build(
-        line,
-        obj.role,
-        obj.content,
-        {
-          id: typeof obj.id === 'string' ? obj.id : undefined,
-          model: typeof obj.model === 'string' ? obj.model : undefined,
-        },
-        context
-      );
-    } catch {
-      return null;
-    }
+    return parseChatLine(line, context);
   }
 
+  /** Any sampled line with content blocks; detection runs before OpenAI's. */
   detect(lines: string[]): boolean {
     return detectBy(lines, (obj) =>
       isRole(obj.role) &&
       Array.isArray(obj.content) &&
-      obj.content.some((b: any) => b && typeof b === 'object' && ('text' in b || b.type === 'tool_use'))
+      obj.content.some(
+        (b: any) =>
+          b && typeof b === 'object' && ('text' in b || b.type === 'tool_use' || b.type === 'tool_result')
+      )
     );
   }
 }
@@ -201,6 +230,7 @@ export class ClaudeCodeAdapter implements LogAdapter {
           timestamp: typeof obj.timestamp === 'string' ? obj.timestamp : undefined,
           model: typeof inner.model === 'string' ? inner.model : undefined,
           sessionId: typeof obj.sessionId === 'string' ? obj.sessionId : undefined,
+          tags: claudeCodeTags(obj, role, inner.content),
         },
         context
       );
@@ -234,6 +264,23 @@ export class ClaudeCodeAdapter implements LogAdapter {
       }
     });
   }
+}
+
+/** Slash-command echoes and local command output Claude Code logs as user turns. */
+const CLAUDE_CODE_COMMAND_RECORD = /^\s*<(?:command-name|command-message|command-args|local-command-stdout|local-command-stderr|local-command-caveat)>/;
+
+/**
+ * Claude Code marks records nobody typed as a turn: isMeta (caveats the
+ * harness injects), isSidechain (a subagent's transcript) and
+ * isCompactSummary (the summary a compaction writes as a user turn).
+ */
+function claudeCodeTags(obj: Record<string, unknown>, role: Role, content: unknown): MessageTag[] {
+  const tags: MessageTag[] = [];
+  const text = typeof content === 'string' ? content : flattenContent(content).text;
+  if (obj.isMeta === true || (role === 'user' && CLAUDE_CODE_COMMAND_RECORD.test(text))) tags.push('meta');
+  if (obj.isSidechain === true) tags.push('sidechain');
+  if (obj.isCompactSummary === true) tags.push('compact_summary');
+  return tags;
 }
 
 /** Non-turn record types Claude Code writes into a session log. */

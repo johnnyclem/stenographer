@@ -1,5 +1,5 @@
 // Stenographer — Main Entry Point
-export { Stenographer } from './core/stenographer.js';
+export { Stenographer, EmbedderMismatchError } from './core/stenographer.js';
 export { StenographerServer, runCLI } from './mcp/server.js';
 export { RestServer } from './api/rest.js';
 export { StateStore, type StateStoreOptions, type IngestCheckpoint } from './store/index.js';
@@ -23,7 +23,13 @@ export {
   detectAdapterFromLines,
   matchAdapterFromLines,
 } from './indexer/adapters.js';
-export { ImportanceDetector, extractStructure, extractEntities, type ExtractedStructure } from './indexer/importance.js';
+export {
+  ImportanceDetector,
+  extractStructure,
+  extractEntities,
+  assertableProse,
+  type ExtractedStructure,
+} from './indexer/importance.js';
 export {
   LocalEmbedder,
   HashedEmbedder,
@@ -32,8 +38,13 @@ export {
   VectorIndex,
   EmbeddingCache,
   cosineSimilarity,
+  sameEmbedder,
+  describeEmbedder,
   EMBEDDING_DIMENSIONS,
+  DEFAULT_EMBEDDING_MODEL,
   type Embedder,
+  type EmbedderIdentity,
+  type CreateEmbedderOptions,
 } from './indexer/embeddings.js';
 export {
   GraphRAGRetriever,

@@ -6,17 +6,66 @@
  *   @huggingface/transformers (all-MiniLM-L6-v2, 384-dim). Downloads the
  *   model (~25MB quantized) on first use, then runs fully locally. No API keys.
  * - HashedEmbedder: deterministic hashed lexical features (word + char
- *   n-grams). Zero downloads, fully offline; weaker on paraphrase. Used as
- *   the automatic fallback when the model can't be loaded.
+ *   n-grams). Zero downloads, fully offline; weaker on paraphrase. Chosen
+ *   explicitly (`hashed`), or as the fallback `auto` opts in to.
+ *
+ * Vectors from two embedders aren't comparable, so each embedder has an
+ * identity that a state database is pinned to, and its own calibrated
+ * supersede threshold.
  */
 
 export const EMBEDDING_DIMENSIONS = 384;
+
+export const DEFAULT_EMBEDDING_MODEL = 'Xenova/all-MiniLM-L6-v2';
+
+/** What produced a vector. Vectors are only comparable under one identity. */
+export interface EmbedderIdentity {
+  kind: 'hashed' | 'transformer';
+  /** Model id; `hashed` for the lexical embedder. */
+  model: string;
+  dimensions: number;
+  /** Bumped when the same model's vectors change (pooling, quantization, features). */
+  version: number;
+}
 
 export interface Embedder {
   embed(text: string): Promise<number[]>;
   embedBatch(texts: string[]): Promise<number[][]>;
   readonly dimensions: number;
+  readonly identity: EmbedderIdentity;
+  /**
+   * Cosine similarity at or above which a new decision is taken as a
+   * rewrite of an active one. Calibrated per embedder on
+   * test/fixtures/supersession-pairs.json.
+   */
+  readonly supersedeThreshold: number;
 }
+
+export function sameEmbedder(a: EmbedderIdentity, b: EmbedderIdentity): boolean {
+  return a.kind === b.kind && a.model === b.model && a.dimensions === b.dimensions && a.version === b.version;
+}
+
+export function describeEmbedder(identity: EmbedderIdentity): string {
+  return identity.kind === 'hashed'
+    ? `hashed (${identity.dimensions}-dim, v${identity.version})`
+    : `${identity.model} (${identity.dimensions}-dim, v${identity.version})`;
+}
+
+/**
+ * Supersede thresholds for known transformer models. all-MiniLM-L6-v2:
+ * rewrites of one decision score 0.57-0.94, unrelated decisions 0.04-0.44.
+ * Other models get the same default; calibrate with `supersedeThreshold`.
+ */
+const TRANSFORMER_THRESHOLDS: Record<string, number> = {
+  [DEFAULT_EMBEDDING_MODEL]: 0.45,
+};
+const DEFAULT_TRANSFORMER_THRESHOLD = 0.45;
+
+/**
+ * Hashed features share function words and n-grams ("use … for the …"):
+ * unrelated decisions score 0.04-0.56, rewrites of one decision 0.84-0.93.
+ */
+const HASHED_SUPERSEDE_THRESHOLD = 0.75;
 
 // FNV-1a 32-bit hash — stable across runs and platforms
 function fnv1a(str: string): number {
@@ -40,13 +89,16 @@ function tokenize(text: string): string[] {
 // Transformer Embedder (default — real semantic embeddings)
 // ─────────────────────────────────────────────────────────────
 
+type FeaturePipeline = (text: string, opts: object) => Promise<{ data: Float32Array }>;
+
 export class TransformerEmbedder implements Embedder {
   private cache: EmbeddingCache;
   private model: string;
-  private pipe: ((text: string, opts: object) => Promise<{ data: Float32Array }>) | null = null;
+  private pipe: FeaturePipeline | null = null;
   private loading: Promise<void> | null = null;
+  private width: number | null = null;
 
-  constructor(model: string = 'Xenova/all-MiniLM-L6-v2', cacheSize: number = 10000) {
+  constructor(model: string = DEFAULT_EMBEDDING_MODEL, cacheSize: number = 10000) {
     this.model = model;
     this.cache = new EmbeddingCache(cacheSize);
   }
@@ -57,11 +109,19 @@ export class TransformerEmbedder implements Embedder {
     if (!this.loading) {
       this.loading = (async () => {
         const { pipeline } = await import('@huggingface/transformers');
-        this.pipe = (await pipeline('feature-extraction', this.model, {
+        const pipe = (await pipeline('feature-extraction', this.model, {
           // q8: same quantized weights as the old `quantized: true` option
           dtype: 'q8',
-        })) as unknown as typeof this.pipe;
+        })) as unknown as FeaturePipeline;
+        // The model's output width, not an assumed 384
+        const probe = await pipe('dimension probe', { pooling: 'mean', normalize: true });
+        this.width = probe.data.length;
+        this.pipe = pipe;
       })();
+      // A failed load can be retried
+      this.loading.catch(() => {
+        this.loading = null;
+      });
     }
     await this.loading;
   }
@@ -85,8 +145,17 @@ export class TransformerEmbedder implements Embedder {
     return results;
   }
 
+  /** The model's output width; known once loaded. */
   get dimensions(): number {
-    return EMBEDDING_DIMENSIONS;
+    return this.width ?? EMBEDDING_DIMENSIONS;
+  }
+
+  get identity(): EmbedderIdentity {
+    return { kind: 'transformer', model: this.model, dimensions: this.dimensions, version: 1 };
+  }
+
+  get supersedeThreshold(): number {
+    return TRANSFORMER_THRESHOLDS[this.model] ?? DEFAULT_TRANSFORMER_THRESHOLD;
   }
 }
 
@@ -141,38 +210,88 @@ export class HashedEmbedder implements Embedder {
   get dimensions(): number {
     return EMBEDDING_DIMENSIONS;
   }
+
+  get identity(): EmbedderIdentity {
+    return { kind: 'hashed', model: 'hashed', dimensions: EMBEDDING_DIMENSIONS, version: 1 };
+  }
+
+  get supersedeThreshold(): number {
+    return HASHED_SUPERSEDE_THRESHOLD;
+  }
 }
 
 // Back-compat alias: LocalEmbedder was the original exported name
 export { HashedEmbedder as LocalEmbedder };
 
 // ─────────────────────────────────────────────────────────────
-// Factory — transformer by default, graceful offline fallback
+// Factory — no silent fallback
 // ─────────────────────────────────────────────────────────────
 
+export interface CreateEmbedderOptions {
+  /** The embedder a state database is pinned to; `auto` uses it. */
+  pinned?: EmbedderIdentity | null;
+  /** The transformer model `auto` tries first (default all-MiniLM-L6-v2). */
+  model?: string;
+}
+
+function fromIdentity(identity: EmbedderIdentity): Embedder {
+  return identity.kind === 'hashed' ? new HashedEmbedder() : new TransformerEmbedder(identity.model);
+}
+
+async function loadTransformer(model: string): Promise<TransformerEmbedder> {
+  const transformer = new TransformerEmbedder(model);
+  try {
+    await transformer.load();
+  } catch (err) {
+    throw new Error(
+      `Could not load embedding model '${model}' (${err instanceof Error ? err.message : err}). ` +
+        "Pass --embeddings hashed for the offline embedder, or --embeddings auto to fall back to it when the model can't load.",
+      { cause: err }
+    );
+  }
+  return transformer;
+}
+
 /**
- * Creates the configured embedder.
- * - 'hashed': offline lexical embedder
- * - any other value (or undefined): transformer model name, defaulting to
- *   Xenova/all-MiniLM-L6-v2. If the model can't be loaded (offline, missing
- *   optional dep), falls back to the hashed embedder with a warning.
+ * Creates the configured embedder:
+ * - 'hashed': the offline lexical embedder.
+ * - 'auto': the embedder the state database is pinned to, if any;
+ *   otherwise the default transformer, falling back to hashed — loudly —
+ *   when it can't be loaded.
+ * - any other value (or undefined): that transformer model (default
+ *   all-MiniLM-L6-v2). A model that can't be loaded is an error, never a
+ *   silent switch of embedding space.
  */
-export async function createEmbedder(embeddingModel?: string): Promise<Embedder> {
+export async function createEmbedder(
+  embeddingModel?: string,
+  options: CreateEmbedderOptions = {}
+): Promise<Embedder> {
   if (embeddingModel === 'hashed') {
     return new HashedEmbedder();
   }
 
-  const transformer = new TransformerEmbedder(embeddingModel || 'Xenova/all-MiniLM-L6-v2');
-  try {
-    await transformer.load();
-    return transformer;
-  } catch (err) {
-    console.error(
-      `⚠️  Could not load transformer embeddings (${err instanceof Error ? err.message : err}); ` +
-        'falling back to offline hashed embeddings'
-    );
-    return new HashedEmbedder();
+  if (embeddingModel === 'auto') {
+    if (options.pinned) {
+      const embedder = fromIdentity(options.pinned);
+      if (embedder instanceof TransformerEmbedder) return loadTransformer(options.pinned.model);
+      return embedder;
+    }
+    const model = options.model ?? DEFAULT_EMBEDDING_MODEL;
+    try {
+      return await loadTransformer(model);
+    } catch (err) {
+      console.error(
+        [
+          `⚠️  --embeddings auto: could not load '${model}' (${err instanceof Error ? (err.cause as Error)?.message ?? err.message : err}).`,
+          '⚠️  Falling back to the offline hashed embedder. Search is lexical, not semantic, and this',
+          '⚠️  state database is pinned to hashed from now on (switching back needs --reembed).',
+        ].join('\n')
+      );
+      return new HashedEmbedder();
+    }
   }
+
+  return loadTransformer(embeddingModel || DEFAULT_EMBEDDING_MODEL);
 }
 
 // ─────────────────────────────────────────────────────────────
