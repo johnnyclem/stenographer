@@ -79,6 +79,14 @@ export {
   notarySecretMatches,
   NOTARY_SECRET_HEADER,
 } from './truth/notary.js';
-export { runNotaryCLI } from './truth/notary-cli.js';
+export { runNotaryCLI, type NotaryIO } from './truth/notary-cli.js';
+export {
+  SignerRegistry,
+  SignerRegistryFileSchema,
+  IdentityError,
+  resolveIdentity,
+  type SignerRegistryFile,
+  type SignerRole,
+} from './truth/identity.js';
 export * from './truth/types.js';
 export * from './types.js';
