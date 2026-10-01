@@ -8,7 +8,7 @@ import { Stenographer } from '../src/core/stenographer.js';
 import { exportWikiEntries, importWikiEntries, decodeWikiLine, wikiLineHash } from '../src/truth/wiki.js';
 import { SignerRegistry } from '../src/truth/identity.js';
 import { appendWikiFile } from '../src/truth/wiki-file.js';
-import type { TruthLedger } from '../src/truth/ledger.js';
+import { TruthLedger } from '../src/truth/ledger.js';
 import type { Evidence, TbEntry, UvEntry } from '../src/truth/types.js';
 
 const commitEvidence: Evidence[] = [{ kind: 'commit', ref: 'abc1234' }];
@@ -776,6 +776,40 @@ describe('the stream states what the ledger derives', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  // F1: an entry the format can't express is skipped, but the TRANSITIONs it
+  // caused named it as their cause, so no teammate could ever import the file.
+  it('a TRANSITION whose cause could not be written names no cause, and the file imports', () => {
+    const fixture = readFileSync(join(import.meta.dirname, 'fixtures', 'truth-ledger-0.x.sql'), 'utf8');
+    const schema = fixture.slice(0, fixture.indexOf('INSERT INTO'));
+    const raw = new Database(':memory:');
+    raw.exec(schema);
+    const insert = raw.prepare(
+      `INSERT INTO truth_entries (id, type, created_at, author, provenance, agent_session_id, origin, body, status, target_ref, struck)
+       VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, NULL, 0)`
+    );
+    const tbId = '01M3AAAAAAAAAAAAAAAAAAAAAA';
+    const uvId = '01M3BBBBBBBBBBBBBBBBBBBBBB';
+    insert.run(tbId, 'TB', '2026-03-01T09:00:00.000Z', 'alice', '{"kind":"manual"}', 'local',
+      JSON.stringify({ claim: 'X is dead', evidence: [{ kind: 'commit', ref: 'abc' }], signedBy: 'alice', status: 'active' }), 'contested');
+    // 0.x imported wiki UVs verbatim, defaulting a missing basis to ''
+    insert.run(uvId, 'UV', '2026-03-01T09:01:00.000Z', 'bob', JSON.stringify({ kind: 'wiki', ref: uvId }), 'wiki',
+      JSON.stringify({ assertion: 'X lives', basis: '', verifyBy: { kind: 'ask', value: 'ops' }, contests: tbId, status: 'open' }), 'open');
+    raw.prepare('INSERT INTO truth_links VALUES (?, ?, ?)').run(uvId, tbId, 'contests');
+    const store = new StateStore(':memory:');
+    const ledger = new TruthLedger(raw);
+    expect(ledger.verify().ok).toBe(true);
+
+    const { lines, skipped } = exportWikiEntries(ledger);
+    expect(skipped.map((s) => s.id)).toEqual([uvId]);
+    const transition = parse(lines).find((l) => l.type === 'TRANSITION');
+    expect(transition).toMatchObject({ target: tbId, status: 'contested', cause: { kind: 'contest', ref: null } });
+
+    const result = importWikiEntries(store.truth, { lines });
+    expect(result).toMatchObject({ committed: true, errors: [] });
+    store.close();
+    raw.close();
   });
 });
 

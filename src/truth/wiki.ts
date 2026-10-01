@@ -451,6 +451,7 @@ function buildStream(ledger: TruthLedger): { lines: WikiLine[]; skipped: Array<{
   const contestsFrom = new Map<string, string[]>();
   const derived = new Map<string, { status: string | null; struck: boolean }>();
   const stated = new Map<string, string>(); // the status the stream last stated, per exported TB/UV
+  const written = new Set<string>(); // ids of the entry lines in the stream
   const lines: WikiLine[] = [];
   const skipped: Array<{ id: string; error: string }> = [];
 
@@ -507,16 +508,22 @@ function buildStream(ledger: TruthLedger): { lines: WikiLine[]; skipped: Array<{
         r.type === 'TB'
           ? { claim: b.claim, evidence: b.evidence, signedBy: b.signedBy, ...(b.literals !== undefined ? { literals: b.literals } : {}) }
           : { assertion: b.assertion, basis: b.basis, verifyBy: b.verifyBy, contests: b.contests ?? null };
-      if (emit({ ...envelope, ...body, status, 'x-steno': steno }, r.id)) stated.set(r.id, status);
+      if (emit({ ...envelope, ...body, status, 'x-steno': steno }, r.id)) {
+        stated.set(r.id, status);
+        written.add(r.id);
+      }
     } else if (
       (r.type === 'ADDENDUM' || r.type === 'RULING') &&
       r.links.some((l) => STATUS_LINKS.includes(l.type) && (types.get(l.toId) === 'TB' || types.get(l.toId) === 'UV'))
     ) {
       const body = r.type === 'ADDENDUM' ? { evidence: b.evidence, note: b.note ?? null } : { kind: b.kind, opinion: b.opinion, target: b.target };
-      emit({ ...envelope, ...body, 'x-steno': steno }, r.id);
+      if (emit({ ...envelope, ...body, 'x-steno': steno }, r.id)) written.add(r.id);
     }
 
-    // Every exported TB or UV whose status this entry changed gets a TRANSITION
+    // Every exported TB or UV whose status this entry changed gets a
+    // TRANSITION. It names this entry as its cause only when this entry's
+    // line is in the stream: one the format can't express (skipped) is not,
+    // and a cause readers can't find would make the file unimportable.
     for (const id of unique) {
       const was = stated.get(id);
       if (id === r.id || was === undefined) continue;
@@ -529,7 +536,7 @@ function buildStream(ledger: TruthLedger): { lines: WikiLine[]; skipped: Array<{
         author: r.author,
         target: id,
         status: now,
-        cause: { kind: causeKind(r, types.get(id)!, now), ref: r.id },
+        cause: { kind: causeKind(r, types.get(id)!, now), ref: written.has(r.id) ? r.id : null },
       };
       if (emit(transition, transition.id)) stated.set(id, now);
     }

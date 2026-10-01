@@ -82,7 +82,7 @@ Their `x-steno.links` say what they do (`verifies`, `refutes`, `overrides`, `str
 |---|---|
 | `target` | The TB or UV whose status changed. |
 | `status` | Its new status. |
-| `cause` | `{kind, ref}`. `kind` is `contest`, `override`, `strike`, `verify` or `refute`, or, in proposal streams, `dismiss` or `promote`. `ref` is the id of the entry that caused the change (the contesting UV, the addendum, the ruling), or `null`. |
+| `cause` | `{kind, ref}`. `kind` is `contest`, `override`, `strike`, `verify` or `refute`, or, in proposal streams, `dismiss` or `promote`. `ref` is the id of the entry that caused the change (the contesting UV, the addendum, the ruling), or `null` when that entry has no line in the stream (stenographer leaves out a pre-1.0 entry the format can't express, and reports it in the export's `skipped`). |
 | `author`, `ts` | The cause's. |
 
 A status change is never an edit. It is an appended TRANSITION line. Stenographer writes one each time an exported entry's status changes, right after the line that caused it:
