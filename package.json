@@ -23,6 +23,7 @@
   "scripts": {
     "build": "tsc && tsc -p tsconfig.cli.json",
     "test": "vitest run",
+    "test:openappa": "node integrations/openappa/run-checks.mjs",
     "lint": "tsc --noEmit"
   },
   "dependencies": {

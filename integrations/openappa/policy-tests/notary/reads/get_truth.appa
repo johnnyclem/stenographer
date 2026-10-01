@@ -1,0 +1,30 @@
+# get_truth from a fresh trajectory, which starts trusted and public.
+# Replay only proposes calls: nothing runs, and each result is empty.
+
+# Current truth: TBs and the open UVs agents wrote.
+# A read has no requirement: it runs.
+mcp/stenographer/get_truth {
+  truthFilter: "current"
+}
+expect allow
+
+# Its result can carry text written outside this trajectory, so it is
+# suspicious: a ledger write now has no remedy under this root.
+mcp/stenographer/assert_uv {
+  assertion: "The nightly export job reads LOG_BUDGET once, at start-up."
+  basis: "export.ts calls loadConfig() before the loop and never again."
+  verifyBy: {"kind": "command", "value": "grep -n loadConfig src/export.ts"}
+}
+expect deny
+
+# It is restricted to self: it cannot go to a public destination.
+mcp/mail/send {
+  to: "public"
+}
+expect deny
+
+# The person running the session can receive it.
+mcp/mail/send {
+  to: "self"
+}
+expect allow

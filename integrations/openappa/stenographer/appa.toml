@@ -1,0 +1,247 @@
+# stenographer battery: the stenographer MCP server (@stenographer/core
+# 1.0), both tool profiles under one namespace. `stenographer start`
+# serves the agent profile (reads, drafts, UVs) by default;
+# `--profile operator` serves the notary's and judge's tools. A tool
+# neither profile serves is not named here.
+#
+# Reads are labelled by what they surface. Transcript tools return
+# messages the indexer took from session logs; in watch mode those are
+# other sessions' logs, with text from wherever those sessions read it
+# (web pages, tool output, files). Ledger tools return UVs, drafts and
+# objections that agents wrote, some in sessions no policy protected, and
+# objections quote transcript lines. All of it can carry text written
+# outside the trajectory, so every such read is `suspicious`. All of it
+# is this person's own corpus, kept in their state file, so every read is
+# restricted to `self`. `get_status` returns counts, modes and identities,
+# no text anyone else wrote: it keeps the session's trust.
+#
+# Writes into the ledger need trusted data: suspicious text cannot become
+# truth, contest a TB or settle a UV unless an authority approves the
+# call. A draft (`propose_tombstone`) is not truth: it becomes truth only
+# through `sign_proposal`, which is gated, so a draft needs no trust and
+# records `stenographer.proposed`. Every act a person performs under
+# their own name in the operator profile — notarizing, dismissing,
+# overriding, ruling, and minting a TB with `signedBy` — also needs the
+# `hitl` mark: the server takes that name from the caller there, so the
+# person approves each such call. The root config supplies an authority
+# permitting `hitl`.
+#
+# OpenAPPA checks a call's requirements against the label its own result
+# would leave, so a rule that requires `trusted` cannot also declare a
+# `suspicious` result: no call could satisfy it without an authority that
+# lifts trust. Write results therefore keep the session's trust. Most are
+# the record of the call itself: the entry it wrote, a count, the entry a
+# person just signed or overrode. Three can quote text nobody vouched
+# for — the UV a resolution settles, the draft a dismissal rejects, and
+# the transcript line an objection quotes — and the README lists that
+# limit. Results that carry ledger entries are restricted to `self`.
+#
+# No write requires an audience. The ledger lives in the person's state
+# file, read by their own sessions; a deployment that exports it to a
+# shared wiki adds the audience its readers need with a root rule.
+
+[policy]
+version = 2
+
+# --- transcript reads: other sessions' text, restricted to self ---
+
+[[policy.tool]]
+name = "mcp/stenographer/get_recent_messages"
+delta = { audience = ["self"], trust = "suspicious" }
+
+[[policy.tool]]
+name = "mcp/stenographer/search_conversation"
+delta = { audience = ["self"], trust = "suspicious" }
+
+[[policy.tool]]
+name = "mcp/stenographer/search_similar"
+delta = { audience = ["self"], trust = "suspicious" }
+
+[[policy.tool]]
+name = "mcp/stenographer/get_context_frame"
+delta = { audience = ["self"], trust = "suspicious" }
+
+# Entities, relations, decisions and corrections are extracted from the
+# same messages and quote them.
+[[policy.tool]]
+name = "mcp/stenographer/get_entities"
+delta = { audience = ["self"], trust = "suspicious" }
+
+[[policy.tool]]
+name = "mcp/stenographer/get_relations"
+delta = { audience = ["self"], trust = "suspicious" }
+
+[[policy.tool]]
+name = "mcp/stenographer/get_decisions"
+delta = { audience = ["self"], trust = "suspicious" }
+
+[[policy.tool]]
+name = "mcp/stenographer/get_decision_history"
+delta = { audience = ["self"], trust = "suspicious" }
+
+[[policy.tool]]
+name = "mcp/stenographer/get_decision_chain"
+delta = { audience = ["self"], trust = "suspicious" }
+
+[[policy.tool]]
+name = "mcp/stenographer/get_corrections"
+delta = { audience = ["self"], trust = "suspicious" }
+
+# --- status: counts and this server's own configuration ---
+
+[[policy.tool]]
+name = "mcp/stenographer/get_status"
+delta = { audience = ["self"] }
+
+# --- ledger reads: agent-written UVs, drafts and quoted transcript lines ---
+
+[[policy.tool]]
+name = "mcp/stenographer/get_truth"
+delta = { audience = ["self"], trust = "suspicious" }
+
+[[policy.tool]]
+name = "mcp/stenographer/search_truth"
+delta = { audience = ["self"], trust = "suspicious" }
+
+[[policy.tool]]
+name = "mcp/stenographer/get_contested"
+delta = { audience = ["self"], trust = "suspicious" }
+
+[[policy.tool]]
+name = "mcp/stenographer/get_verification_queue"
+delta = { audience = ["self"], trust = "suspicious" }
+
+[[policy.tool]]
+name = "mcp/stenographer/list_proposals"
+delta = { audience = ["self"], trust = "suspicious" }
+
+[[policy.tool]]
+name = "mcp/stenographer/list_objections"
+delta = { audience = ["self"], trust = "suspicious" }
+
+# --- drafts: a person notarizes them; not truth ---
+
+# With targetRef, the call can return the drafter's earlier open draft for
+# the same target, which another session under the same agent identity
+# may have written.
+[[policy.tool]]
+name = "mcp/stenographer/propose_tombstone(targetRef:*)"
+delta = { audience = ["self"], trust = "suspicious" }
+effects = ["stenographer.proposed"]
+
+# Without it, the result echoes the call's own draft.
+[[policy.tool]]
+name = "mcp/stenographer/propose_tombstone"
+delta = {}
+effects = ["stenographer.proposed"]
+
+# --- truth writes: trusted data only ---
+
+# Agent profile: attributed to the server-bound agent identity. Operator
+# profile: `author` names who believes it.
+[[policy.tool]]
+name = "mcp/stenographer/assert_uv"
+delta = {}
+requires = { trust = "trusted" }
+effects = ["stenographer.changed"]
+
+# Operator profile, minting a TB under a person's signature. Returns the
+# UV, its addendum, and the TB and promotion ruling the person signed.
+[[policy.tool]]
+name = "mcp/stenographer/resolve_uv(signedBy:*)"
+delta = { audience = ["self"] }
+requires = { trust = "trusted", attention = ["hitl"] }
+effects = ["stenographer.changed", "stenographer.ruled"]
+
+# Returns the resolved UV, which its own author wrote (see the README's
+# limits), and the addendum this call filed.
+[[policy.tool]]
+name = "mcp/stenographer/resolve_uv"
+delta = { audience = ["self"] }
+requires = { trust = "trusted" }
+effects = ["stenographer.changed"]
+
+# Operator profile: a TB signed with a person's name.
+[[policy.tool]]
+name = "mcp/stenographer/assert_tombstone(signedBy:*)"
+delta = {}
+requires = { trust = "trusted", attention = ["hitl"] }
+effects = ["stenographer.changed", "stenographer.ruled"]
+
+# Agent profile with --allow-agent-assert: signed by the agent identity.
+[[policy.tool]]
+name = "mcp/stenographer/assert_tombstone"
+delta = {}
+requires = { trust = "trusted" }
+effects = ["stenographer.changed"]
+
+# Files a team wiki's lines; TBs land as truth only when signed and
+# verifiable. Returns ids, counts and reasons.
+[[policy.tool]]
+name = "mcp/stenographer/import_wiki_entries"
+delta = { audience = ["self"] }
+requires = { trust = "trusted" }
+effects = ["stenographer.changed"]
+
+# Returns a count.
+[[policy.tool]]
+name = "mcp/stenographer/backfill_legacy_tombstones"
+delta = {}
+requires = { trust = "trusted" }
+effects = ["stenographer.changed"]
+
+# --- a person's acts under their own name: trusted data and fresh review ---
+
+# The notary act: mints the draft's TB or UV under the signer's name and
+# returns it. The person reviewing the call vouches for it by signing.
+[[policy.tool]]
+name = "mcp/stenographer/sign_proposal"
+delta = { audience = ["self"] }
+requires = { trust = "trusted", attention = ["hitl"] }
+effects = ["stenographer.changed", "stenographer.ruled"]
+
+# Files a dismissal ruling. Returns the dismissed draft, which its drafter
+# wrote (see the README's limits).
+[[policy.tool]]
+name = "mcp/stenographer/dismiss_proposal"
+delta = { audience = ["self"] }
+requires = { trust = "trusted", attention = ["hitl"] }
+effects = ["stenographer.changed", "stenographer.ruled"]
+
+# The force path. Returns the overridden TB, which a signer vouched for,
+# and the addendum this call filed.
+[[policy.tool]]
+name = "mcp/stenographer/override_tombstone"
+delta = { audience = ["self"] }
+requires = { trust = "trusted", attention = ["hitl"] }
+effects = ["stenographer.changed", "stenographer.ruled"]
+
+# Strike, promotion or contempt. Returns the ruling and, for contempt, the
+# TB minted from the call's own opinion.
+[[policy.tool]]
+name = "mcp/stenographer/file_ruling"
+delta = {}
+requires = { trust = "trusted", attention = ["hitl"] }
+effects = ["stenographer.changed", "stenographer.ruled"]
+
+# Returns the ruling and the objection, which quotes the transcript line it
+# was raised on (see the README's limits).
+[[policy.tool]]
+name = "mcp/stenographer/rule_on_objection"
+delta = { audience = ["self"] }
+requires = { trust = "trusted", attention = ["hitl"] }
+effects = ["stenographer.changed", "stenographer.ruled"]
+
+# --- wiki export ---
+
+# With file: appends the ledger's stream to a wiki file. Returns counts.
+[[policy.tool]]
+name = "mcp/stenographer/export_wiki_entries(file:*)"
+delta = {}
+requires = { trust = "trusted" }
+effects = ["stenographer.exported"]
+
+# Without it: returns the ledger's lines inline, a read.
+[[policy.tool]]
+name = "mcp/stenographer/export_wiki_entries"
+delta = { audience = ["self"], trust = "suspicious" }

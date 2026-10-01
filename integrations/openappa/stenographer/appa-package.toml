@@ -1,0 +1,10 @@
+schema = 1
+name = "stenographer"
+description = "Rules for the stenographer MCP server's 29 tools, agent and operator profiles: transcript and ledger reads stay with you and enter suspicious, ledger writes need trusted data, and a person reviews every act signed with their name."
+
+[battery]
+policy = "appa.toml"
+hosts = ["claude-code"]
+namespaces = ["stenographer"]
+helpers = []
+benefit = "Rules for the stenographer court reporter's tools: APPA keeps transcript and ledger reads with you, lets only trusted data become ground truth, and asks you before an override, a ruling, or a signature in your name."

@@ -1,0 +1,34 @@
+# Offline policy replay: the stenographer battery under the human authority
+# the Claude Code plugin's default policy ships
+# (marketplace/plugins/claude-code/default.appa.toml in OpenAPPA 0.30.0).
+# It may approve data below `trusted`, an audience up to `public`, and every
+# attention mark, so a ledger write from a suspicious trajectory asks the
+# person running the session instead of being denied. `appa replay` supplies
+# the review: it approves every offer.
+include = ["../../stenographer/appa.toml"]
+
+[policy]
+version = 2
+
+[[policy.authority]]
+name = "hitl"
+hint = "Ask the person running this session to review the exact call, the data it carries, and any required audience expansion."
+
+[policy.authority.permits]
+trust_below = "trusted"
+audience_missing = ["public"]
+attention = ["*"]
+
+# This tool tests who can receive a stenographer result.
+[[policy.tool]]
+name = "mcp/mail/send"
+requires = { audience = { contains = ["$to"] } }
+delta = {}
+
+[externals]
+timeout_ms = 5000
+review_timeout_ms = 600000
+max_body_bytes = 65536
+
+[externals.authorities.hitl]
+builtin = "hitl"

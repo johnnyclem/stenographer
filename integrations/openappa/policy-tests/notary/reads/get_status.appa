@@ -1,0 +1,20 @@
+# get_status from a fresh trajectory, which starts trusted and public.
+# Replay only proposes calls: nothing runs, and each result is empty.
+
+# Counts, modes and this server's identities: no text anyone else wrote.
+mcp/stenographer/get_status {}
+expect allow
+
+# The session keeps its trust: a ledger write still runs.
+mcp/stenographer/assert_uv {
+  assertion: "The nightly export job reads LOG_BUDGET once, at start-up."
+  basis: "export.ts calls loadConfig() before the loop and never again."
+  verifyBy: {"kind": "command", "value": "grep -n loadConfig src/export.ts"}
+}
+expect allow
+
+# The status is restricted to self.
+mcp/mail/send {
+  to: "public"
+}
+expect deny

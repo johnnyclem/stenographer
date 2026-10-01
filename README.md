@@ -352,6 +352,10 @@ It composes with other `PreToolUse` hooks (for example OpenAPPA's policy hook): 
 - Prose. The gate sees tool calls only; live objections cover what the agent says.
 - Anyone who can edit `settings.json` can remove the hook.
 
+### OpenAPPA battery
+
+[`integrations/openappa/`](./integrations/openappa/README.md) is a policy battery for [OpenAPPA](https://github.com/archestra-ai/OpenAPPA) 0.30.0, which checks a protected Claude Code session's tool calls before they run. It names every MCP tool of both profiles (`mcp/stenographer/<tool>`): transcript and ledger reads leave the session restricted to its user and `suspicious`, every ledger write but a draft (`propose_tombstone`) needs a `trusted` session, and overrides, rulings and every act signed with a person's name also need that person's approval (`hitl`). In a protected session, text from a web page or another session's transcript can't become truth through stenographer's MCP tools unless someone approves the exact call; the REST API and the terminal notary are outside it. `appa replay` traces pin the decisions; `npm run test:openappa` runs them when `appa` is installed. The README covers installing it next to OpenAPPA's claude-code battery.
+
 ## GraphRAG Search
 
 The `search_conversation` tool performs **hybrid retrieval**:
@@ -406,6 +410,7 @@ npm install
 npm run build   # tsc (core) + tsc -p tsconfig.cli.json (CLI)
 npm test        # vitest
 npm run lint    # tsc --noEmit
+npm run test:openappa   # OpenAPPA battery checks; skipped without an appa binary
 ```
 
 Tests live in [`test/`](./test), covering the core engine, GraphRAG retriever, embeddings, importance scoring, provider adapters, the tailer, the SQLite store, and the REST API.
