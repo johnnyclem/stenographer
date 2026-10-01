@@ -99,7 +99,11 @@ Options (start):
       --signer-registry <path>
                            JSON allowlist of signers and roles
                            ({"signers": [{"id", "role": "human"|"agent"}]});
-                           operator paths accept only listed identities
+                           operator paths accept only listed identities, and
+                           wiki import takes TBs only from listed signers
+      --wiki-dir <dir>     directory wiki import/export read and write
+                           (default: wiki/ next to the state file); files
+                           are named relative to it, nothing outside it
       --skip-verify        serve even if the truth ledger fails its integrity
                            check (by default start refuses; see
                            'stenographer verify')

@@ -6,7 +6,7 @@ import Database from 'better-sqlite3';
 import { Stenographer } from '../src/core/stenographer.js';
 import { TruthLedger } from '../src/truth/ledger.js';
 import { findLiteralHits, assertedText } from '../src/truth/objections.js';
-import { entryToWikiLine, wikiLineToEntry, importWikiEntries } from '../src/truth/wiki.js';
+import { exportWikiEntries, decodeWikiLine, importWikiEntries } from '../src/truth/wiki.js';
 import { TbInputSchema, type TbEntry } from '../src/truth/types.js';
 import type { StenographerConfig } from '../src/types.js';
 
@@ -364,11 +364,20 @@ describe('wiki interop carries literals', () => {
     );
     expect('literals' in without.body).toBe(false);
 
-    for (const entry of [withLiterals, without]) {
-      const line = entryToWikiLine(entry);
-      expect(JSON.stringify(wikiLineToEntry(line).body)).toBe(JSON.stringify(entry.body));
-    }
-    expect(entryToWikiLine(withLiterals).literals).toEqual([LOG_BUDGET]);
+    const { lines } = exportWikiEntries(ledger);
+    const [withLine, withoutLine] = lines.map((l) => decodeWikiLine(l).line);
+    // The literals travel as written: the same bytes as the stored body's
+    expect(JSON.stringify(withLine.literals)).toBe(JSON.stringify(withLiterals.body.literals));
+    expect(withLine.literals).toEqual([LOG_BUDGET]);
+    expect('literals' in withoutLine).toBe(false);
+
+    // Imported elsewhere, the TB objects to the same literals, and travels on unchanged
+    const other = new TruthLedger(new Database(':memory:'));
+    expect(importWikiEntries(other, { lines })).toMatchObject({ committed: true, inserted: 2 });
+    expect(other.getMatchableTombstones().map((t) => t.body.literals)).toEqual([[LOG_BUDGET]]);
+    expect(JSON.stringify(other.getEntry(withLiterals.id)!.body)).toBe(JSON.stringify(withLiterals.body));
+    const again = exportWikiEntries(other).lines.map((l) => decodeWikiLine(l).line);
+    expect(again.map((l) => l.literals)).toEqual([withLine.literals, undefined]);
   });
 
   it('rejects wiki lines whose literals cannot be matched precisely', () => {

@@ -257,6 +257,13 @@ export interface StenographerConfig {
    * may perform the act (people sign, notarize, rule; agents draft).
    */
   signerRegistry?: string | SignerRegistryFile;
+  /**
+   * The directory wiki import and export read and write (`--wiki-dir`).
+   * Default: `wiki/` next to the state file. Files are named relative to it;
+   * paths outside it, symlinks out of it, non-`.jsonl` names and the state
+   * file itself are refused.
+   */
+  wikiDir?: string;
   /** Port for the REST API. Defaults to 8787 in daemon mode, off otherwise. */
   restPort?: number;
   /**

@@ -131,6 +131,13 @@ const TruthFilterArg = z
   .default('current');
 const Id = (description: string) => z.string().min(1).describe(description);
 const Text = (description: string) => z.string().min(1).describe(description);
+const WikiFile = z
+  .string()
+  .min(1)
+  .describe(
+    'A .jsonl file in the wiki directory (--wiki-dir), named relative to it. Absolute paths, "..", symlinks out ' +
+      'of the directory and the state file are refused.'
+  );
 const Signer = (description: string) =>
   z.string().min(1).describe(`${description} — checked against the signer registry when one is configured`);
 
@@ -767,24 +774,31 @@ export class StenographerServer {
       tool({
         name: 'export_wiki_entries',
         description:
-          'Export signed TB/UV entries as team llm-wiki append-only JSONL. Stenographer-specific fields travel ' +
-          'under the x-steno key. Proposals are never exported — the wiki only ever sees signed truth.',
+          'Export this ledger as team llm-wiki JSONL, truth format v2 (spec/truth-format): a hash-chained line ' +
+          'stream (seq, prevHash, hash) of TB and UV lines, the addenda and rulings that change a status, and a ' +
+          'TRANSITION line for every status change. Proposals are never exported. With file, appends the lines ' +
+          'that file (this ledger\'s own: one writer per file) does not hold yet; it never truncates or rewrites a ' +
+          'line. Without it, returns the lines after sinceSeq.',
         input: args({
-          since: z.string().describe('ISO timestamp; only entries created after it').optional(),
-          path: z.string().min(1).describe('File to write/append; omit to return lines inline').optional(),
+          sinceSeq: z.number().int().min(0).describe('Return the lines after this seq (the lastSeq of your previous export)').optional(),
+          since: z.string().describe('Deprecated: return the stream from the first line written after this ISO timestamp').optional(),
+          file: WikiFile.optional(),
         }),
-        annotations: DESTRUCTIVE,
-        run: ({ since, path }) => e.exportWikiEntries({ since, path }),
+        annotations: { ...APPEND, idempotentHint: true },
+        run: ({ sinceSeq, since, file }) => e.exportWikiEntries({ sinceSeq, since, file }),
       }),
       tool({
         name: 'import_wiki_entries',
         description:
-          'Ingest the team llm-wiki JSONL. Wiki entries keep their original ids and authors; the wiki file stays ' +
-          'authoritative for their content. A wiki entry contradicting a local one generates a reconciliation ' +
-          'PROPOSAL — it does not auto-win and does not auto-lose.',
-        input: args({ path: Text('The wiki JSONL file') }),
-        annotations: APPEND,
-        run: ({ path }) => e.importWikiEntries({ path }),
+          'Ingest a team llm-wiki JSONL file (truth format v2; v1 lines are still read) in one transaction: every ' +
+          'line lands or none does, with a per-line error report, and the file\'s hash chain must hold. Entries ' +
+          'keep their ids and authors. A TB lands as truth only when signed and verifiable (hash-chained, and ' +
+          'its signer listed in the signer registry when one is configured); otherwise it becomes a ' +
+          'reconciliation PROPOSAL, as does a line that contradicts a local entry or whose status is unknown. ' +
+          'Re-importing a file changes nothing.',
+        input: args({ file: WikiFile }),
+        annotations: { ...APPEND, idempotentHint: true },
+        run: ({ file }) => e.importWikiEntries({ file }),
       }),
       tool({
         name: 'backfill_legacy_tombstones',
@@ -843,6 +857,7 @@ export async function runCLI(args: string[]): Promise<void> {
       'agent-identity': { type: 'string' },
       'allow-agent-assert': { type: 'boolean' },
       'signer-registry': { type: 'string' },
+      'wiki-dir': { type: 'string' },
       // Accepted for 0.x configs: notarization is now the agent-profile default
       'require-notary': { type: 'boolean' },
       'skip-verify': { type: 'boolean' },
@@ -917,6 +932,7 @@ export async function runCLI(args: string[]): Promise<void> {
     agentIdentity: values['agent-identity'] as string | undefined,
     allowAgentAssert: Boolean(values['allow-agent-assert']),
     signerRegistry: values['signer-registry'] as string | undefined,
+    wikiDir: values['wiki-dir'] as string | undefined,
   };
 
   // Log to stderr — stdout carries the MCP stdio protocol

@@ -17,8 +17,10 @@ import { RestServer } from '../api/rest.js';
 import {
   exportWikiEntries,
   importWikiEntries,
+  wikiLineTexts,
   type ImportResult,
 } from '../truth/wiki.js';
+import { appendWikiFile, defaultWikiDir, readWikiFile, type WikiFileTarget } from '../truth/wiki-file.js';
 import type { TruthFilter } from '../truth/ledger.js';
 import type { Objection, ObjectionMode, ObjectionStatus, ObjectionStats } from '../truth/objections.js';
 import { createSinkTransport, type ObjectionTransport } from '../truth/delivery.js';
@@ -899,8 +901,8 @@ export class Stenographer implements StenographerAPI {
     context?: string,
     k: number = 10
   ): Promise<Array<UvEntry & { queueRank: { contesting: boolean; relevance: number; deprioritized: boolean } }>> {
-    const uvs = this.store.truth.getOpenUvs();
     const ctxEmbedding = context ? await (await this.ensureEmbedder()).embed(context) : null;
+    const uvs = ctxEmbedding ? await this.withEmbeddings(this.store.truth.getOpenUvs()) : this.store.truth.getOpenUvs();
 
     const scored = uvs.map((uv) => {
       const contesting = Boolean(uv.body.contests);
@@ -945,9 +947,10 @@ export class Stenographer implements StenographerAPI {
     k: number = 5,
     filter: TruthFilter = 'current'
   ): Promise<Array<(TbEntry | UvEntry) & { relevance: number }>> {
-    const entries = this.store.truth.getTruth(filter);
-    if (entries.length === 0) return [];
+    const found = this.store.truth.getTruth(filter);
+    if (found.length === 0) return [];
     const queryEmbedding = await (await this.ensureEmbedder()).embed(query);
+    const entries = await this.withEmbeddings(found);
 
     return entries
       .map((entry) => {
@@ -962,6 +965,27 @@ export class Stenographer implements StenographerAPI {
           Number(b.type === 'TB') - Number(a.type === 'TB')
       )
       .slice(0, k);
+  }
+
+  /**
+   * Fills in the embedding of entries that have none (imported by a caller
+   * without an embedder, or before 1.0 embedded imports) and caches it, so
+   * relevance ranking never scores a relevant entry 0 for lack of one.
+   */
+  private async withEmbeddings<T extends (TbEntry | UvEntry) & { embedding: number[] | null }>(entries: T[]): Promise<T[]> {
+    if (entries.every((e) => e.embedding)) return entries;
+    const embedder = await this.ensureEmbedder();
+    const filled: T[] = [];
+    for (const entry of entries) {
+      if (entry.embedding) {
+        filled.push(entry);
+        continue;
+      }
+      const embedding = await embedder.embed(entry.type === 'TB' ? entry.body.claim : entry.body.assertion);
+      this.store.truth.cacheEmbedding(entry.id, embedding);
+      filled.push({ ...entry, embedding });
+    }
+    return filled;
   }
 
   async getTruthStats(): Promise<{
@@ -1043,17 +1067,71 @@ export class Stenographer implements StenographerAPI {
     return { ...this.store.objections.stats(), mode: this.objectionMode };
   }
 
-  /** §8 export: signed truth only, x-steno namespaced extras. */
-  async exportWikiEntries(options: { since?: string; path?: string } = {}): Promise<{
-    lines: string[];
-    count: number;
-  }> {
-    return exportWikiEntries(this.store.truth, options);
+  /** A file in the wiki directory (`wikiDir`, default `<state dir>/wiki`); never the state file. */
+  private wikiFile(file: string): WikiFileTarget {
+    const statePath = this.config.statePath || './stenographer.db';
+    const memory = statePath === ':memory:';
+    return {
+      dir: this.config.wikiDir ?? defaultWikiDir(memory ? './stenographer.db' : statePath),
+      file,
+      statePath: memory ? undefined : statePath,
+    };
   }
 
-  /** §8 import: wiki entries keep their ids/authors; conflicts become proposals. */
-  async importWikiEntries(input: { path?: string; lines?: string[] }): Promise<ImportResult> {
-    return importWikiEntries(this.store.truth, input);
+  /**
+   * §8 export, truth format v2 (spec/truth-format): this ledger's
+   * hash-chained line stream — TB, UV, and the addenda and rulings that
+   * change a status, with a TRANSITION line for each change. Never
+   * proposals. With `file` (inside the wiki directory, and this ledger's
+   * own: one writer per file), appends the lines the file doesn't hold yet;
+   * without it, returns the lines after `sinceSeq` (or, deprecated, from
+   * the first line written after `since`).
+   */
+  async exportWikiEntries(options: { sinceSeq?: number; since?: string; file?: string } = {}): Promise<{
+    lines?: string[];
+    count: number;
+    lastSeq: number;
+    skipped: Array<{ id: string; error: string }>;
+    file?: string;
+    appended?: number;
+    present?: number;
+  }> {
+    if (options.file === undefined) {
+      return exportWikiEntries(this.store.truth, { sinceSeq: options.sinceSeq, since: options.since });
+    }
+    if (options.sinceSeq !== undefined || options.since !== undefined) {
+      throw new Error('a file export appends whatever the file lacks: sinceSeq and since apply to inline exports only');
+    }
+    const target = this.wikiFile(options.file);
+    const stream = exportWikiEntries(this.store.truth);
+    const written = appendWikiFile(target, stream.lines);
+    return {
+      file: target.file,
+      count: stream.count,
+      lastSeq: stream.lastSeq,
+      appended: written.appended,
+      present: written.present,
+      skipped: stream.skipped,
+    };
+  }
+
+  /**
+   * §8 import: one transaction per file, whose v2 lines must chain.
+   * Entries keep their ids and authors; a TB lands as truth only signed and
+   * verifiable (hash-chained, and a signer the registry lists, when there
+   * is one) — otherwise as a reconciliation proposal. Status changes are
+   * applied from the addenda and rulings that cause them. Imported claims
+   * and assertions are embedded, so search ranks them.
+   */
+  async importWikiEntries(input: { file?: string; lines?: string[] }): Promise<ImportResult> {
+    const lines = input.lines ?? readWikiFile(this.wikiFile(input.file ?? ''));
+    const embedder = await this.ensureEmbedder();
+    const embeddings = new Map<string, number[]>();
+    for (const [id, text] of wikiLineTexts(lines)) {
+      // Only what this import can add: a re-import embeds nothing
+      if (!this.store.truth.getEntry(id)) embeddings.set(id, await embedder.embed(text));
+    }
+    return importWikiEntries(this.store.truth, { lines }, { signers: this.signers, embeddings });
   }
 
   /**

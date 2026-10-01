@@ -3,8 +3,8 @@
  * through which profile, whose name lands on each write, and what the
  * server accepts as arguments (STENO-T-01/02/18/23/26).
  */
-import { describe, it, expect, afterEach } from 'vitest';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { describe, it, expect, afterEach, onTestFinished } from 'vitest';
+import { mkdtempSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -467,5 +467,41 @@ describe('propose_tombstone dedupe (STENO-T-26)', () => {
     expect(again.status).toMatch(/deduped/);
     expect(again.raisedTo).toEqual([]);
     expect(ledger.listProposals('open')).toHaveLength(1);
+  });
+});
+
+describe('wiki tools are confined to the wiki directory (STENO-T-04)', () => {
+  it('take no filesystem path: export cannot overwrite the ledger, import cannot read outside the wiki directory', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'steno-wiki-root-'));
+    onTestFinished(() => rmSync(root, { recursive: true, force: true }));
+    const statePath = join(root, 'stenographer.db');
+    const { call, ledger, notarizedTb } = await start({ profile: 'operator', statePath, wikiDir: join(root, 'wiki') });
+    await notarizedTb();
+
+    expect((await call('export_wiki_entries', { path: statePath })).error).toMatch(/invalid arguments/);
+    expect((await call('import_wiki_entries', { path: '/etc/passwd' })).error).toMatch(/invalid arguments/);
+    for (const file of ['../stenographer.db', statePath, '/etc/passwd', 'notes.md']) {
+      expect((await call('export_wiki_entries', { file })).error, file).toBeDefined();
+      const res = await call('import_wiki_entries', { file });
+      expect(res.error, file).toBeDefined();
+      expect(res.error).not.toMatch(/root:x:0/);
+    }
+    expect(readFileSync(statePath).subarray(0, 15).toString()).toBe('SQLite format 3');
+    expect(ledger.verify().ok).toBe(true);
+
+    // Inside it, export appends and import is a no-op on its own lines
+    expect(await call('export_wiki_entries', { file: 'truth.jsonl' })).toMatchObject({ appended: 1 });
+    expect(await call('export_wiki_entries', { file: 'truth.jsonl' })).toMatchObject({ appended: 0 });
+    expect(await call('import_wiki_entries', { file: 'truth.jsonl' })).toMatchObject({ committed: true, unchanged: 1 });
+  });
+
+  it('annotates wiki export and import as non-destructive and idempotent', async () => {
+    const { client } = await start({ profile: 'operator' });
+    const { tools } = await client.listTools();
+    for (const name of ['export_wiki_entries', 'import_wiki_entries']) {
+      const tool = tools.find((t) => t.name === name)!;
+      expect(tool.annotations, name).toMatchObject({ destructiveHint: false, idempotentHint: true });
+      expect(Object.keys(tool.inputSchema.properties ?? {}), name).not.toContain('path');
+    }
   });
 });

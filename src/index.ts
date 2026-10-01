@@ -40,6 +40,8 @@ export {
   NotarizationRequiredError,
   type WriteContext,
   type TruthFilter,
+  type NewEntry,
+  type LedgerRecord,
 } from './truth/ledger.js';
 export {
   verifyLedger,
@@ -56,11 +58,33 @@ export { runVerifyCLI, verifyStateFile, formatLedgerCheck, startupLedgerCheck, t
 export {
   exportWikiEntries,
   importWikiEntries,
-  entryToWikiLine,
-  wikiLineToEntry,
-  type WikiEntryLine,
+  decodeWikiLine,
+  checkWikiChain,
+  wikiLineHash,
+  wikiLineTexts,
+  WikiLineError,
+  WIKI_SCHEMA_VERSION,
+  WIKI_SYNC_DETECTOR,
+  WIKI_STATUSES,
+  CAUSE_KINDS,
+  type CauseKind,
+  type WikiLine,
+  type DecodedWikiLine,
+  type WikiExportResult,
+  type ImportOptions,
   type ImportResult,
+  type ReconciliationReason,
 } from './truth/wiki.js';
+export {
+  resolveWikiFile,
+  readWikiFile,
+  appendWikiFile,
+  defaultWikiDir,
+  WikiPathError,
+  MAX_WIKI_FILE_BYTES,
+  type WikiFileTarget,
+  type WikiAppendResult,
+} from './truth/wiki-file.js';
 export {
   importProposalDrafts,
   COMPACTION_DETECTOR,

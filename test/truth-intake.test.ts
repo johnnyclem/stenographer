@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { StateStore } from '../src/store/index.js';
 import { importProposalDrafts, COMPACTION_DETECTOR } from '../src/truth/intake.js';
+import { wikiLineHash } from '../src/truth/wiki.js';
 
 // Lines shaped exactly like short-hand's exportProposalDrafts output.
 function uvDraftLine(key = 'database', value = 'PostgreSQL'): string {
@@ -168,5 +169,79 @@ describe('proposal-draft intake (short-hand seam)', () => {
   it('the detector cannot sign its own intake (one hat, not two)', () => {
     const { filed } = importProposalDrafts(store.truth, { lines: [uvDraftLine()] });
     expect(() => store.truth.signProposal(filed[0].id, COMPACTION_DETECTOR)).toThrow();
+  });
+});
+
+describe('the suite PROPOSAL envelope (truth format v2)', () => {
+  let store: StateStore;
+  beforeEach(() => {
+    store = new StateStore(':memory:');
+  });
+  afterEach(() => store.close());
+
+  /** A proposals stream, hash-chained as the spec says. */
+  function stream(...bodies: Array<Record<string, unknown>>): string[] {
+    const lines: string[] = [];
+    let prevHash: string | null = null;
+    bodies.forEach((body, i) => {
+      const line = { schemaVersion: 2, seq: i + 1, type: 'PROPOSAL', ts: '2026-09-30T12:00:00.000Z', ...body, prevHash };
+      const hash = wikiLineHash(line);
+      lines.push(JSON.stringify({ ...line, hash }));
+      prevHash = hash;
+    });
+    return lines;
+  }
+  const tb = {
+    id: '01J9PROPTB0000000000000000',
+    author: 'detector:short-hand',
+    kind: 'tb',
+    draft: {
+      claim: 'LOG_BUDGET 30 is dead; it is 100.',
+      evidence: [{ kind: 'message', ref: 'm5' }],
+      literals: [{ subject: 'LOG_BUDGET', dead: '30', current: '100' }],
+    },
+    targetRef: 'shorthand:tombstone:m5',
+    signal: { source: 'compaction-candidate', detail: 'L4 correction' },
+  };
+  const uv = {
+    id: '01J9PROPUV0000000000000000',
+    author: 'agent:claude-code',
+    kind: 'uv',
+    draft: { assertion: 'Retries are idempotent.', basis: 'design doc', verifyBy: { kind: 'ask', value: 'sam' }, contests: null },
+    targetRef: null,
+    signal: { source: 'agent' },
+    agentSessionId: 'sess_9',
+  };
+
+  it('files tb and uv drafts, keeping literals, with the envelope under meta.intake', () => {
+    const lines = stream(tb, uv);
+    const result = importProposalDrafts(store.truth, { lines });
+    expect(result.errors).toEqual([]);
+    expect(result.filed).toHaveLength(2);
+    const [t, u] = result.filed;
+    expect(t.body).toMatchObject({ kind: 'tombstone', draft: { literals: tb.draft.literals }, signal: { source: 'compaction-candidate' } });
+    expect(t.body.meta).toMatchObject({
+      intake: { source: 'compaction-candidate', id: tb.id, author: 'detector:short-hand', hash: JSON.parse(lines[0]).hash },
+    });
+    expect(u.body).toMatchObject({ kind: 'uv', meta: { intake: { source: 'agent', id: uv.id } } });
+    expect(u.agentSessionId).toBe('sess_9');
+    // Re-importing the same stream files nothing new
+    expect(importProposalDrafts(store.truth, { lines })).toMatchObject({ filed: [], deduped: 2 });
+  });
+
+  it('refuses a line whose hash does not match, or that breaks the chain', () => {
+    const lines = stream(tb, uv);
+    const edited = JSON.stringify({ ...JSON.parse(lines[0]), targetRef: 'elsewhere' });
+    const gap = stream(tb, uv, { ...uv, id: '01J9PROPUV0000000000000001' });
+    const result = importProposalDrafts(store.truth, { lines: [edited] });
+    expect(result.errors).toMatchObject([{ line: 1, error: expect.stringMatching(/hash mismatch/) }]);
+    const broken = importProposalDrafts(store.truth, { lines: [gap[0], gap[2]] });
+    expect(broken.errors).toMatchObject([{ line: 2, error: expect.stringMatching(/chain broken/) }]);
+  });
+
+  it('refuses a kind or signal source the envelope does not define', () => {
+    const lines = stream({ ...tb, kind: 'tombstone' }, { ...uv, id: '01J9PROPUV0000000000000002', signal: { source: 'shorthand-compaction' } });
+    const { errors } = importProposalDrafts(store.truth, { lines });
+    expect(errors.map((e) => e.line)).toEqual([1, 2]);
   });
 });

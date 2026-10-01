@@ -14,6 +14,7 @@
  */
 
 import type Database from 'better-sqlite3';
+import { z } from 'zod';
 import { CHAIN_VERSION, chainRecord, recordHash, linkKey, verifyLedger, type IntegrityReport, type LedgerRow } from './chain.js';
 import { canonicalize } from './jcs.js';
 import { deriveAll, deriveStatus, deriveStruck, recordedStatus, type InboundLink } from './status.js';
@@ -31,6 +32,10 @@ import {
   TombstoneDraftInputSchema,
   UvInputSchema,
   EvidenceSchema,
+  ProvenanceSchema,
+  VerifyBySchema,
+  TombstonedLiteralSchema,
+  LINK_TYPES,
   MIGRATION_AUTHOR,
   type Evidence,
   type Provenance,
@@ -80,7 +85,113 @@ const CHAIN_COLUMNS: Array<[string, string]> = [
 ];
 
 /** An entry as it is stored: the body as written, without the derived status. */
-type NewEntry = Omit<TruthEntry, 'links' | 'body'> & { body: object };
+export type NewEntry = Omit<TruthEntry, 'links' | 'body'> & { body: object };
+
+/** An entry as the wiki codec reads it: its stored body, the links its append wrote, and its chain position. */
+export interface LedgerRecord {
+  id: string;
+  type: TruthEntryType;
+  createdAt: string;
+  author: string;
+  provenance: Provenance;
+  agentSessionId: string | null;
+  origin: 'local' | 'wiki';
+  body: Record<string, unknown>;
+  targetRef: string | null;
+  links: TruthLink[];
+  seq: number;
+  /** The entry's hash in this ledger's chain (chain.ts). */
+  hash: string;
+}
+
+interface AppendOptions {
+  embedding?: number[];
+  targetRef?: string | null;
+  /** The backfill path: a TB authored by 'migration', with no signer. */
+  backfill?: boolean;
+  /** Wiki import: the entry may carry links into itself, and links to entries this ledger doesn't hold. */
+  imported?: boolean;
+}
+
+// What admit() checks, per entry type. Bodies are checked as stored: the
+// same building blocks the write-time input schemas use (types.ts), without
+// their transforms, so a validated body is stored exactly as given.
+const TB_STATUSES = ['active', 'contested', 'overridden'] as const;
+const UV_STATUSES = ['open', 'verified', 'refuted'] as const;
+const STORED_BODY: Partial<Record<TruthEntryType, z.ZodTypeAny>> = {
+  TB: z
+    .object({
+      claim: z.string().min(1),
+      evidence: z.array(EvidenceSchema).min(1, 'a TB requires at least one piece of evidence'),
+      signedBy: z.string().nullable(),
+      literals: z.array(TombstonedLiteralSchema).optional(),
+      // Recorded by a pre-1.0 ledger or a v1 wiki line; a terminal one is a floor (status.ts)
+      status: z.enum(TB_STATUSES).optional(),
+    })
+    .strict(),
+  UV: z
+    .object({
+      assertion: z.string().min(1),
+      basis: z.string().min(1),
+      verifyBy: VerifyBySchema,
+      contests: z.string().min(1).nullable().optional(),
+      status: z.enum(UV_STATUSES).optional(),
+    })
+    .strict(),
+  ADDENDUM: z
+    .object({
+      evidence: z.array(EvidenceSchema).min(1, 'an addendum requires at least one piece of evidence'),
+      note: z.string().nullable().optional(),
+    })
+    .strict(),
+  RULING: z
+    .object({
+      kind: z.enum(['strike', 'promotion', 'contempt', 'objection', 'dismissal']),
+      opinion: z.string().refine((o) => o.trim().length > 0, 'a ruling requires a written opinion'),
+      target: z.string().min(1),
+      objectionId: z.string().min(1).optional(),
+      outcome: z.enum(['sustained', 'overruled']).optional(),
+    })
+    .strict(),
+  PROPOSAL: z
+    .object({
+      kind: z.enum(['tombstone', 'uv']),
+      draft: z.record(z.unknown()),
+      signal: z.object({ source: z.string().min(1) }).passthrough(),
+    })
+    .passthrough(),
+  MARKER: z.object({ kind: z.literal('chained-at-migration') }).passthrough(),
+};
+
+/** The links each entry type writes from itself. */
+export const OUTBOUND_LINKS: Record<TruthEntryType, readonly LinkType[]> = {
+  TB: ['supersedes', 'signs'],
+  UV: ['contests', 'signs'],
+  ADDENDUM: ['verifies', 'refutes', 'overrides'],
+  RULING: ['strikes', 'dismisses'],
+  PROPOSAL: [],
+  MARKER: LINK_TYPES,
+};
+
+/** What a link of each type may point at (any entry, when absent). */
+const LINK_TARGET: Partial<Record<LinkType, readonly TruthEntryType[]>> = {
+  overrides: ['TB'],
+  contests: ['TB'],
+  verifies: ['UV'],
+  refutes: ['UV'],
+  signs: ['PROPOSAL'],
+  dismisses: ['PROPOSAL'],
+};
+
+/** Links into itself an imported entry may carry: its own history, written in a ledger we don't hold. */
+export const INBOUND_LINKS: Partial<Record<TruthEntryType, readonly LinkType[]>> = {
+  TB: ['overrides', 'contests', 'supersedes', 'strikes'],
+  UV: ['verifies', 'refutes', 'supersedes', 'strikes'],
+};
+
+function formatIssues(error: z.ZodError): string {
+  return error.issues.map((i) => (i.path.length > 0 ? `${i.path.join('.')}: ${i.message}` : i.message)).join('; ');
+}
 
 export class TruthLedger {
   private db: Database.Database;
@@ -363,8 +474,9 @@ export class TruthLedger {
    * head, writes the links it carries, and re-derives the cached status of
    * everything those links touch.
    */
-  private append(entry: NewEntry, links: TruthLink[] = [], opts: { embedding?: number[]; targetRef?: string | null } = {}): void {
+  private append(entry: NewEntry, links: TruthLink[] = [], opts: AppendOptions = {}): void {
     this.tx(() => {
+      this.admit(entry, links, opts);
       this.writes++;
       const unique = [...new Map(links.map((l) => [linkKey(l), { fromId: l.fromId, toId: l.toId, type: l.type }])).values()];
       const head = this.db
@@ -416,6 +528,88 @@ export class TruthLedger {
       for (const link of unique) insertLink.run(link.fromId, link.toId, link.type);
       this.refresh([entry.id, ...unique.flatMap((l) => [l.fromId, l.toId])]);
     });
+  }
+
+  /**
+   * The admission check: what every entry must satisfy to enter the ledger,
+   * by any path — live writes and wiki import alike, since both append
+   * through here. Accountable identities (reserved ones only on their own
+   * paths), a well-formed envelope, a body of its type's shape (a TB has a
+   * claim, evidence and a signer; a ruling has an opinion), and links its
+   * type may write, at entries of the type they mean. The write methods
+   * check their inputs first, for clearer errors; this is the floor none of
+   * them, and no import, gets under.
+   */
+  private admit(entry: NewEntry, links: TruthLink[], opts: AppendOptions): void {
+    const fail = (message: string): never => {
+      throw new TruthWriteError(`entry ${entry.id}: ${message}`);
+    };
+    if (typeof entry.id !== 'string' || entry.id.length === 0 || hasControlCharacters(entry.id)) {
+      fail('an entry needs an id without control characters');
+    }
+    const bodySchema = STORED_BODY[entry.type];
+    if (!bodySchema) fail(`unknown entry type '${entry.type}'`);
+    if (typeof entry.createdAt !== 'string' || !Number.isFinite(Date.parse(entry.createdAt))) {
+      fail('createdAt must be a timestamp');
+    }
+
+    // Who: 'migration' writes markers and backfilled TBs, detectors file proposals, nobody else is reserved
+    const body = entry.body as Record<string, unknown>;
+    if (entry.type === 'MARKER' || (entry.type === 'TB' && opts.backfill)) {
+      if (entry.author !== MIGRATION_AUTHOR) fail(`a ${entry.type === 'MARKER' ? 'marker' : 'backfilled TB'} is written by '${MIGRATION_AUTHOR}'`);
+    } else {
+      this.accountable(entry.author, 'author', { allowDetector: entry.type === 'PROPOSAL' });
+    }
+    if (entry.type === 'TB') {
+      if (body.signedBy === null) {
+        if (!opts.backfill) fail('a TB needs an accountable signer');
+      } else {
+        this.accountable(body.signedBy as string, 'signer');
+      }
+    }
+    if (!ProvenanceSchema.safeParse(entry.provenance).success) fail('provenance is malformed');
+    if (entry.origin !== 'local' && entry.origin !== 'wiki') fail(`origin must be 'local' or 'wiki'`);
+    if (entry.agentSessionId != null && typeof entry.agentSessionId !== 'string') fail('agentSessionId must be a string');
+
+    const parsed = bodySchema!.safeParse(body);
+    if (!parsed.success) fail(formatIssues(parsed.error));
+
+    // Links: of a type this entry writes, at an entry of the type the link means
+    const typeOf = this.db.prepare('SELECT type FROM truth_entries WHERE id = ?');
+    for (const link of links) {
+      if (
+        !link ||
+        typeof link.fromId !== 'string' ||
+        typeof link.toId !== 'string' ||
+        !link.fromId ||
+        !link.toId ||
+        !(LINK_TYPES as readonly string[]).includes(link.type)
+      ) {
+        fail('malformed link');
+      }
+      // The migration marker carries links whose endpoints are both elsewhere
+      if (entry.type === 'MARKER') continue;
+      if (link.fromId === entry.id) {
+        if (!OUTBOUND_LINKS[entry.type].includes(link.type)) fail(`a ${entry.type} cannot write a '${link.type}' link`);
+        const target = (typeOf.get(link.toId) as { type: TruthEntryType } | undefined)?.type;
+        const expected = LINK_TARGET[link.type];
+        if (target && expected && !expected.includes(target)) {
+          fail(`a '${link.type}' link points at a ${expected.join(' or ')}, and ${link.toId} is a ${target}`);
+        }
+        if (!target && !opts.imported) fail(`no such entry: ${link.toId}`);
+        // Proposals never travel: a wiki line can't close one this ledger holds
+        if (target && opts.imported && (link.type === 'signs' || link.type === 'dismisses')) {
+          fail(`a wiki line cannot ${link.type === 'signs' ? 'sign' : 'dismiss'} proposal ${link.toId}, which this ledger holds — a person does that here`);
+        }
+        if (link.type === 'contests' && link.toId !== body.contests) {
+          fail(`a UV's contests link must point at the TB its contests field names`);
+        }
+      } else if (link.toId === entry.id && opts.imported) {
+        if (!INBOUND_LINKS[entry.type]?.includes(link.type)) fail(`a ${entry.type} cannot carry a '${link.type}' link into itself`);
+      } else {
+        fail(`link ${link.fromId} -${link.type}-> ${link.toId} is not this entry's to write`);
+      }
+    }
   }
 
   /**
@@ -1103,43 +1297,119 @@ export class TruthLedger {
         } satisfies Omit<TbBody, 'status'>,
       },
       [],
-      { targetRef: `legacy:${legacy.id}` }
+      { targetRef: `legacy:${legacy.id}`, backfill: true }
     );
     return this.getEntry(id) as TbEntry;
   }
 
+  // ─────────────────────────────────────────────────────────
+  // Wiki import (wiki.ts) — the same admit() as every write
+  // ─────────────────────────────────────────────────────────
+
   /**
-   * Used by wiki import: entries keep their original ids and authors, and
-   * their body as the wiki wrote it — including the status the line
-   * carried, which counts only as a terminal floor (status.ts). The entry is
-   * chained like any other, with the links the line carried about itself.
-   *
-   * Since links decide status, a line may only speak for itself: it keeps
-   * links into the entry (its own history) and the links a TB or UV writes —
-   * a UV's contest (the one its `contests` field names, which it implies),
-   * a TB's supersessions, and a TB's signature of a proposal this ledger
-   * doesn't hold. Anything else it carries, such as an `overrides` or
-   * `strikes` aimed at a local entry, is dropped.
+   * Runs `fn` atomically: as its own write transaction, or, inside one, as a
+   * savepoint that a throw rolls back on its own. Wiki import runs a file in
+   * one transaction and each line in a savepoint.
    */
-  importEntry(entry: TruthEntry, embedding?: number[]): 'inserted' | 'unchanged' | 'conflict' {
-    const existing = this.getEntry(entry.id);
-    if (existing) {
-      const same = canonicalize(existing.body) === canonicalize(entry.body) && existing.author === entry.author;
-      return same ? 'unchanged' : 'conflict';
-    }
-    const contests = entry.type === 'UV' ? ((entry.body as UvBody).contests ?? null) : null;
-    const ownLink = (link: TruthLink): boolean => {
-      if (link.toId === entry.id) return true;
-      if (link.fromId !== entry.id) return false;
-      if (entry.type === 'UV') return link.type === 'contests' && link.toId === contests;
-      return link.type === 'supersedes' || (link.type === 'signs' && !this.getEntry(link.toId));
-    };
-    this.append(
-      entry,
-      [...entry.links.filter(ownLink), ...(contests ? [{ fromId: entry.id, toId: contests, type: 'contests' as const }] : [])],
-      { embedding }
-    );
-    return 'inserted';
+  atomically<T>(fn: () => T): T {
+    return this.db.inTransaction ? this.db.transaction(fn)() : this.db.transaction(fn).immediate();
+  }
+
+  /**
+   * A TB or UV from the wiki, keeping its id, author and body as the line
+   * gave them, chained here like any other entry and admitted by the same
+   * check. Its links are the ones its own append wrote (and, from a v1 line,
+   * links into itself); a UV's `contests` field implies its contest link.
+   * The body may record a status, which counts only as a terminal floor
+   * (status.ts). An id this ledger already holds is never written again:
+   * the same entry is 'unchanged', a different one a 'conflict' for the
+   * caller to reconcile.
+   */
+  importEntry(
+    entry: NewEntry,
+    links: TruthLink[],
+    opts: { embedding?: number[]; targetRef?: string | null } = {}
+  ): 'inserted' | 'unchanged' | 'conflict' {
+    return this.atomically(() => {
+      if (entry.type !== 'TB' && entry.type !== 'UV') {
+        throw new TruthWriteError(`entry ${entry.id}: only a TB or UV is imported as an entry, not a ${entry.type}`);
+      }
+      const held = this.storedRecord(entry.id);
+      if (held) return sameEntry(held, entry) ? 'unchanged' : 'conflict';
+
+      const contests = entry.type === 'UV' ? ((entry.body as { contests?: string | null }).contests ?? null) : null;
+      const all = [...links];
+      if (contests && !all.some((l) => l.type === 'contests' && l.fromId === entry.id)) {
+        all.push({ fromId: entry.id, toId: contests, type: 'contests' });
+      }
+      this.append(entry, all, { embedding: opts.embedding, targetRef: opts.targetRef ?? null, imported: true });
+      return 'inserted';
+    });
+  }
+
+  /**
+   * An ADDENDUM or RULING from the wiki whose links change the status of
+   * entries this ledger holds (override, verify, refute, strike). Admitted
+   * by the same check as every write, and by the contempt rule a live
+   * resolution meets. Status joins on the lattice, so a change whose effect
+   * is already in place (a TB overridden here first) is recorded and changes
+   * nothing. One aimed at an entry this ledger doesn't hold is 'held':
+   * nothing is written, and a later import retries it.
+   */
+  importChange(entry: NewEntry, links: TruthLink[]): { outcome: 'inserted' | 'unchanged' } | { outcome: 'held'; reason: string } {
+    return this.atomically(() => {
+      if (entry.type !== 'ADDENDUM' && entry.type !== 'RULING') {
+        throw new TruthWriteError(`entry ${entry.id}: only an ADDENDUM or RULING changes a status, not a ${entry.type}`);
+      }
+      const held = this.storedRecord(entry.id);
+      if (held) {
+        const heldLinks = held.links.map(linkKey).sort().join('\n');
+        if (sameEntry(held, entry) && heldLinks === links.map(linkKey).sort().join('\n')) return { outcome: 'unchanged' as const };
+        throw new TruthWriteError(`${entry.type} ${entry.id} differs from the copy this ledger holds`);
+      }
+      for (const link of links) {
+        if (!this.getEntry(link.toId)) {
+          return { outcome: 'held' as const, reason: `its target ${link.toId} is not held here` };
+        }
+      }
+      // A resolution is corroboration: the contempt rule a live resolveUv meets
+      const actor = { author: entry.author, agentSessionId: entry.agentSessionId };
+      for (const link of links) {
+        if (link.type !== 'verifies' && link.type !== 'refutes') continue;
+        const uv = this.mustGetTyped<UvEntry>(link.toId, 'UV');
+        this.requireIndependence(actor, uv, link.type === 'verifies' ? 'verify' : 'refute');
+        const contested = link.type === 'refutes' && uv.body.contests ? this.getEntry(uv.body.contests) : null;
+        if (contested) this.requireIndependence(actor, contested, 'refute the contest against');
+      }
+      this.append(entry, links, { imported: true });
+      return { outcome: 'inserted' as const };
+    });
+  }
+
+  /** Every PROPOSAL filed against `targetRef`, in any status, oldest first. */
+  proposalsFor(targetRef: string): ProposalEntry[] {
+    const rows = this.db
+      .prepare(`SELECT * FROM truth_entries WHERE type = 'PROPOSAL' AND target_ref = ? ORDER BY seq`)
+      .all(targetRef) as any[];
+    return rows.map((r) => this.rowToEntry(r) as ProposalEntry);
+  }
+
+  /**
+   * Stores an embedding for an entry that has none (e.g. imported by a
+   * caller without an embedder). The embedding is a cache for ranking, not
+   * part of the hashed entry, so this changes nothing the chain covers.
+   */
+  cacheEmbedding(id: string, embedding: number[]): void {
+    if (embedding.length === 0) return;
+    this.db
+      .prepare('UPDATE truth_entries SET embedding = ? WHERE id = ? AND embedding IS NULL')
+      .run(Buffer.from(new Float32Array(embedding).buffer), id);
+  }
+
+  /** The stored form of an entry: its body as written (no derived status) and the links its append wrote. */
+  private storedRecord(id: string): LedgerRecord | null {
+    const row = this.db.prepare('SELECT * FROM truth_entries WHERE id = ?').get(id) as LedgerRow | undefined;
+    return row ? toRecord(row) : null;
   }
 
   // ─────────────────────────────────────────────────────────
@@ -1231,16 +1501,13 @@ export class TruthLedger {
     }));
   }
 
-  /** Signed truth for wiki export: TBs and UVs, never proposals. */
-  getExportableEntries(since?: string): Array<TbEntry | UvEntry> {
-    const rows = (
-      since
-        ? this.db
-            .prepare(`SELECT * FROM truth_entries WHERE type IN ('TB','UV') AND created_at > ? ORDER BY created_at ASC, id ASC`)
-            .all(since)
-        : this.db.prepare(`SELECT * FROM truth_entries WHERE type IN ('TB','UV') ORDER BY created_at ASC, id ASC`).all()
-    ) as any[];
-    return rows.map((r) => this.rowToEntry(r) as TbEntry | UvEntry);
+  /**
+   * Every chained entry as stored, in ledger order, with the links its
+   * append wrote: what the wiki export replays to build its line stream.
+   */
+  getChainedRecords(): LedgerRecord[] {
+    const rows = this.db.prepare('SELECT * FROM truth_entries WHERE seq IS NOT NULL ORDER BY seq').all() as LedgerRow[];
+    return rows.map(toRecord);
   }
 
   getStats(): { tombstones: number; uvs: number; openUvs: number; openProposals: number; contested: number; rulings: number } {
@@ -1300,3 +1567,27 @@ export class TruthLedger {
     };
   }
 }
+
+/** A row as stored. */
+function toRecord(row: LedgerRow): LedgerRecord {
+  return {
+    id: row.id,
+    type: row.type as TruthEntryType,
+    createdAt: row.created_at,
+    author: row.author,
+    provenance: JSON.parse(row.provenance),
+    agentSessionId: row.agent_session_id ?? null,
+    origin: row.origin as 'local' | 'wiki',
+    body: JSON.parse(row.body),
+    targetRef: row.target_ref ?? null,
+    links: JSON.parse(row.appended_links ?? '[]'),
+    seq: row.seq!,
+    hash: row.hash!,
+  };
+}
+
+/** The same entry: type, author and stored body. Status isn't stored, so a state change is never a difference. */
+function sameEntry(held: LedgerRecord, entry: NewEntry): boolean {
+  return held.type === entry.type && held.author === entry.author && canonicalize(held.body) === canonicalize(entry.body);
+}
+
