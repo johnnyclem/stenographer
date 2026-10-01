@@ -165,6 +165,19 @@ describe('OpenAPPA context provider (POST /appa/context)', () => {
     ]);
   });
 
+  it("reads OpenAPPA's canonical tool ids (host/<harness>/<tool>) as the harness's own tools", async () => {
+    // A served runtime names Claude Code's Bash host/claude-code/Bash
+    // (appa-adapter-claude-code identity.rs), not Bash
+    const bash = await consult('host/claude-code/Bash', { command: "printf 'LOG_BUDGET=30\\n' >> .env" });
+    expect(bash.hits.map((h: { tb_id: string; argument: string }) => [h.tb_id, h.argument])).toEqual([[budget.id, 'command']]);
+    const write = await consult('host/claude-code/Write', { file_path: 'a.ts', content: 'export const LOG_BUDGET = 30;' });
+    expect(write.hits.map((h: { argument: string }) => h.argument)).toEqual(['content']);
+    expect(await consult('host/claude-code/Grep', { pattern: 'LOG_BUDGET = 30' })).toBeNull();
+    // An MCP tool is read through its content-like fields, whatever its name
+    const mcp = await consult('mcp/files/write_file', { path: 'a.ts', content: 'const limiter = legacyRateLimiter()' });
+    expect(mcp.hits.map((h: { tb_id: string }) => h.tb_id)).toEqual([limiter.id]);
+  });
+
   it('answers null when the ledger has nothing to say about the call', async () => {
     const res = await replay(recorded('unrelated-fetch'));
     expect(await res.json()).toEqual({ version: 1, answer: null });

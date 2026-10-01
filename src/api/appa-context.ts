@@ -86,6 +86,18 @@ const ABOUT =
   'open UV disputes it (contested_by). Facts from the ledger, not a judgment of the call.';
 
 /**
+ * The harness's own name for a tool OpenAPPA names canonically: a served
+ * runtime calls Claude Code's Bash `host/claude-code/Bash` (and an MCP tool
+ * `mcp/<server>/<tool>`), where the gate and the transcript see `Bash`. MCP
+ * tools and bare names pass through; an MCP tool is read through its
+ * content-like fields, as the gate reads one it doesn't know.
+ */
+export function harnessToolName(tool: string): string {
+  const host = /^host\/[^/]+\/(.+)$/.exec(tool);
+  return host ? host[1] : tool;
+}
+
+/**
  * The ledger's facts about one proposed call; null when it has none.
  * `compiled` is the active-TB matcher; pass a cached one (the objection
  * log's, recompiled only when the ledger changes) to skip compiling it
@@ -96,7 +108,7 @@ export function answerContextConsult(
   artifact: ContextConsult['artifact'],
   compiled?: CompiledTombstones
 ): ContextAnswer | null {
-  const fields = assertingFields(artifact.tool, artifact.arguments);
+  const fields = assertingFields(harnessToolName(artifact.tool), artifact.arguments);
   if (fields.length === 0) return null;
   const { tombstones, matcher } = compiled ?? compileTombstones(ledger.getMatchableTombstones());
   if (tombstones.length === 0) return null;
