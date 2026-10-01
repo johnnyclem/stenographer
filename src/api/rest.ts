@@ -307,7 +307,9 @@ export class RestServer {
       const issues = consult.error.issues.map((i) => `${i.path.join('.') || 'body'}: ${i.message}`);
       throw new RequestError(400, `Not a v1 context consult — ${issues.join('; ')}`);
     }
-    sendJson(res, 200, { version: 1, answer: answerContextConsult(this.engine.store.truth, consult.data.artifact) });
+    // The objection log's matcher: compiled once per ledger generation, not per consult
+    const { truth, objections } = this.engine.store;
+    sendJson(res, 200, { version: 1, answer: answerContextConsult(truth, consult.data.artifact, objections.compiled()) });
   }
 
   /**

@@ -12,21 +12,25 @@
  *   response: {"version": 1, "answer": {"about", "hits": [...]}}  or
  *             {"version": 1, "answer": null} when the ledger has nothing to say
  *
- * Read-only. Matching is the objection detector's (`findLiteralHits`):
- * exact tokens, a subject next to its value, a line that also names the
- * current value is discussion, and keys naming the old side of an edit
- * (`old_string`, ...) are skipped. Facts, not labels: what the annotator
- * makes of a hit is its policy's business.
+ * Read-only. What is read, and how it matches, is exactly what the
+ * objection detector and `stenographer gate` use, so the three agree on
+ * what a call asserts: only the fields that carry new content
+ * (`assertingFields` — a Write's content, the new side of an edit, the
+ * writing parts of a shell command; never a search, a read, a commit
+ * message or the old side of an edit), matched by the shared clause
+ * matcher (`LiteralMatcher`). Facts, not labels: what the annotator makes
+ * of a hit is its policy's business.
  *
  *   [externals.context.stenographer]
- *   url = "http://127.0.0.1:8787/appa/context"
- *   token_env = "APPA_STENOGRAPHER_TOKEN"   # the REST bearer token
+ *   url = "http://127.0.0.1:8789/appa/context"  # --rest-port 8789: OpenAPPA's runtime holds 8787
+ *   token_env = "APPA_STENOGRAPHER_TOKEN"        # the REST bearer token
  */
 
 import { z } from 'zod';
-import { findLiteralHits } from '../truth/objections.js';
+import { compileTombstones, type CompiledTombstones } from '../truth/objections.js';
+import { assertingFields } from '../truth/asserting.js';
 import type { TruthLedger } from '../truth/ledger.js';
-import type { UvEntry } from '../truth/types.js';
+import type { TbEntry, TombstonedLiteral, UvEntry } from '../truth/types.js';
 
 export const ContextConsultSchema = z.object({
   version: z.literal(1),
@@ -76,43 +80,35 @@ export interface ContextAnswer {
 }
 
 const ABOUT =
-  "Literals in this call's arguments that a signed tombstone (TB) in stenographer's asserted-truth ledger " +
+  "Literals this call asserts (in the arguments that carry new content: file content, the new side of an edit, " +
+  "the writing parts of a shell command) that a signed tombstone (TB) in stenographer's asserted-truth ledger " +
   'declares dead. claim is the TB text, written by author and signed by signer; status contested means an ' +
   'open UV disputes it (contested_by). Facts from the ledger, not a judgment of the call.';
 
-const MAX_DEPTH = 8;
-const MAX_STRINGS = 2_000;
-
-/** Every string in the arguments with its path, skipping the old side of edits. */
-function argumentStrings(value: unknown): Array<{ path: string; text: string }> {
-  const out: Array<{ path: string; text: string }> = [];
-  const walk = (v: unknown, path: string, depth: number): void => {
-    if (depth > MAX_DEPTH || out.length >= MAX_STRINGS) return;
-    if (typeof v === 'string') {
-      out.push({ path: path || '(arguments)', text: v });
-    } else if (Array.isArray(v)) {
-      v.forEach((item, i) => walk(item, `${path}[${i}]`, depth + 1));
-    } else if (v && typeof v === 'object') {
-      for (const [key, item] of Object.entries(v)) {
-        // Replacing a dead value is the fix, not the mistake (as assertedText)
-        if (/^old/i.test(key)) continue;
-        walk(item, path ? `${path}.${key}` : key, depth + 1);
-      }
-    }
-  };
-  walk(value, '', 0);
-  return out;
-}
-
-/** The ledger's facts about one proposed call; null when it has none. */
+/**
+ * The ledger's facts about one proposed call; null when it has none.
+ * `compiled` is the active-TB matcher; pass a cached one (the objection
+ * log's, recompiled only when the ledger changes) to skip compiling it
+ * per consult.
+ */
 export function answerContextConsult(
   ledger: TruthLedger,
-  artifact: ContextConsult['artifact']
+  artifact: ContextConsult['artifact'],
+  compiled?: CompiledTombstones
 ): ContextAnswer | null {
-  const strings = argumentStrings(artifact.arguments);
-  if (strings.length === 0) return null;
-  const tombstones = ledger.getMatchableTombstones();
+  const fields = assertingFields(artifact.tool, artifact.arguments);
+  if (fields.length === 0) return null;
+  const { tombstones, matcher } = compiled ?? compileTombstones(ledger.getMatchableTombstones());
   if (tombstones.length === 0) return null;
+
+  // The first asserting field per literal, in ledger order
+  const found = new Map<number, { tb: TbEntry; literal: TombstonedLiteral; path: string; line: string }>();
+  for (const { field, text } of fields) {
+    for (const hit of matcher.match(text, { skip: (key) => found.has(key.order) })) {
+      found.set(hit.key.order, { tb: hit.key.tb, literal: hit.key.literal, path: field, line: hit.line });
+    }
+  }
+  if (found.size === 0) return null;
 
   let contests: Map<string, UvEntry[]> | null = null;
   const contestsOf = (tbId: string): UvEntry[] => {
@@ -120,40 +116,28 @@ export function answerContextConsult(
     return contests.get(tbId) ?? [];
   };
 
-  const hits: ContextHit[] = [];
-  for (const tb of tombstones) {
-    for (const literal of tb.body.literals ?? []) {
-      let found: { path: string; line: string } | null = null;
-      for (const { path, text } of strings) {
-        const [line] = findLiteralHits(text, literal);
-        if (line !== undefined) {
-          found = { path, line };
-          break;
-        }
-      }
-      if (!found) continue;
-      hits.push({
-        tb_id: tb.id,
-        ...(literal.subject ? { subject: literal.subject } : {}),
-        dead: literal.dead,
-        ...(literal.current ? { current: literal.current } : {}),
-        claim: tb.body.claim,
-        signer: tb.body.signedBy ?? null,
-        author: tb.author,
-        status: tb.body.status,
-        argument: found.path,
-        line: found.line,
-        contested_by:
-          tb.body.status === 'contested'
-            ? contestsOf(tb.id).map((uv) => ({
-                uv_id: uv.id,
-                assertion: uv.body.assertion,
-                author: uv.author,
-                status: uv.body.status,
-              }))
-            : [],
-      });
-    }
-  }
-  return hits.length > 0 ? { about: ABOUT, hits } : null;
+  const hits: ContextHit[] = [...found.entries()]
+    .sort(([a], [b]) => a - b)
+    .map(([, { tb, literal, path, line }]) => ({
+      tb_id: tb.id,
+      ...(literal.subject ? { subject: literal.subject } : {}),
+      dead: literal.dead,
+      ...(literal.current ? { current: literal.current } : {}),
+      claim: tb.body.claim,
+      signer: tb.body.signedBy ?? null,
+      author: tb.author,
+      status: tb.body.status,
+      argument: path,
+      line,
+      contested_by:
+        tb.body.status === 'contested'
+          ? contestsOf(tb.id).map((uv) => ({
+              uv_id: uv.id,
+              assertion: uv.body.assertion,
+              author: uv.author,
+              status: uv.body.status,
+            }))
+          : [],
+    }));
+  return { about: ABOUT, hits };
 }

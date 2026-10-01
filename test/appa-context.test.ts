@@ -126,6 +126,45 @@ describe('OpenAPPA context provider (POST /appa/context)', () => {
     expect(await res.json()).toEqual({ version: 1, answer: null });
   });
 
+  /** A consult in the recorded wire shape, for another proposed call. */
+  const consult = async (tool: string, args: Record<string, unknown>) => {
+    const r = recorded('bash-asserts-dead-literal');
+    const res = await fetch(`${base}${r.path}`, {
+      method: 'POST',
+      headers: { ...r.headers, authorization: `Bearer ${engine.restToken}` },
+      body: JSON.stringify({ ...r.body, artifact: { tool, arguments: args } }),
+    });
+    expect(res.status).toBe(200);
+    return (await res.json()).answer;
+  };
+
+  it('reads what the call asserts, as the gate and the objection detector do: searches and commit messages are not hits', async () => {
+    expect(await consult('Grep', { pattern: 'legacyRateLimiter', path: 'src' })).toBeNull();
+    expect(
+      await consult('Bash', {
+        command: 'grep -rn legacyRateLimiter src/ && git commit -m "Remove legacyRateLimiter; LOG_BUDGET = 30 is gone"',
+        description: 'Check the dead limiter is gone, then commit',
+      })
+    ).toBeNull();
+    // A description that names a dead value asserts nothing either
+    expect(await consult('Bash', { command: 'npm test', description: 'run with LOG_BUDGET = 30' })).toBeNull();
+  });
+
+  it('reports what a write or an edit asserts, by the field that asserts it', async () => {
+    const write = await consult('Write', { file_path: 'src/config.ts', content: 'export const LOG_BUDGET = 30;\n' });
+    expect(write.hits.map((h: { tb_id: string; argument: string }) => [h.tb_id, h.argument])).toEqual([[budget.id, 'content']]);
+    const multi = await consult('MultiEdit', {
+      file_path: 'src/limit.ts',
+      edits: [
+        { old_string: 'TokenBucket', new_string: 'TokenBucket' },
+        { old_string: 'x', new_string: 'const limiter = legacyRateLimiter()' },
+      ],
+    });
+    expect(multi.hits.map((h: { tb_id: string; argument: string }) => [h.tb_id, h.argument])).toEqual([
+      [limiter.id, 'edits[1].new_string'],
+    ]);
+  });
+
   it('answers null when the ledger has nothing to say about the call', async () => {
     const res = await replay(recorded('unrelated-fetch'));
     expect(await res.json()).toEqual({ version: 1, answer: null });

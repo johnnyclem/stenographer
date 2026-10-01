@@ -173,7 +173,7 @@ Query parameters are validated: a malformed one (`k=abc`, `n=0`, an unknown `sta
 
 ### OpenAPPA context provider
 
-[OpenAPPA](https://github.com/archestra-ai/openappa) asks configured context providers about each proposed tool call before its annotator labels the call. `POST /appa/context` implements consult protocol v1 for `kind: "context"`. It takes `{version: 1, kind: "context", name, declaration: {}, artifact: {tool, arguments, cwd?}}` and answers `{version: 1, answer}`. The answer is `null` when the ledger has nothing to say. Otherwise it is `{about, hits}`, with one hit per tombstoned literal found in the arguments:
+[OpenAPPA](https://github.com/archestra-ai/openappa) asks configured context providers about each proposed tool call before its annotator labels the call. `POST /appa/context` implements consult protocol v1 for `kind: "context"`. It takes `{version: 1, kind: "context", name, declaration: {}, artifact: {tool, arguments, cwd?}}` and answers `{version: 1, answer}`. The answer is `null` when the ledger has nothing to say. Otherwise it is `{about, hits}`, with one hit per tombstoned literal the call asserts:
 
 ```json
 { "tb_id": "01J…", "subject": "LOG_BUDGET", "dead": "30", "current": "100",
@@ -182,7 +182,7 @@ Query parameters are validated: a malformed one (`k=abc`, `n=0`, an unknown `sta
   "contested_by": [] }
 ```
 
-Matching is the objection detector's: exact tokens, a subject next to its value, lines that also name the current value skipped, and the old side of an edit (`old_string`, …) ignored. A contested TB lists the open UVs that dispute it, with their authors. The answer is facts for the annotator, not a label. Whether a hit matters is the policy's call. The route is read-only and uses the same bearer token.
+The call is read exactly as the objection detector and [`stenographer gate`](#pre-dispatch-gate) read it: only the arguments that carry new content (a Write's `content`, the new side of an edit, the writing parts of a shell command, content-like fields of tools it doesn't know), matched by the same clause matcher. A search, a read, a commit message or the old side of an edit is not a hit, so a consult reports what the gate in `enforce` mode would deny. A contested TB lists the open UVs that dispute it, with their authors. The answer is facts for the annotator, not a label. Whether a hit matters is the policy's call. The route is read-only and uses the same bearer token.
 
 OpenAPPA's runtime also listens on `127.0.0.1:8787` by default, so run the daemon on another port next to it (for example `--rest-port 8789`) and point the binding there:
 
