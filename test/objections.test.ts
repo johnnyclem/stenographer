@@ -326,6 +326,25 @@ describe('objection dedupe is per session (STENO-T-14)', () => {
     expect(second[0].sessionId).toBe('sessionB');
   });
 
+  it('a shadow objection does not silence the first delivered one in its session', () => {
+    // Replayed history (and the gate in shadow mode) records shadow
+    // objections; counsel hasn't said anything yet, so a live assertion of
+    // the same literal is still objected to — once
+    const db = new Database(':memory:');
+    const ledger = new TruthLedger(db);
+    ledger.assertTombstone(
+      { claim: 'LOG_BUDGET 30 is dead', evidence: [{ kind: 'commit', ref: 'a1' }], signedBy: 'jc', literals: [LOG_BUDGET] },
+      { author: 'jc' }
+    );
+    const log = new ObjectionLog(db, ledger);
+    const msg = (id: string) => ({ id, role: 'assistant' as const, content: 'LOG_BUDGET = 30', timestamp: '2026-09-18T10:00:00Z' });
+
+    expect(log.scan(msg('replayed'), 'S', 'shadow').map((o) => o.delivered)).toEqual([false]);
+    expect(log.scan(msg('replayed-again'), 'S', 'shadow')).toHaveLength(0);
+    expect(log.scan(msg('live'), 'S', 'deliver').map((o) => [o.messageId, o.delivered])).toEqual([['live', true]]);
+    expect(log.scan(msg('live-again'), 'S', 'deliver')).toHaveLength(0);
+  });
+
   it('migrates a 0.x objections table to the per-session key, keeping its rows', () => {
     const db = new Database(':memory:');
     db.exec(`

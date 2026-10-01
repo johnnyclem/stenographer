@@ -132,6 +132,7 @@
 - Text past MiniLM's input window (a few hundred tokens; the rest was dropped) is searchable: long messages are embedded in overlapping ~1,000-character windows (at most 64). (STENO-IDX-25)
 - Indexing is linear in session length (an indexed, embedding-free history read; statements prepared once; `synchronous=NORMAL` under WAL): 1k/4k/10k messages in 0.8/3.0/7.3 s on the test workload, against 2.2/19.7 s for 1k/4k before. (STENO-IDX-15)
 - Importance totals are stored and used by GraphRAG and context frames, as the README describes. (STENO-IDX-23)
+- A shadow objection no longer silences the first live one in its session. Lines a log held at startup are scanned in shadow (STENO-IDX-02), and so are the gate's objections in shadow mode; because counsel doesn't repeat a pending objection, the agent asserting the same dead literal again, live, was never objected to. In `deliver` mode only a delivered pending objection (or an overruled one) now counts as already said.
 - `stenographer verify` and `stenographer gate` no longer add columns to, or chain, a state database written by a newer stenographer.
 
 ### Documentation

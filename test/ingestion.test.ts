@@ -421,6 +421,32 @@ describe('engine ingestion', () => {
     expect((await e.getObjections()).map((o) => o.messageId)).toEqual(['o2']);
   });
 
+  it('a replayed line does not silence a live objection to the same literal', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'steno-ingest-'));
+    const log = join(dir, 'log.jsonl');
+    writeFileSync(log, '');
+    let e = await run({ objectionMode: 'deliver' });
+    await e.assertTombstone({
+      claim: 'LOG_BUDGET 30 is dead',
+      evidence: [{ kind: 'commit', ref: 'c1' }],
+      signedBy: 'johnnyclem',
+      literals: [{ subject: 'LOG_BUDGET', dead: '30', current: '100' }],
+    });
+    e.stop();
+    engine = null;
+
+    // The log already holds the mistake when stenographer starts: shadow
+    writeFileSync(log, assistant('h1', 'Setting LOG_BUDGET = 30'));
+    e = await run({ objectionMode: 'deliver' });
+    expect((await e.getObjections({ includeShadow: true })).map((o) => [o.messageId, o.delivered])).toEqual([['h1', false]]);
+
+    // The agent makes it again, live, in the same session: delivered
+    appendFileSync(log, assistant('l1', 'LOG_BUDGET = 30 again'));
+    await until(() => false, 300);
+    await e.flush();
+    expect((await e.getObjections()).map((o) => o.messageId)).toEqual(['l1']);
+  });
+
   it('auto-detection waits for the first line of an empty log (IDX-05)', async () => {
     dir = mkdtempSync(join(tmpdir(), 'steno-ingest-'));
     const log = join(dir, 'log.jsonl');

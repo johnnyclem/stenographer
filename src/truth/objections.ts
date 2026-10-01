@@ -204,7 +204,9 @@ export class ObjectionLog {
    *
    * Counsel doesn't repeat itself: a literal already objected to in this
    * session and still pending, or already overruled, isn't raised again.
-   * One the judge sustained is raised again if the mistake recurs.
+   * One the judge sustained is raised again if the mistake recurs. A
+   * pending shadow objection (replayed history, the gate in shadow mode)
+   * was never delivered, so it doesn't silence a delivered one.
    *
    * Each source is read once by one matcher for all active literals; the
    * settled literals are fetched once per scan.
@@ -214,7 +216,7 @@ export class ObjectionLog {
     const { tombstones, matcher } = this.compiled();
     if (tombstones.length === 0) return [];
 
-    const settled = this.settledInSession(sessionId);
+    const settled = this.settledInSession(sessionId, mode === 'deliver');
     const found = new Map<ActiveLiteral, { line: string; source: string }>();
     for (const { source, text } of assertedText(msg)) {
       const hits = matcher.match(text, {
@@ -231,14 +233,18 @@ export class ObjectionLog {
     return raised;
   }
 
-  /** (tb, dead) pairs already objected to in this session and pending, or overruled. */
-  private settledInSession(sessionId: string): Set<string> {
+  /**
+   * (tb, dead) pairs already objected to in this session and pending, or
+   * overruled. When delivering, only delivered pending objections count:
+   * counsel hasn't said what it only recorded.
+   */
+  private settledInSession(sessionId: string, delivering: boolean): Set<string> {
     const rows = this.db
       .prepare(`
         SELECT DISTINCT tb_id, dead FROM objections
-        WHERE session_id = ? AND status IN ('pending', 'overruled')
+        WHERE session_id = ? AND (status = 'overruled' OR (status = 'pending' AND delivered >= ?))
       `)
-      .all(sessionId) as Array<{ tb_id: string; dead: string }>;
+      .all(sessionId, delivering ? 1 : 0) as Array<{ tb_id: string; dead: string }>;
     return new Set(rows.map((r) => settledKey(r.tb_id, r.dead)));
   }
 
