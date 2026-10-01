@@ -10,7 +10,7 @@ import { watch, type FSWatcher } from 'node:fs';
 import { open, stat, type FileHandle } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
-import { basename, dirname, resolve } from 'node:path';
+import { basename, dirname, extname, resolve } from 'node:path';
 import { MessageSchema, type ConversationMessage } from '../types.js';
 
 /** Where a line sits in its log, so id-less formats can derive stable ids. */
@@ -80,7 +80,22 @@ export interface IngestPosition extends TailPosition {
   replay: boolean;
 }
 
+/**
+ * The session a log is named after when its lines don't say: the file's
+ * basename without its extension. Claude Code names each session log
+ * `<session id>.jsonl`, so for Claude Code this is the harness session id.
+ */
+export function logSessionId(filePath: string): string {
+  return basename(filePath, extname(filePath));
+}
+
 export interface TailerOptions {
+  /**
+   * Session for lines whose adapter doesn't parse one. Default: the log's
+   * basename (`logSessionId`). A session id the adapter parses (Claude
+   * Code's `sessionId`) always wins, and becomes the default for the lines
+   * after it.
+   */
   sessionId?: string;
   /** Fixed log format. Omit it and pass `detect` to choose one from the first lines. */
   adapter?: LogAdapter;
@@ -181,7 +196,7 @@ export class Tailer extends EventEmitter {
 
     this.filePath = filePath;
     this.source = resolve(filePath);
-    this.sessionId = options.sessionId || `session_${Date.now()}`;
+    this.sessionId = options.sessionId || logSessionId(filePath);
     this.detector = options.detect ?? null;
     this.adapter = options.adapter ?? (this.detector ? null : new JsonlAdapter());
     this.follow = options.follow ?? true;
@@ -448,6 +463,9 @@ export class Tailer extends EventEmitter {
     const msg = this.adapter!.parseLine(line.text, { source: this.source, offset: line.offset });
     if (!msg) return;
     this.lastReported = line.end;
+    // The harness's own session id (Claude Code's `sessionId`) is the one
+    // receivers route by: keep it, and name the log after the latest one
+    if (msg.sessionId) this.sessionId = msg.sessionId;
     this.emit(
       'message',
       { ...msg, sessionId: this.sessionId },

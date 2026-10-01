@@ -6,6 +6,7 @@ export { StateStore, type StateStoreOptions, type IngestCheckpoint } from './sto
 export {
   Tailer,
   JsonlAdapter,
+  logSessionId,
   type LogAdapter,
   type LineContext,
   type TailerOptions,

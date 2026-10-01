@@ -7,7 +7,7 @@
 
 import { watch, existsSync, statSync, readdirSync, type FSWatcher } from 'node:fs';
 import { join, basename, resolve } from 'node:path';
-import { Tailer, type LogAdapter, type IngestPosition } from '../indexer/tailer.js';
+import { Tailer, logSessionId, type LogAdapter, type IngestPosition } from '../indexer/tailer.js';
 import { getAdapter, matchAdapterFromLines } from '../indexer/adapters.js';
 import { contentId } from '../indexer/ids.js';
 import { StateStore } from '../store/index.js';
@@ -119,7 +119,9 @@ export class Stenographer implements StenographerAPI {
 
   constructor(config: StenographerConfig) {
     this.config = config;
-    this.sessionId = `session_${Date.now()}`;
+    // Until a line names its harness session (Claude Code's sessionId), a
+    // log's session is its basename — stable across restarts, never minted
+    this.sessionId = logSessionId(config.logPath);
     this.store = new StateStore(config.statePath || './stenographer.db');
     this.detector = new ImportanceDetector();
     // Vector candidates come from the persistent index (chunks, session partitions)
@@ -453,6 +455,8 @@ export class Stenographer implements StenographerAPI {
    */
   private async indexMessage(msg: ConversationMessage, position?: IngestPosition): Promise<void> {
     const sessionId = msg.sessionId || this.sessionId;
+    // File modes follow one log: its latest session is the query scope
+    if (this.config.mode !== 'watch') this.sessionId = sessionId;
     const checkpoint = () => {
       if (position) this.saveCheckpoint(position, sessionId);
     };
