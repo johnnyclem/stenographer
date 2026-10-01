@@ -1,0 +1,74 @@
+{
+  "description": "OpenAPPA consult protocol v1, kind=context: the requests an APPA runtime sends to an [externals.context.stenographer] url binding. Wire shape from openappa appa-runtime/src/consult.rs (Consult serializes {version, kind, name, declaration, artifact}; ContextArtifact is {tool, arguments, cwd?}; ContextDeclaration is {}) and appa-runtime/src/external.rs (reqwest POST with .json(), bearer_auth from token_env). The bearer value is replaced with the test server's token.",
+  "requests": [
+    {
+      "name": "bash-asserts-dead-literal",
+      "method": "POST",
+      "path": "/appa/context",
+      "headers": {
+        "content-type": "application/json",
+        "accept": "*/*",
+        "authorization": "Bearer <token>"
+      },
+      "body": {
+        "version": 1,
+        "kind": "context",
+        "name": "stenographer",
+        "declaration": {},
+        "artifact": {
+          "tool": "Bash",
+          "arguments": {
+            "command": "printf 'LOG_BUDGET=30\\n' >> .env && node scripts/limiter.js --impl legacyRateLimiter",
+            "description": "Restore the old log budget"
+          },
+          "cwd": "/work/checkout"
+        }
+      }
+    },
+    {
+      "name": "edit-removes-dead-literal",
+      "method": "POST",
+      "path": "/appa/context",
+      "headers": {
+        "content-type": "application/json",
+        "accept": "*/*",
+        "authorization": "Bearer <token>"
+      },
+      "body": {
+        "version": 1,
+        "kind": "context",
+        "name": "stenographer",
+        "declaration": {},
+        "artifact": {
+          "tool": "Edit",
+          "arguments": {
+            "file_path": "/work/checkout/src/config.ts",
+            "old_string": "export const LOG_BUDGET = 30;",
+            "new_string": "export const LOG_BUDGET = 100;"
+          },
+          "cwd": "/work/checkout"
+        }
+      }
+    },
+    {
+      "name": "unrelated-fetch",
+      "method": "POST",
+      "path": "/appa/context",
+      "headers": {
+        "content-type": "application/json",
+        "accept": "*/*",
+        "authorization": "Bearer <token>"
+      },
+      "body": {
+        "version": 1,
+        "kind": "context",
+        "name": "stenographer",
+        "declaration": {},
+        "artifact": {
+          "tool": "fetch",
+          "arguments": { "url": "https://a.example" }
+        }
+      }
+    }
+  ]
+}

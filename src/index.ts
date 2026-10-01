@@ -16,6 +16,14 @@ export {
 export { type RestServerOptions } from './api/rest.js';
 export { resolveRestToken, restTokenPath, REST_TOKEN_FILE, type RestToken } from './api/auth.js';
 export {
+  answerContextConsult,
+  ContextConsultSchema,
+  type ContextConsult,
+  type ContextAnswer,
+  type ContextHit,
+  type ContestFact,
+} from './api/appa-context.js';
+export {
   OpenAIAdapter,
   AnthropicAdapter,
   ClaudeCodeAdapter,

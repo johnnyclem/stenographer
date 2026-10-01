@@ -7,6 +7,9 @@
  * Query parameters are validated: a malformed one gets 400, an oversized
  * count is clamped.
  *
+ * OpenAPPA context provider (consult protocol v1, ./appa-context.ts):
+ *   POST /appa/context  {version: 1, kind: "context", artifact: {tool, arguments, cwd?}}
+ *
  * Routes:
  *   GET /status
  *   GET /messages?n=10
@@ -33,8 +36,11 @@ import type { Stenographer } from '../core/stenographer.js';
 import { TruthWriteError } from '../truth/ledger.js';
 import { NOTARY_SECRET_HEADER, notarySecretMatches } from '../truth/notary.js';
 import { allowedHostNames, bearerMatches, hostHeaderName, originAllowed } from './auth.js';
+import { ContextConsultSchema, answerContextConsult } from './appa-context.js';
 
 const MAX_BODY_BYTES = 64 * 1024;
+/** A consult carries the whole proposed call (a Write's file content, say). */
+const MAX_CONSULT_BYTES = 1024 * 1024;
 /** Upper bounds for list sizes: larger requests are clamped, not refused. */
 const MAX_K = 200;
 const MAX_MESSAGES = 1000;
@@ -189,6 +195,10 @@ export class RestServer {
     const url = new URL(req.url || '/', 'http://localhost');
     const path = url.pathname.replace(/\/+$/, '') || '/';
 
+    if (req.method === 'POST' && path === '/appa/context') {
+      await this.handleContextConsult(req, res);
+      return;
+    }
     if (req.method === 'POST') {
       await this.handleNotary(req, res, path);
       return;
@@ -286,6 +296,19 @@ export class RestServer {
   }
 
   /**
+   * OpenAPPA context provider: the ledger's facts about one proposed call.
+   * Read-only; the response is exactly `{version: 1, answer}`.
+   */
+  private async handleContextConsult(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const consult = ContextConsultSchema.safeParse(await readJson(req, MAX_CONSULT_BYTES));
+    if (!consult.success) {
+      const issues = consult.error.issues.map((i) => `${i.path.join('.') || 'body'}: ${i.message}`);
+      throw new RequestError(400, `Not a v1 context consult — ${issues.join('; ')}`);
+    }
+    sendJson(res, 200, { version: 1, answer: answerContextConsult(this.engine.store.truth, consult.data.artifact) });
+  }
+
+  /**
    * The notary routes: a person approving (or declining) a proposal from a UI
    * that holds the notary secret. Agents are never given the secret, so this
    * is the path their MCP tools can't take.
@@ -343,12 +366,12 @@ export class RestServer {
   }
 }
 
-async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
+async function readJson(req: IncomingMessage, maxBytes: number = MAX_BODY_BYTES): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of req) {
     size += (chunk as Buffer).length;
-    if (size > MAX_BODY_BYTES) throw new RequestError(413, 'request body too large');
+    if (size > maxBytes) throw new RequestError(413, 'request body too large');
     chunks.push(chunk as Buffer);
   }
   const text = Buffer.concat(chunks).toString('utf8');
