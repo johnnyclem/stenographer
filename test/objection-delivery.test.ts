@@ -8,6 +8,8 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { Stenographer } from '../src/core/stenographer.js';
+import { StenographerServer } from '../src/mcp/server.js';
+import { evaluateGate } from '../src/truth/gate.js';
 import {
   createSinkTransport,
   createMcpChannelTransport,
@@ -585,5 +587,66 @@ describe("Claude Code's built-in channel (MCP notifications/claude/channel)", ()
 
     await client.close();
     await server.close();
+  });
+
+  // STENO-REV-04: every delivered objection in the state file went to the
+  // attached agent, including other sessions' transcript objections and
+  // gate objections their PreToolUse hooks filed in enforce mode.
+  it("pushes only this server's own session's transcript objections, not other sessions' or gate ones", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'steno-channel-'));
+    const log = join(dir, 'log.jsonl');
+    const statePath = join(dir, 'state.db');
+    writeFileSync(log, '');
+    const server = new StenographerServer({
+      logPath: log,
+      statePath,
+      mode: 'live',
+      embeddingModel: 'hashed',
+      objectionMode: 'deliver',
+    });
+    try {
+      await server.engine.start();
+      const client = new Client({ name: 'claude-code', version: 'test' });
+      const received: Array<{ method: string; params: any }> = [];
+      client.fallbackNotificationHandler = async (n) => {
+        received.push(n as any);
+      };
+      const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+      await Promise.all([server.connect(serverSide), client.connect(clientSide)]);
+      const engine = server.engine;
+      await engine.assertTombstone({
+        claim: 'LOG_BUDGET 30 is dead; the budget is 100',
+        evidence: [{ kind: 'commit', ref: 'a1b2c3' }],
+        signedBy: 'johnnyclem',
+        literals: [BUDGET],
+      });
+
+      // This session's transcript
+      appendFileSync(log, assistant('a1', 'LOG_BUDGET = 30'));
+      await settle(engine);
+      // Another session's transcript, on the same state file
+      engine.store.objections.scan(
+        { id: 'b1', role: 'assistant', content: 'set LOG_BUDGET = 30', timestamp: '2026-09-18T10:00:00Z' },
+        'someone-elses-session',
+        'deliver'
+      );
+      // Gate objections in enforce mode: another session's, and this one's
+      for (const session_id of ['someone-elses-session', engine.getSessionId()]) {
+        const gate = evaluateGate(
+          { session_id, tool_name: 'Write', tool_input: { file_path: 'a.ts', content: `export const LOG_BUDGET = 30; // ${session_id}` } },
+          { mode: 'enforce', statePath, timeoutMs: 2000, onError: 'deny', tools: ['Write'] }
+        );
+        expect(gate.decision).toBe('deny');
+      }
+      await settle(engine);
+      await new Promise((r) => setTimeout(r, 20));
+
+      expect(received.map((n) => n.params.meta.session_ids)).toEqual([engine.getSessionId()]);
+      expect(received[0].params.content).toContain('LOG_BUDGET = 30');
+      await client.close();
+    } finally {
+      server.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

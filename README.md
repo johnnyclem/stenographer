@@ -391,7 +391,7 @@ Every objection ships the objection, the exhibit (the full TB, plus any contesti
 
 | Receiver | How it's reached | When it's delivered |
 |---|---|---|
-| Claude Code (built-in channel) | The attached MCP client gets `notifications/claude/channel`; stenographer declares the `claude/channel` capability | As discovered |
+| Claude Code (built-in channel) | The attached MCP client gets `notifications/claude/channel` for the transcript objections of its own session (not other sessions' on the same state file, and not gate objections, whose deny reason the harness already showed); stenographer declares the `claude/channel` capability. Not in `watch` mode | As discovered |
 | smallchat agent-to-agent messaging | `--objection-channel <url>` → `POST <url>/event` on smallchat's channel bridge (`X-Channel-Secret`), relayed into the agent's session | As discovered |
 | Harnesses without interrupts | `--objection-webhook <url>` → `POST {type: "stenographer.objections", objections: [...]}`, signed per [Standard Webhooks](https://www.standardwebhooks.com/) | Once a batch of 3 is pending, or after the oldest has waited 5 minutes |
 

@@ -118,6 +118,8 @@ export class Stenographer implements StenographerAPI {
   private restServer: RestServer | null = null;
   private restAuth: RestToken | null = null;
   private sessionId: string;
+  /** Every session this engine's logs have carried (the current one included). */
+  private sessionsSeen = new Set<string>();
   private indexing: Promise<void> = Promise.resolve();
   private supersedeThreshold: number;
   private truthMode: 'shadow' | 'assert';
@@ -153,6 +155,15 @@ export class Stenographer implements StenographerAPI {
 
   getSessionId(): string {
     return this.sessionId;
+  }
+
+  /**
+   * Whether `sessionId` is one this engine's own logs carry: the current
+   * session, or one a line it indexed named. Other sessions writing to the
+   * same state file (their transcripts, their gate hooks) are not.
+   */
+  carriesSession(sessionId: string): boolean {
+    return sessionId === this.sessionId || this.sessionsSeen.has(sessionId);
   }
 
   // ─────────────────────────────────────────────────────────
@@ -489,6 +500,7 @@ export class Stenographer implements StenographerAPI {
    */
   private async indexMessage(msg: ConversationMessage, position?: IngestPosition): Promise<void> {
     const sessionId = msg.sessionId || this.sessionId;
+    this.sessionsSeen.add(sessionId);
     // File modes follow one log: its latest session is the query scope
     if (this.config.mode !== 'watch') this.sessionId = sessionId;
     const checkpoint = () => {

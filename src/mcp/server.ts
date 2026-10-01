@@ -230,11 +230,15 @@ export class StenographerServer {
     // Objections go to the attached client as channel events the moment
     // they're raised. Watch mode tails many sessions over one connection,
     // so it can't know which objections belong to this client — skip there.
+    // Otherwise only this server's own sessions' transcript objections go
+    // to it: other sessions write objections to the same state file, and a
+    // gate objection's deny reason was already shown by the harness.
     const { config } = this.engine;
     if (config.objectionMcpChannel !== false && config.mode !== 'watch') {
       this.engine.addObjectionTransport(
-        createMcpChannelTransport((params) =>
-          this.server.notification({ method: 'notifications/claude/channel', params })
+        createMcpChannelTransport(
+          (params) => this.server.notification({ method: 'notifications/claude/channel', params }),
+          (objection) => !objection.gate && this.engine.carriesSession(objection.sessionId)
         )
       );
     }
