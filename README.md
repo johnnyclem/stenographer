@@ -451,7 +451,7 @@ It composes with other `PreToolUse` hooks (for example OpenAPPA's policy hook): 
 
 - Paraphrases ("the old budget"), values built at runtime (`30` computed or concatenated), and values split across lines or fields.
 - Content a tool's input doesn't carry. This includes a script that writes the value (`./set-budget.sh`), `cp` of a file that contains it, a download, and an MCP tool whose input fields don't look like content. Unknown tools are read through common content field names (`content`, `new_string`, `file_text`, `code`, patches by their added lines). Pass `--tools` to choose which tools the gate reads.
-- Shell commands are classified, not parsed: `eval`, `find -exec`, aliases and command substitution can hide a write, or show one that isn't there.
+- Shell commands are classified, not parsed: `eval`, aliases, functions and command substitution can hide a write, or show one that isn't there. Searches are let through (`grep`, `rg`, a `find` whose `-exec` only reads); `jq`, `yq`, `sort`, `uniq`, `cut`, `head` and `tail` are read whole when their output goes into a file (a redirect, `yq -i`, `sort -o`, a pipe into `tee` or `sponge`), and a `find`/`fd` `-exec` command is read like a command of its own.
 - Only the first 1,048,576 characters of each field are read.
 - Prose. The gate sees tool calls only; live objections cover what the agent says.
 - Anyone who can edit `settings.json` can remove the hook.

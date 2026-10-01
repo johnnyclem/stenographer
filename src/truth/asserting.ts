@@ -13,7 +13,11 @@
  * quotes, `$(…)` and heredocs kept together, and each simple command is
  * classified by its name:
  *   - searches and viewers (grep, rg, find, cat without a redirect, …),
- *     git and gh: nothing, except environment assignments in front of them;
+ *     git and gh: nothing, except environment assignments in front of them,
+ *     and what a find/fd `-exec` runs (read like a command of its own);
+ *   - jq, yq, sort, uniq, cut, head, tail: the whole command when its
+ *     output goes into a file (redirected, `yq -i`, `sort -o`, piped into
+ *     tee or sponge);
  *   - echo/printf/cat: only when redirected or piped onward;
  *   - sed/perl: only in place (-i), redirected or piped, and only the
  *     replacement side of each s///;
@@ -48,11 +52,15 @@ export function addedLines(patch: string): string {
     .join('\n');
 }
 
+/** Words joined back into one command line, quoted where the shell would need it. */
+const joinWords = (words: string[]): string =>
+  words.map((v) => (/[\s'"\\$`;&|<>]/.test(v) ? `'${v.replace(/'/g, `'\\''`)}'` : v)).join(' ');
+
 const commandText = (value: unknown): string | null =>
   typeof value === 'string'
     ? value
     : Array.isArray(value) && value.every((v) => typeof v === 'string')
-      ? (value as string[]).map((v) => (/[\s'"\\$`;&|<>]/.test(v) ? `'${v.replace(/'/g, `'\\''`)}'` : v)).join(' ')
+      ? joinWords(value as string[])
       : null;
 
 const shellFields = (value: unknown, name: string): AssertedField[] => {
@@ -164,6 +172,20 @@ const SEARCH_COMMANDS = new Set([
   'ls', 'tree', 'stat', 'file', 'wc', 'du', 'head', 'tail', 'less', 'more',
   'sort', 'uniq', 'cut', 'diff', 'cmp', 'jq', 'yq',
 ]);
+/**
+ * Of those, the ones that print what they are given, or a transformation of
+ * it (a jq/yq filter, a here-string): they assert it when it goes into a
+ * file — redirected, in place (`yq -i`, `sort -o`), or piped into a writer.
+ */
+const TRANSFORMERS = new Set(['jq', 'yq', 'sort', 'uniq', 'cut', 'head', 'tail']);
+/** Write what is piped into them to a file. */
+const PIPE_WRITERS = new Set(['tee', 'sponge']);
+/** Options that run a command per result: find's up to `;` or `+`, fd's up to `;` or the end. */
+const EXEC_OPTIONS: Record<string, Set<string>> = {
+  find: new Set(['-exec', '-execdir', '-ok', '-okdir']),
+  fd: new Set(['-x', '--exec', '-X', '--exec-batch']),
+  fdfind: new Set(['-x', '--exec', '-X', '--exec-batch']),
+};
 /** Write only to stdout: they assert something only when it goes somewhere. */
 const STDOUT_COMMANDS = new Set(['echo', 'printf', 'cat']);
 /** Edit with a script whose s/// pattern is the old side. */
@@ -362,21 +384,59 @@ function substitutionReplacements(script: string): string[] | null {
 
 const basename = (s: string): string => s.slice(s.lastIndexOf('/') + 1);
 
-/** What one simple command asserts. */
-function commandAsserts(cmd: SimpleCommand, depth: number): string[] {
-  const out: string[] = [];
+const isAssignment = (word: string): boolean => /^[A-Za-z_][A-Za-z0-9_]*=/.test(word);
+
+/** Index of the command's name: past environment assignments and wrappers. */
+function nameIndex(words: string[]): number {
   let k = 0;
-  for (; k < cmd.words.length; k++) {
-    const w = cmd.words[k];
-    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(w)) out.push(w); // an environment assignment sets a value
-    else if (!WRAPPERS.has(w)) break;
+  while (k < words.length && (isAssignment(words[k]) || WRAPPERS.has(words[k]))) k++;
+  return k;
+}
+
+/** Whether a transformer writes its output to a file itself. */
+function writesInPlace(name: string, args: string[]): boolean {
+  if (name === 'yq') return args.some((a) => /^-[A-Za-z]*i[A-Za-z]*$/.test(a) || a === '--inplace' || a.startsWith('--inplace='));
+  if (name === 'sort') return args.some((a) => /^-[A-Za-z]*o/.test(a) || a.startsWith('--output'));
+  return false;
+}
+
+/** What the commands a find/fd `-exec` runs per result assert, read like commands of their own. */
+function execAsserts(name: string, args: string[], depth: number): string[] {
+  const options = EXEC_OPTIONS[name];
+  if (!options || depth >= 3) return [];
+  const out: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    if (!options.has(args[i])) continue;
+    let end = i + 1;
+    while (end < args.length && args[end] !== ';' && !(name === 'find' && args[end] === '+')) end++;
+    const words = args.slice(i + 1, end);
+    if (words.length > 0) {
+      const run: SimpleCommand = { raw: joinWords(words), words, redirected: false, pipedOut: false, heredocs: [] };
+      out.push(...commandAsserts(run, depth + 1));
+    }
+    i = end;
   }
+  return out;
+}
+
+/** What one simple command asserts; `next` is the command it pipes into, if any. */
+function commandAsserts(cmd: SimpleCommand, depth: number, next?: SimpleCommand): string[] {
+  const k = nameIndex(cmd.words);
+  // An environment assignment sets a value
+  const out = cmd.words.slice(0, k).filter(isAssignment);
   if (k >= cmd.words.length) return out;
   const name = basename(cmd.words[k]);
   const args = cmd.words.slice(k + 1);
+  const pipedToFile =
+    cmd.pipedOut && next !== undefined && PIPE_WRITERS.has(basename(next.words[nameIndex(next.words)] ?? ''));
   const writes = cmd.redirected || cmd.pipedOut;
 
-  if (SEARCH_COMMANDS.has(name)) return out;
+  if (SEARCH_COMMANDS.has(name)) {
+    if (TRANSFORMERS.has(name) && (cmd.redirected || pipedToFile || writesInPlace(name, args))) {
+      return [cmd.raw, ...cmd.heredocs];
+    }
+    return [...out, ...execAsserts(name, args, depth)];
+  }
   if (name === 'git') {
     const sub = args.find((a, i) => !a.startsWith('-') && !['-C', '-c'].includes(args[i - 1] ?? ''));
     if (sub === 'apply' || sub === 'am') out.push(...cmd.heredocs.map(addedLines));
@@ -400,8 +460,9 @@ function commandAsserts(cmd: SimpleCommand, depth: number): string[] {
 }
 
 function shellTexts(command: string, depth: number): string[] {
-  return parseShell(command)
-    .flatMap((cmd) => commandAsserts(cmd, depth))
+  const commands = parseShell(command);
+  return commands
+    .flatMap((cmd, i) => commandAsserts(cmd, depth, commands[i + 1]))
     .filter((text) => text.length > 0);
 }
 

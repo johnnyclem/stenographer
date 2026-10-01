@@ -355,6 +355,40 @@ describe('asserting fields', () => {
   });
 });
 
+// STENO-REV-03: jq, yq, sort, find… were read as searches even when they
+// wrote a file, so these ordinary ways of setting a config value got past
+// the gate in enforce mode (and the live scan, and consults).
+describe('gate: commands that search or transform but write a file', () => {
+  const bash = (command: string) =>
+    evaluateGate({ tool_name: 'Bash', tool_input: { command }, session_id: 's1' }, options());
+
+  it.each([
+    ["yq -i '.LOG_BUDGET = 30' config.yaml"],
+    ["yq eval --inplace '.LOG_BUDGET = 30' config.yaml"],
+    ["jq '.LOG_BUDGET = 30' config.json > config.tmp && mv config.tmp config.json"],
+    ["jq '.LOG_BUDGET = 30' config.json | sponge config.json"],
+    ["sort <<< 'LOG_BUDGET=30' > .env"],
+    ["sort -o .env <<< 'LOG_BUDGET=30'"],
+    ["find . -name config.ts -exec sed -i 's/LOG_BUDGET = 100/LOG_BUDGET = 30/' {} +"],
+    ["find . -name config.ts -execdir sed -i 's/LOG_BUDGET = 100/LOG_BUDGET = 30/' {} \\;"],
+    ["fd config.ts -x sed -i 's/LOG_BUDGET = 100/LOG_BUDGET = 30/'"],
+    ["find . -name '*.env' -exec sh -c 'echo LOG_BUDGET=30 >> \"$1\"' _ {} \\;"],
+  ])('denies %s', (command) => {
+    expect(bash(command).decision).toBe('deny');
+  });
+
+  it.each([
+    ["jq '.LOG_BUDGET' config.json"],
+    ["yq '.LOG_BUDGET' config.yaml"],
+    ["grep -rn 'LOG_BUDGET = 30' src > /tmp/hits.txt"],
+    ["find . -name '*.ts' -exec grep -l 'LOG_BUDGET = 30' {} +"],
+    ["find . -name config.ts -exec sed -i 's/LOG_BUDGET = 30/LOG_BUDGET = 100/' {} +"],
+    ["sort .env | uniq"],
+  ])('lets a search or a fix through: %s', (command) => {
+    expect(bash(command)).toMatchObject({ decision: 'allow', hits: [] });
+  });
+});
+
 describe('gate performance', () => {
   it('decides on 1,000 literals against a 100 KB Write in under 500 ms, opening the state each time', () => {
     const big = join(dir, 'big.db');
