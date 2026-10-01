@@ -133,6 +133,7 @@
 - Indexing is linear in session length (an indexed, embedding-free history read; statements prepared once; `synchronous=NORMAL` under WAL): 1k/4k/10k messages in 0.8/3.0/7.3 s on the test workload, against 2.2/19.7 s for 1k/4k before. (STENO-IDX-15)
 - Importance totals are stored and used by GraphRAG and context frames, as the README describes. (STENO-IDX-23)
 - A shadow objection no longer silences the first live one in its session. Lines a log held at startup are scanned in shadow (STENO-IDX-02), and so are the gate's objections in shadow mode; because counsel doesn't repeat a pending objection, the agent asserting the same dead literal again, live, was never objected to. In `deliver` mode only a delivered pending objection (or an overruled one) now counts as already said.
+- A truth-ledger refusal while indexing a line no longer drops the line. Each line commits in one transaction (STENO-IDX-01), and every ledger write is admitted like a live write (STENO-T-03); a detector proposal the ledger refused (for example one quoting a lone surrogate, which can't be canonicalized for the hash chain) rolled back the message, its decisions and its checkpoint, and the next line's checkpoint moved past it. Detector proposals now commit in their own savepoint, and a refusal is logged.
 - `stenographer verify` and `stenographer gate` no longer add columns to, or chain, a state database written by a newer stenographer.
 
 ### Documentation

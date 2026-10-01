@@ -447,6 +447,22 @@ describe('engine ingestion', () => {
     expect((await e.getObjections()).map((o) => o.messageId)).toEqual(['l1']);
   });
 
+  it('a ledger refusal while indexing a line does not cost the line', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'steno-ingest-'));
+    // A truncated emoji leaves a lone surrogate in the successor decision.
+    // The supersession proposal quoting it can't be canonicalized (RFC 8785),
+    // so the ledger refuses it; the message and its decision are still indexed.
+    writeFileSync(
+      join(dir, 'log.jsonl'),
+      line('m1', 'we decided to use postgres for the main database', '2026-06-09T10:00:00Z') +
+        line('m2', 'we decided to use mysql for the main database \ud83d', '2026-06-09T10:05:00Z')
+    );
+    const e = await run({ mode: 'catchup' });
+    expect((await e.getStatus()).messagesIndexed).toBe(2);
+    const history = await e.getDecisionHistory();
+    expect(history.map((d) => d.sourceMessageId).sort()).toEqual(['m1', 'm2']);
+  });
+
   it('auto-detection waits for the first line of an empty log (IDX-05)', async () => {
     dir = mkdtempSync(join(tmpdir(), 'steno-ingest-'));
     const log = join(dir, 'log.jsonl');

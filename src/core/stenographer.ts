@@ -710,21 +710,23 @@ export class Stenographer implements StenographerAPI {
       });
     } else {
       // Assert mode, unmatched correction: still worth a reviewable proposal
-      this.store.truth.addProposal(
-        {
-          kind: 'tombstone',
-          draft: {
-            claim: `Correction detected: ${correctedStatement}`,
-            evidence: [{ kind: 'message', ref: msg.id, detail: correctedStatement }],
+      this.fileDetectorProposal(msg, () =>
+        this.store.truth.addProposal(
+          {
+            kind: 'tombstone',
+            draft: {
+              claim: `Correction detected: ${correctedStatement}`,
+              evidence: [{ kind: 'message', ref: msg.id, detail: correctedStatement }],
+            },
+            signal: { source: 'supersession-detector', detail: 'correction pattern, no matching decision' },
+            targetRef: `correction:${msg.id}`,
           },
-          signal: { source: 'supersession-detector', detail: 'correction pattern, no matching decision' },
-          targetRef: `correction:${msg.id}`,
-        },
-        {
-          author: DETECTOR_AUTHOR,
-          provenance: { kind: 'sourceMessageId', ref: msg.id },
-          timestamp: msg.timestamp,
-        }
+          {
+            author: DETECTOR_AUTHOR,
+            provenance: { kind: 'sourceMessageId', ref: msg.id },
+            timestamp: msg.timestamp,
+          }
+        )
       );
     }
   }
@@ -776,31 +778,48 @@ export class Stenographer implements StenographerAPI {
     score: number,
     msg: ConversationMessage
   ): void {
-    this.store.truth.addProposal(
-      {
-        kind: 'tombstone',
-        draft: {
-          claim: `"${superseded.description}" is superseded by "${successor.description}"`,
-          evidence: [{ kind: 'message', ref: msg.id, detail: successor.description }],
+    this.fileDetectorProposal(msg, () =>
+      this.store.truth.addProposal(
+        {
+          kind: 'tombstone',
+          draft: {
+            claim: `"${superseded.description}" is superseded by "${successor.description}"`,
+            evidence: [{ kind: 'message', ref: msg.id, detail: successor.description }],
+          },
+          signal: {
+            source: 'supersession-detector',
+            score,
+            threshold: this.supersedeThreshold,
+          },
+          targetRef: `${superseded.id}->${successor.id}`,
+          meta: {
+            supersededDecisionId: superseded.id,
+            successorDecisionId: successor.id,
+            sessionId,
+          },
         },
-        signal: {
-          source: 'supersession-detector',
-          score,
-          threshold: this.supersedeThreshold,
-        },
-        targetRef: `${superseded.id}->${successor.id}`,
-        meta: {
-          supersededDecisionId: superseded.id,
-          successorDecisionId: successor.id,
-          sessionId,
-        },
-      },
-      {
-        author: DETECTOR_AUTHOR,
-        provenance: { kind: 'sourceMessageId', ref: msg.id },
-        timestamp: msg.timestamp,
-      }
+        {
+          author: DETECTOR_AUTHOR,
+          provenance: { kind: 'sourceMessageId', ref: msg.id },
+          timestamp: msg.timestamp,
+        }
+      )
     );
+  }
+
+  /**
+   * Files a detector proposal in its own savepoint, inside the message's
+   * transaction. The ledger admits every entry the way it admits a live
+   * write, and an entry it refuses (one it can't canonicalize, say) must
+   * not cost the record it was derived from: the message, its decisions
+   * and the checkpoint commit without the proposal.
+   */
+  private fileDetectorProposal(msg: ConversationMessage, write: () => unknown): void {
+    try {
+      this.store.transaction(write);
+    } catch (err) {
+      console.error(`⚠️  The ledger refused a proposal derived from message ${msg.id}: ${err instanceof Error ? err.message : err}`);
+    }
   }
 
   /**
