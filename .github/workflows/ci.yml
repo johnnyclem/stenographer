@@ -24,6 +24,16 @@ jobs:
       - run: npm test
       - run: npm run build
       # The OpenAPPA battery: `appa describe --check` against the built
-      # server's tool list, then `appa replay`. Without an appa binary on
-      # the runner it prints a skip and exits 0.
+      # server's tool list, then `appa replay`. The battery is written
+      # against one OpenAPPA release; its installer verifies the archive
+      # against the release's SHA256SUMS. APPA_REQUIRED makes a missing
+      # binary a failure here instead of a skip.
+      - name: Install OpenAPPA (the battery's pinned release)
+        env:
+          APPA_VERSION: v0.30.0
+          APPA_INSTALL_DIR: ${{ runner.temp }}/appa
+        run: curl -fsSL "https://github.com/archestra-ai/OpenAPPA/releases/download/${APPA_VERSION}/appa-install.sh" | sh
       - run: npm run test:openappa
+        env:
+          APPA_BIN: ${{ runner.temp }}/appa/appa
+          APPA_REQUIRED: '1'

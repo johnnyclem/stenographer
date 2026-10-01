@@ -169,8 +169,10 @@ npm run test:openappa
 ```
 
 `run-checks.mjs` finds `appa` on `PATH` (or at `$APPA_BIN`). Without one it
-prints that it skipped and exits 0. With one, for each root under
-`policy-tests/` it runs:
+prints that it skipped and exits 0, unless `APPA_REQUIRED` is set: then it
+fails. CI installs OpenAPPA 0.30.0 with its release installer and sets
+`APPA_REQUIRED`, so the checks always run there. With `appa`, for each
+root under `policy-tests/` it runs:
 
 - `appa describe --config <root>/appa.toml --check --session-tools …`
   with every tool the built server serves in either profile. It fails

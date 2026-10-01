@@ -6,8 +6,10 @@
  * composed config and find a rule for every tool the built server serves
  * (both profiles, passed as --session-tools in Claude Code's spelling), and
  * `appa replay` must get every expected decision. Skips, exit 0, when no
- * appa binary is found: APPA_BIN names one off PATH. The battery is written
- * against OpenAPPA 0.30.0; another version gets a warning, not a skip.
+ * appa binary is found: APPA_BIN names one off PATH. With APPA_REQUIRED set
+ * (CI sets it, after installing the pinned release), a missing binary
+ * fails instead. The battery is written against OpenAPPA 0.30.0; another
+ * version gets a warning, not a skip.
  */
 import { spawnSync } from 'node:child_process';
 import { accessSync, constants, existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -81,6 +83,10 @@ function run(appa, args) {
 async function main() {
   const appa = findAppa();
   if (!appa) {
+    if (process.env.APPA_REQUIRED) {
+      console.error(`test:openappa: no appa binary on PATH or in APPA_BIN, and APPA_REQUIRED is set (OpenAPPA ${PINNED})`);
+      return 1;
+    }
     console.log(`test:openappa: skipped — no appa binary on PATH (OpenAPPA ${PINNED}; APPA_BIN names one elsewhere)`);
     return 0;
   }

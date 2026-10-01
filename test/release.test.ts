@@ -71,6 +71,18 @@ describe('release metadata', () => {
     for (const step of ['npm run lint', 'npm test', 'npm run build']) expect(ci).toContain(step);
   });
 
+  // F13: CI ran test:openappa with no appa on the runner, so it printed a
+  // skip and the battery's replay traces never ran.
+  it('CI installs the pinned OpenAPPA and requires it for test:openappa', () => {
+    const ci = read('.github/workflows/ci.yml');
+    const pinned = /const PINNED = '([^']+)'/.exec(read('integrations/openappa/run-checks.mjs'))?.[1];
+    expect(pinned).toBeTruthy();
+    expect(ci).toContain(`APPA_VERSION: v${pinned}`);
+    expect(ci).toMatch(/releases\/download\/v\$\{APPA_VERSION#v\}\/appa-install\.sh|releases\/download\/\$\{APPA_VERSION\}\/appa-install\.sh/);
+    expect(ci).toMatch(/APPA_REQUIRED:\s*'?1'?/);
+    expect(ci.indexOf('appa-install.sh')).toBeLessThan(ci.indexOf('npm run test:openappa'));
+  });
+
   it('the README badges and requirements match package.json', () => {
     const readme = read('README.md');
     // shields.io escapes a dash in a badge value as --
