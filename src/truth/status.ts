@@ -11,8 +11,8 @@
  *
  * `overrides` makes a TB overridden and nothing takes that back: refuting a
  * contest only removes that contest's contribution (STENO-T-06). A TB is
- * contested while at least one contesting UV is open. `strikes` makes any
- * entry struck, for good.
+ * contested while at least one contesting UV is open and not struck.
+ * `strikes` makes any entry struck, for good.
  *
  * A body may also record a terminal status it arrived with — a wiki line
  * that was already overridden, or a pre-1.0 row. That acts as a floor on
@@ -40,10 +40,11 @@ const TERMINAL: Partial<Record<TruthEntryType, readonly string[]>> = {
 export interface InboundLink {
   type: LinkType;
   /**
-   * The entry the link comes from, with its derived status; null when that
-   * entry isn't in this ledger (a link carried in by a wiki import).
+   * The entry the link comes from, with its derived status and whether it
+   * was struck; null when that entry isn't in this ledger (a link carried
+   * in by a wiki import).
    */
-  from: { type: TruthEntryType; status: string | null } | null;
+  from: { type: TruthEntryType; status: string | null; struck?: boolean } | null;
 }
 
 /** What one inbound link says about its target's status, if anything. */
@@ -51,9 +52,13 @@ function contribution(type: TruthEntryType, link: InboundLink): string | null {
   switch (type) {
     case 'TB':
       if (link.type === 'overrides') return 'overridden';
-      // A contest counts while its UV is open. A contest from a UV this
-      // ledger doesn't hold can't be shown closed, so it still counts.
-      if (link.type === 'contests' && (link.from === null || (link.from.type === 'UV' && link.from.status === 'open'))) {
+      // A contest counts while its UV is open and not struck (inadmissible).
+      // A contest from a UV this ledger doesn't hold can't be shown closed,
+      // so it still counts.
+      if (
+        link.type === 'contests' &&
+        (link.from === null || (link.from.type === 'UV' && link.from.status === 'open' && !link.from.struck))
+      ) {
         return 'contested';
       }
       return null;
@@ -119,7 +124,9 @@ export function deriveAll(
       const fromType = types.get(link.fromId);
       return {
         type: link.type,
-        from: fromType ? { type: fromType, status: derived.get(link.fromId)?.status ?? null } : null,
+        from: fromType
+          ? { type: fromType, status: derived.get(link.fromId)?.status ?? null, struck: derived.get(link.fromId)?.struck ?? false }
+          : null,
       };
     });
     derived.set(entry.id, { status: deriveStatus(entry.type, entry.recorded, links), struck: deriveStruck(links) });

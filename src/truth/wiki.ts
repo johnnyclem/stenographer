@@ -428,7 +428,8 @@ function causeKind(cause: LedgerRecord, targetType: TruthEntryType, status: stri
   if (targetType === 'TB') {
     if (status === 'overridden') return 'override';
     if (status === 'contested') return 'contest';
-    // A contest stopped counting: its UV was resolved
+    // A contest stopped counting: its UV was struck, or resolved
+    if (cause.links.some((l) => l.type === 'strikes')) return 'strike';
     return cause.links.some((l) => l.type === 'verifies') ? 'verify' : 'refute';
   }
   return status === 'verified' ? 'verify' : 'refute';
@@ -458,7 +459,8 @@ function buildStream(ledger: TruthLedger): { lines: WikiLine[]; skipped: Array<{
     if (!type) return;
     const links = (inbound.get(id) ?? []).map((l): InboundLink => {
       const fromType = types.get(l.fromId);
-      return { type: l.type, from: fromType ? { type: fromType, status: derived.get(l.fromId)?.status ?? null } : null };
+      const from = derived.get(l.fromId);
+      return { type: l.type, from: fromType ? { type: fromType, status: from?.status ?? null, struck: from?.struck ?? false } : null };
     });
     derived.set(id, { status: deriveStatus(type, recorded.get(id), links), struck: deriveStruck(links) });
   };

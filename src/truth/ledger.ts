@@ -656,16 +656,18 @@ export class TruthLedger {
       .sort((a, b) => Number(a.type === 'TB') - Number(b.type === 'TB'));
 
     const inbound = this.db.prepare(`
-      SELECT l.link_type, e.type AS from_type, e.status AS from_status
+      SELECT l.link_type, e.type AS from_type, e.status AS from_status, e.struck AS from_struck
       FROM truth_links l LEFT JOIN truth_entries e ON e.id = l.from_id
       WHERE l.to_id = ?
     `);
     const update = this.db.prepare('UPDATE truth_entries SET status = ?, struck = ? WHERE id = ?');
     for (const row of rows) {
-      const links = (inbound.all(row.id) as Array<{ link_type: string; from_type: string | null; from_status: string | null }>).map(
+      const links = (
+        inbound.all(row.id) as Array<{ link_type: string; from_type: string | null; from_status: string | null; from_struck: number | null }>
+      ).map(
         (l): InboundLink => ({
           type: l.link_type as LinkType,
-          from: l.from_type ? { type: l.from_type as TruthEntryType, status: l.from_status } : null,
+          from: l.from_type ? { type: l.from_type as TruthEntryType, status: l.from_status, struck: Boolean(l.from_struck) } : null,
         })
       );
       const status = deriveStatus(row.type as TruthEntryType, recordedStatus(JSON.parse(row.body)), links);
@@ -1483,8 +1485,12 @@ export class TruthLedger {
       .all() as any[];
     return rows.map((r) => {
       const tb = this.rowToEntry(r) as TbEntry;
+      // A struck UV is inadmissible: it contests nothing
       const contests = this.db
-        .prepare(`SELECT from_id FROM truth_links WHERE to_id = ? AND link_type = 'contests'`)
+        .prepare(`
+          SELECT l.from_id FROM truth_links l JOIN truth_entries e ON e.id = l.from_id
+          WHERE l.to_id = ? AND l.link_type = 'contests' AND e.struck = 0
+        `)
         .all(tb.id) as Array<{ from_id: string }>;
       const contestedBy = contests
         .map((c) => this.getEntry(c.from_id) as UvEntry)

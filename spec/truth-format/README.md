@@ -93,7 +93,7 @@ A status change is never an edit. It is an appended TRANSITION line. Stenographe
 | A UV that contests a TB | TB → `contested` |
 | An addendum that overrides a TB | TB → `overridden` |
 | An addendum that verifies or refutes a UV | UV → `verified` / `refuted`; a TB it contested → `active` again, unless another contest is open or it was overridden |
-| A strike | entry → `struck` |
+| A strike | entry → `struck`; a TB the struck UV contested → `active` again (cause `strike`), unless another contest is open or it was overridden |
 
 ## Status is a fold
 

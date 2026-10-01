@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { StateStore } from '../src/store/index.js';
 import { TruthLedger, TruthWriteError, ContemptError } from '../src/truth/ledger.js';
+import { exportWikiEntries } from '../src/truth/wiki.js';
 import type { Evidence, TbEntry } from '../src/truth/types.js';
 
 const commandEvidence: Evidence[] = [
@@ -399,6 +400,60 @@ describe('TruthLedger', () => {
     const addendum = ledger.getEntry(overrideLinks[0].fromId)!;
     expect(addendum.type).toBe('ADDENDUM');
     expect(addendum.author).toBe('alex');
+  });
+});
+
+// F14: a struck contesting UV still counted as an open contest, so striking
+// an inadmissible contest left the TB contested, citing the struck UV.
+describe('a struck contest', () => {
+  let store: StateStore;
+  beforeEach(() => {
+    store = new StateStore(':memory:');
+  });
+  afterEach(() => store.close());
+
+  const contestedTb = () => {
+    const ledger = store.truth;
+    const tb = ledger.assertTombstone({ claim: 'LOG_BUDGET is 100', evidence: commitEvidence, signedBy: 'johnny' }, { author: 'johnny' });
+    const contest = (assertion: string) =>
+      ledger.assertUv(
+        { assertion, basis: 'a dashboard', verifyBy: { kind: 'ask', value: 'ops' }, contests: tb.id },
+        { author: 'alex' }
+      );
+    return { ledger, tb, contest };
+  };
+  const statusOf = (id: string) => (store.truth.getEntry(id)!.body as { status: string }).status;
+
+  it('no longer contests: the TB is active again, and nothing cites the struck UV', () => {
+    const { ledger, tb, contest } = contestedTb();
+    const uv = contest('LOG_BUDGET is 30 in staging');
+    expect(statusOf(tb.id)).toBe('contested');
+    ledger.fileRuling({ kind: 'strike', opinion: 'inadmissible: no evidence', target: uv.id }, { author: 'kim' });
+    expect(statusOf(tb.id)).toBe('active');
+    expect(ledger.getContested()).toEqual([]);
+    expect(ledger.verify().ok).toBe(true);
+  });
+
+  it('leaves the TB contested while another contest is open, citing only that one', () => {
+    const { ledger, tb, contest } = contestedTb();
+    const struck = contest('LOG_BUDGET is 30 in staging');
+    const open = contest('LOG_BUDGET is 30 in prod');
+    ledger.fileRuling({ kind: 'strike', opinion: 'inadmissible: no evidence', target: struck.id }, { author: 'kim' });
+    expect(statusOf(tb.id)).toBe('contested');
+    expect(ledger.getContested().map((c) => c.contestedBy.map((u) => u.id))).toEqual([[open.id]]);
+  });
+
+  it('travels: the stream has the TB back to active, caused by the strike', () => {
+    const { ledger, tb, contest } = contestedTb();
+    const uv = contest('LOG_BUDGET is 30 in staging');
+    const { ruling } = ledger.fileRuling({ kind: 'strike', opinion: 'inadmissible: no evidence', target: uv.id }, { author: 'kim' });
+    const lines = exportWikiEntries(ledger).lines.map((l) => JSON.parse(l));
+    const transitions = lines.filter((l) => l.type === 'TRANSITION').map((l) => [l.target, l.status, l.cause.kind, l.cause.ref]);
+    expect(transitions).toEqual([
+      [tb.id, 'contested', 'contest', uv.id],
+      [uv.id, 'struck', 'strike', ruling.id],
+      [tb.id, 'active', 'strike', ruling.id],
+    ]);
   });
 });
 

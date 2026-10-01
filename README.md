@@ -280,7 +280,7 @@ Five record types live in one append-only, hash-chained ledger (`truth_entries`,
 - **`UV`** — unverified assertion ("there be dragons"): believed true, stated before verification exists, with a machine-actionable `verifyBy` hint.
 - **`PROPOSAL`** — what the supersession detector now emits. Signing mints the TB/UV; dismissing costs nothing, so thresholds can be tuned for recall.
 - **`ADDENDUM`** — evidence attached after the fact (UV resolutions, TB overrides).
-- **`RULING`** — a signed judgment with a required written opinion: `strike` (inadmissible, never deleted), `promotion` (evidence ruled sufficient), `contempt` (self-corroboration called out — mints one conduct TB, no karma system), `dismissal` (a proposal declined, with the reason).
+- **`RULING`** — a signed judgment with a required written opinion: `strike` (inadmissible, never deleted; a struck UV no longer contests its TB), `promotion` (evidence ruled sufficient), `contempt` (self-corroboration called out — mints one conduct TB, no karma system), `dismissal` (a proposal declined, with the reason).
 
 The ledger also writes `MARKER` entries about itself; today the only one is `chained-at-migration` (see [Ledger integrity](#ledger-integrity)).
 
