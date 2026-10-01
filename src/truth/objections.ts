@@ -12,7 +12,9 @@
  * v1 is precision over recall: only tombstoned *literals* (numeric
  * constants, identifiers, config values declared on the TB) are matched,
  * only in assistant output (generated code and concrete plans), and only
- * the new side of an edit. Not paraphrases, not vibes.
+ * what a tool call asserts: the new side of an edit, a written file, a
+ * shell command that writes (asserting.ts). Not searches, not commit
+ * messages, not paraphrases. The matcher lives in literal-matcher.ts.
  *
  * Objections themselves are operational state, not truth: the log lives
  * beside the ledger, and only the *ruling* on an objection enters the
@@ -23,6 +25,10 @@ import type Database from 'better-sqlite3';
 import { ulid, type TbEntry, type UvEntry, type TombstonedLiteral } from './types.js';
 import type { TruthLedger } from './ledger.js';
 import type { ConversationMessage } from '../types.js';
+import { LiteralMatcher } from './literal-matcher.js';
+import { assertingFields } from './asserting.js';
+
+export { findLiteralHits } from './literal-matcher.js';
 
 export type ObjectionMode = 'off' | 'shadow' | 'deliver';
 export type ObjectionStatus = 'pending' | 'sustained' | 'overruled';
@@ -60,138 +66,120 @@ export interface ObjectionStats {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Literal matching
+// What a message asserts
 // ─────────────────────────────────────────────────────────────
 
-/** How far after a subject a dead value may appear (`LOG_BUDGET = 30`, "log budget to 30"). */
-const AFTER_SUBJECT_WINDOW = 40;
-/** How far before a subject (`30 as the log budget`). */
-const BEFORE_SUBJECT_WINDOW = 20;
-const MAX_LINE_LENGTH = 500;
-
-function escapeRegExp(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
 /**
- * Subject pattern that tolerates naming-convention drift: "logBudget",
- * "LOG_BUDGET", "log-budget", and "log budget" all match subject
- * "logBudget". Word-bounded, so "maxLogBudget" and "LOG_BUDGET_MAX" don't.
- */
-function subjectRegExp(subject: string): RegExp {
-  const words = subject
-    .split(/[\s_\-.]+|(?<=[a-z0-9])(?=[A-Z])/)
-    .filter(Boolean)
-    .map(escapeRegExp);
-  return new RegExp(`(?<![A-Za-z0-9_])${words.join('[\\s_\\-.]*')}(?![A-Za-z0-9_])`, 'gi');
-}
-
-/** Exact, case-sensitive token: "30" doesn't match "300" or "30.5". */
-function valueRegExp(value: string): RegExp {
-  return new RegExp(`(?<![A-Za-z0-9_.])${escapeRegExp(value)}(?![A-Za-z0-9_]|\\.\\d)`, 'g');
-}
-
-function spans(re: RegExp, text: string): Array<[number, number]> {
-  return [...text.matchAll(re)].map((m) => [m.index!, m.index! + m[0].length]);
-}
-
-/**
- * Returns the lines of `text` that assert a tombstoned literal. A line
- * that also mentions the replacement is discussing the change ("bumped
- * LOG_BUDGET from 30 to 100"), not asserting the dead value, and is skipped.
- */
-export function findLiteralHits(text: string, literal: TombstonedLiteral): string[] {
-  const dead = valueRegExp(literal.dead);
-  const current = literal.current ? valueRegExp(literal.current) : null;
-  const subject = literal.subject ? subjectRegExp(literal.subject) : null;
-  const hits: string[] = [];
-
-  for (const line of text.split('\n')) {
-    const deadSpans = spans(dead, line);
-    if (deadSpans.length === 0) continue;
-    if (current && spans(current, line).length > 0) continue;
-
-    if (subject) {
-      const near = spans(subject, line).some(([sStart, sEnd]) =>
-        deadSpans.some(
-          ([dStart, dEnd]) =>
-            (dStart >= sEnd && dStart - sEnd <= AFTER_SUBJECT_WINDOW) ||
-            (dEnd <= sStart && sStart - dEnd <= BEFORE_SUBJECT_WINDOW)
-        )
-      );
-      if (!near) continue;
-    }
-    hits.push(line.trim().slice(0, MAX_LINE_LENGTH));
-  }
-  return hits;
-}
-
-/**
- * The text an assistant message asserts: its prose plus the string inputs
- * of its tool calls. Keys naming the *old* side of an edit (`old_string`,
- * `oldText`, ...) are skipped — replacing a dead value is the fix, not the
- * mistake.
+ * The text an assistant message asserts: its prose plus what its tool calls
+ * assert (asserting.ts): the new side of an edit, a written file, a shell
+ * command that writes. Searches, reads, commit messages and keys naming the
+ * *old* side of an edit are skipped — looking for a dead value, or
+ * replacing it, is the fix, not the mistake.
  */
 export function assertedText(msg: ConversationMessage): Array<{ source: string; text: string }> {
   const out: Array<{ source: string; text: string }> = [];
   if (msg.content) out.push({ source: 'text', text: msg.content });
-
-  const collect = (value: unknown, source: string, depth: number): void => {
-    if (depth > 4) return;
-    if (typeof value === 'string') {
-      out.push({ source, text: value });
-    } else if (Array.isArray(value)) {
-      for (const v of value) collect(v, source, depth + 1);
-    } else if (value && typeof value === 'object') {
-      for (const [key, v] of Object.entries(value)) {
-        if (/^old/i.test(key)) continue;
-        collect(v, source, depth + 1);
-      }
-    }
-  };
   for (const call of msg.toolCalls ?? []) {
-    collect(call.input, `tool:${call.name}`, 0);
+    for (const { text } of assertingFields(call.name, call.input)) out.push({ source: `tool:${call.name}`, text });
   }
   return out;
+}
+
+// ─────────────────────────────────────────────────────────────
+// The objections table
+// ─────────────────────────────────────────────────────────────
+
+const OBJECTIONS_TABLE = (name: string) => `
+  CREATE TABLE IF NOT EXISTS ${name} (
+    id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    tb_id TEXT NOT NULL,
+    dead TEXT NOT NULL,
+    record TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    delivered INTEGER NOT NULL DEFAULT 0,
+    ruling_id TEXT,
+    UNIQUE(session_id, message_id, tb_id, dead)
+  )`;
+const SESSION_KEY = /UNIQUE\s*\(\s*session_id\s*,\s*message_id\s*,\s*tb_id\s*,\s*dead\s*\)/i;
+
+/**
+ * Creates the objections table, or moves a 0.x one (unique on message id,
+ * so an id-less adapter's line hash collided across sessions — STENO-T-14)
+ * to the per-session key, rows included.
+ */
+export function ensureObjectionSchema(db: Database.Database): void {
+  db.exec(OBJECTIONS_TABLE('objections'));
+  const outdated = () => {
+    const row = db.prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'objections'`).get() as
+      | { sql: string }
+      | undefined;
+    return Boolean(row && !SESSION_KEY.test(row.sql));
+  };
+  if (outdated()) {
+    const migrate = () => {
+      // Checked again under the write lock: another process may have just migrated
+      if (!outdated()) return;
+      db.exec(`
+        ${OBJECTIONS_TABLE('objections_next')};
+        INSERT INTO objections_next (id, created_at, session_id, message_id, tb_id, dead, record, status, delivered, ruling_id)
+          SELECT id, created_at, session_id, message_id, tb_id, dead, record, status, delivered, ruling_id FROM objections;
+        DROP TABLE objections;
+        ALTER TABLE objections_next RENAME TO objections;
+      `);
+    };
+    if (db.inTransaction) migrate();
+    else db.transaction(migrate).immediate();
+  }
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_objections_key ON objections(session_id, tb_id, dead);
+  `);
 }
 
 // ─────────────────────────────────────────────────────────────
 // Detector + log
 // ─────────────────────────────────────────────────────────────
 
+/** One active literal, as the matcher knows it. */
+interface ActiveLiteral {
+  tb: TbEntry;
+  literal: TombstonedLiteral;
+  /** Ledger order (TB, then literal): the order objections are raised in. */
+  order: number;
+}
+
+/** The active TBs and their literals, compiled into one matcher. */
+export interface CompiledTombstones {
+  tombstones: TbEntry[];
+  matcher: LiteralMatcher<ActiveLiteral>;
+}
+
+/** Compiles the literals of `tombstones` (in order) into one matcher. */
+export function compileTombstones(tombstones: TbEntry[]): CompiledTombstones {
+  const literals = tombstones.flatMap((tb) => (tb.body.literals ?? []).map((literal) => ({ tb, literal })));
+  return { tombstones, matcher: new LiteralMatcher(literals.map((l, order) => ({ key: { ...l, order }, literal: l.literal }))) };
+}
+
 export class ObjectionLog {
   private db: Database.Database;
   private ledger: TruthLedger;
-  private cache: { generation: string; tombstones: TbEntry[] } | null = null;
+  private cache: ({ generation: string } & CompiledTombstones) | null = null;
 
   constructor(db: Database.Database, ledger: TruthLedger) {
     this.db = db;
     this.ledger = ledger;
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS objections (
-        id TEXT PRIMARY KEY,
-        created_at TEXT NOT NULL,
-        session_id TEXT NOT NULL,
-        message_id TEXT NOT NULL,
-        tb_id TEXT NOT NULL,
-        dead TEXT NOT NULL,
-        record TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'pending',
-        delivered INTEGER NOT NULL DEFAULT 0,
-        ruling_id TEXT,
-        UNIQUE(message_id, tb_id, dead)
-      );
-      CREATE INDEX IF NOT EXISTS idx_objections_key ON objections(session_id, tb_id, dead);
-    `);
+    ensureObjectionSchema(db);
   }
 
-  /** The active-TB cache: rebuilt only when the ledger's generation moves. */
-  private matchableTombstones(): TbEntry[] {
+  /** The active-TB matcher: recompiled only when the ledger's generation moves. */
+  compiled(): CompiledTombstones {
     const generation = this.ledger.generation();
     if (!this.cache || this.cache.generation !== generation) {
-      this.cache = { generation, tombstones: this.ledger.getMatchableTombstones() };
+      this.cache = { generation, ...compileTombstones(this.ledger.getMatchableTombstones()) };
     }
-    return this.cache.tombstones;
+    return this.cache;
   }
 
   /**
@@ -202,50 +190,46 @@ export class ObjectionLog {
    * Counsel doesn't repeat itself: a literal already objected to in this
    * session and still pending, or already overruled, isn't raised again.
    * One the judge sustained is raised again if the mistake recurs.
+   *
+   * Each source is read once by one matcher for all active literals; the
+   * settled literals are fetched once per scan.
    */
   scan(msg: ConversationMessage, sessionId: string, mode: ObjectionMode): Objection[] {
     if (mode === 'off' || msg.role !== 'assistant') return [];
-    const tombstones = this.matchableTombstones();
+    const { tombstones, matcher } = this.compiled();
     if (tombstones.length === 0) return [];
 
-    const sources = assertedText(msg);
+    const settled = this.settledInSession(sessionId);
+    const found = new Map<ActiveLiteral, { line: string; source: string }>();
+    for (const { source, text } of assertedText(msg)) {
+      const hits = matcher.match(text, {
+        skip: (key) => found.has(key) || settled.has(settledKey(key.tb.id, key.literal.dead)),
+      });
+      for (const hit of hits) found.set(hit.key, { line: hit.line, source });
+    }
+
     const raised: Objection[] = [];
-
-    for (const tb of tombstones) {
-      for (const literal of tb.body.literals ?? []) {
-        if (this.isSettledInSession(sessionId, tb.id, literal.dead)) continue;
-
-        let hit: { line: string; source: string } | null = null;
-        for (const { source, text } of sources) {
-          const lines = findLiteralHits(text, literal);
-          if (lines.length > 0) {
-            hit = { line: lines[0], source };
-            break;
-          }
-        }
-        if (!hit) continue;
-
-        const objection = this.record(msg, sessionId, tb, literal, hit, mode === 'deliver');
-        if (objection) raised.push(objection);
-      }
+    for (const [key, hit] of [...found].sort(([a], [b]) => a.order - b.order)) {
+      const objection = this.record(sessionId, msg.id, key.tb, key.literal, hit, mode === 'deliver');
+      if (objection) raised.push(objection);
     }
     return raised;
   }
 
-  private isSettledInSession(sessionId: string, tbId: string, dead: string): boolean {
-    const row = this.db
+  /** (tb, dead) pairs already objected to in this session and pending, or overruled. */
+  private settledInSession(sessionId: string): Set<string> {
+    const rows = this.db
       .prepare(`
-        SELECT 1 FROM objections
-        WHERE session_id = ? AND tb_id = ? AND dead = ? AND status IN ('pending', 'overruled')
-        LIMIT 1
+        SELECT DISTINCT tb_id, dead FROM objections
+        WHERE session_id = ? AND status IN ('pending', 'overruled')
       `)
-      .get(sessionId, tbId, dead);
-    return Boolean(row);
+      .all(sessionId) as Array<{ tb_id: string; dead: string }>;
+    return new Set(rows.map((r) => settledKey(r.tb_id, r.dead)));
   }
 
   private record(
-    msg: ConversationMessage,
     sessionId: string,
+    messageId: string,
     tb: TbEntry,
     literal: TombstonedLiteral,
     hit: { line: string; source: string },
@@ -275,7 +259,7 @@ export class ObjectionLog {
           (id, created_at, session_id, message_id, tb_id, dead, record, status, delivered)
         VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
       `)
-      .run(id, createdAt, sessionId, msg.id, tb.id, literal.dead, JSON.stringify(record), delivered ? 1 : 0);
+      .run(id, createdAt, sessionId, messageId, tb.id, literal.dead, JSON.stringify(record), delivered ? 1 : 0);
     // Re-tailing the same message is idempotent
     return result.changes > 0 ? this.get(id) : null;
   }
@@ -348,3 +332,5 @@ function rowToObjection(row: any): Objection {
     rulingId: row.ruling_id ?? null,
   };
 }
+
+const settledKey = (tbId: string, dead: string): string => `${tbId}\u0000${dead}`;

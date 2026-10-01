@@ -27,6 +27,9 @@
 - **One admission check for every ledger write.** `TruthLedger` validates each entry before it is appended, whichever path it came from: accountable (and, off their own paths, non-reserved) author and signer, a body of its type's shape, and only links its type writes, at entries of the type the link means. Library code that appended unusual entries through the ledger's public methods may now get a `TruthWriteError`.
 - **Proposal intake reads the suite PROPOSAL envelope** (truth format v2): `{schemaVersion: 2, seq, type: "PROPOSAL", id, ts, author, kind: "tb"|"uv", draft, targetRef, signal: {source: "compaction-candidate"|"agent"|"detector:<name>"}, prevHash, hash}`. Envelope lines are hash-checked and chained, and filed once per id whatever became of the proposal. Tombstone drafts keep their `literals` (both dialects). The older dialects are still read.
 - **MCP annotations:** `export_wiki_entries` is no longer `destructiveHint`; both wiki tools are `idempotentHint`.
+- **Objections read only what a tool call asserts** (STENO-T-12). Before, every string in every tool call's input was scanned except keys starting with `old`. Now only asserting fields are read. These are Write `content`; the new side of Edit, MultiEdit and NotebookEdit; the parts of a shell command that write (environment assignments, redirected `echo`/`printf`/`cat` and heredocs, the replacement side of an in-place `sed`/`perl` `s///`, `bash -c` scripts, and other commands as written); and the added lines of `apply_patch`. Tools stenographer doesn't know are read through content-like field names (`content`, `new_string`, `new_str`, `file_text`, `code`, …; `patch`/`diff` by their added lines). Read, Grep, Glob, WebFetch, WebSearch, TodoWrite and Task inputs, shell searches (`grep`, `rg`, `find`, …), `git` and `gh` commands (commit messages included), `echo` without a redirect and `sed` without `-i` no longer raise objections.
+- **The literal matcher works by clause** (STENO-T-12). A mention of the replacement value now skips only its own clause, not the whole line. A clause ends at `;`, `&&`, `||`, `//`, ` # ` or the start of another assignment, so `LOG_BUDGET = 30; MAX_RETRIES = 100` now objects. Negated and past-tense mentions ("do not set LOG_BUDGET to 30", "we removed legacyRateLimiter", "LOG_BUDGET was 30", "the old LOG_BUDGET of 30") no longer object. Subjects split acronyms (`maxHTTPRetries` matches `MAX_HTTP_RETRIES`), and an identifier literal now matches after a `.` (`this.legacyRateLimiter`). For a line over 500 characters, the quoted transcript line is an excerpt around the value instead of the line's first 500 characters. Only the first 1,048,576 characters of each text are scanned.
+- **Objections are unique per session** (STENO-T-14). The `objections` table's unique key is `(session_id, message_id, tb_id, dead)`, not `(message_id, tb_id, dead)`. An existing table is rebuilt with the new key, rows kept, the first time a 1.0 stenographer opens it.
 
 ### Added
 
@@ -43,6 +46,8 @@
 - `--wiki-dir` on `stenographer start`, and `StenographerConfig.wikiDir`.
 - Library: `decodeWikiLine`, `checkWikiChain`, `wikiLineHash`, `wikiLineTexts`, `WIKI_SCHEMA_VERSION`, `WIKI_STATUSES`, `CAUSE_KINDS`, `WIKI_SYNC_DETECTOR`, `resolveWikiFile`, `readWikiFile`, `appendWikiFile`, `defaultWikiDir`, `WikiPathError`; `TruthLedger.importChange`, `getChainedRecords`, `atomically`, `proposalsFor`, `cacheEmbedding`.
 - Dev dependencies `ajv` and `ajv-formats`, to validate the fixtures against the JSON Schema in tests.
+- The literal matcher used by objections: `LiteralMatcher` (all literals compiled into one Aho-Corasick automaton, with an optional deadline), `MatchDeadlineError`, `MAX_SCANNED_CHARS`. Also `assertingFields`, `shellAssertingText`, `addedLines`, `compileTombstones` and `ensureObjectionSchema`.
+- `test/fixtures/literal-corpus.json`: a golden false-positive/false-negative corpus for the matcher.
 
 ### Fixed
 
@@ -56,7 +61,11 @@
 - Strikes, overrides, contests and resolutions now reach teammates' ledgers, and re-importing a file after them raises no conflicts, files no duplicate proposals and mints no second TB (STENO-T-07).
 - One bad line no longer leaves a partial import and an exception (STENO-T-09): the file is rolled back and the result lists every bad line.
 - Imported entries are embedded, and entries without an embedding get one when search or the verification queue reaches them, so `search_truth` no longer ranks team truth at relevance 0 (STENO-T-10).
+- Objection scanning no longer stalls indexing on large messages (STENO-T-13). Every active literal compiles into one matcher per ledger generation. Each text is read once, the settled literals are fetched once per scan instead of once per literal, and nothing is re-split or recompiled per literal. In the test suite, 1,000 literals against a 100 KB Write scan in about 10 ms. The same test took about 660 ms before, and the test fails above 150 ms.
+- The same assistant line in a second session is objected to there too (STENO-T-14). Before, a message id from an adapter without native ids collided across sessions, and the second session was never warned.
+- Searching for a dead value, committing its removal, or saying not to use it no longer raises an objection; `LOG_BUDGET = 30; MAX_RETRIES = 100`, `ENABLE_CACHE=false; DEBUG=true` and `MAX_HTTP_RETRIES = 5` (subject `maxHTTPRetries`) now do (STENO-T-12).
 
 ### Documentation
 
+- README: "Real-time objections" describes the clause rules and asserting fields.
 - README: "Notarization, identity and the threat model". It covers what the agent profile protects (an agent limited to an agent-profile MCP connection) and what it does not: anything running as the operator's user can read the notary secret, change the profile, or drive the terminal notary through a pseudo-terminal (STENO-T-20, STENO-T-21).

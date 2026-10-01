@@ -92,13 +92,24 @@ export {
 } from './truth/intake.js';
 export {
   ObjectionLog,
-  findLiteralHits,
   assertedText,
+  compileTombstones,
+  ensureObjectionSchema,
+  type CompiledTombstones,
   type Objection,
   type ObjectionMode,
   type ObjectionStatus,
   type ObjectionStats,
 } from './truth/objections.js';
+export {
+  LiteralMatcher,
+  findLiteralHits,
+  MatchDeadlineError,
+  MAX_SCANNED_CHARS,
+  type LiteralHit,
+  type MatchOptions,
+} from './truth/literal-matcher.js';
+export { assertingFields, shellAssertingText, addedLines, type AssertedField } from './truth/asserting.js';
 export {
   ObjectionDispatcher,
   createSinkTransport,

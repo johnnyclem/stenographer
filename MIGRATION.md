@@ -124,3 +124,20 @@ If you use a signer registry, list your teammates in it: with one, a TB from the
 - Consumers of the format (short-hand, smallchat, smallchat-swift): follow `spec/truth-format/README.md`, and run `spec/truth-format/fixtures/` in your tests. A line's current status is its latest TRANSITION's, else the entry line's own `status`; unknown statuses fail closed.
 - Proposal files: write the v2 PROPOSAL envelope (`kind: "tb"|"uv"`, `signal.source: "compaction-candidate"|"agent"|"detector:<name>"`, chained with `seq`, `prevHash`, `hash`). The bare short-hand dialect and `shorthand-compaction` are still read.
 
+## Objections
+
+### Existing state files
+
+The `objections` table is rebuilt the first time 1.0 opens it, with `(session_id, message_id, tb_id, dead)` as its unique key instead of `(message_id, tb_id, dead)`. Rows are kept. Nothing to do. If you query the table directly: the same message id can now appear once per session.
+
+### What raises an objection
+
+Objections now read only what a tool call asserts (see the README's "Real-time objections"). If you relied on objections raised by searches, reads, commit messages or `echo` to the terminal, those were false positives and stop. A tool of your own is read through content-like field names (`content`, `new_string`, `new_str`, `file_text`, `code`, `patch`, …). If yours carries new content under another name, objections won't see it.
+
+The matcher now works by clause. Literals you tuned around the old "a line that mentions `current` never objects" rule may object more on lines like `LOG_BUDGET = 30; MAX_RETRIES = 100`, and less on negated prose. Before you rely on a literal, run `findLiteralHits(text, literal)` on real snippets.
+
+### Library users
+
+- `findLiteralHits` keeps its signature. It now lives in `literal-matcher.ts` (re-exported from `objections.ts` and the package root). For many literals, compile one `LiteralMatcher`.
+- `assertedText(msg)` returns only asserting text (see above). `assertingFields(toolName, input)` gives the same per tool call, field by field.
+- `ObjectionLog.scan` is unchanged. `ObjectionLog.compiled()` exposes the cached matcher.
