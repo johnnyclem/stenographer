@@ -122,7 +122,7 @@ export const MIGRATIONS: Migration[] = [
   // same transaction as each message so a restart resumes exactly there.
   (db) => {
     db.exec(`
-      CREATE TABLE ingest_checkpoints (
+      CREATE TABLE IF NOT EXISTS ingest_checkpoints (
         source TEXT PRIMARY KEY,
         dev TEXT NOT NULL,
         inode TEXT NOT NULL,
@@ -203,13 +203,24 @@ export function assertSchemaSupported(db: Database.Database, supported: number =
 /**
  * Brings the database up to SCHEMA_VERSION. Refuses a database written by a
  * newer build rather than guessing at a schema it doesn't know.
+ *
+ * Several processes may open one state file at once (two sessions starting,
+ * `stenographer proposals` while the server starts). Each step takes the
+ * write lock first (IMMEDIATE) and reads the version again under it, so a
+ * step another process applied since is skipped, never re-run, and the
+ * version is never written back lower.
  */
 export function migrate(db: Database.Database, migrations: Migration[] = MIGRATIONS): void {
-  const current = assertSchemaSupported(db, migrations.length);
-  for (let version = current; version < migrations.length; version++) {
-    db.transaction(() => {
+  // Read without the write lock: an up-to-date database (most opens) takes none
+  if (assertSchemaSupported(db, migrations.length) === migrations.length) return;
+  for (;;) {
+    const done = db.transaction(() => {
+      const version = assertSchemaSupported(db, migrations.length);
+      if (version === migrations.length) return true;
       migrations[version](db);
       db.pragma(`user_version = ${version + 1}`);
-    })();
+      return false;
+    }).immediate();
+    if (done) return;
   }
 }

@@ -2,9 +2,12 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import Database from 'better-sqlite3';
+import * as sqliteVec from 'sqlite-vec';
 import { StateStore } from '../src/store/index.js';
-import { SCHEMA_VERSION } from '../src/store/migrations.js';
+import { SCHEMA_VERSION, MIGRATIONS, migrate, type Migration } from '../src/store/migrations.js';
 import { verifyStateFile } from '../src/truth/verify-cli.js';
 import { evaluateGate, DEFAULT_GATE_TOOLS } from '../src/truth/gate.js';
 
@@ -31,6 +34,59 @@ const tables = (db: Database.Database): string[] =>
 
 const tableSql = (db: Database.Database, name: string): string =>
   (db.prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?`).get(name) as { sql: string }).sql;
+
+/**
+ * Runs `race` right after `db` first reads something matching `pattern`
+ * (a pragma or a query): another process acting between this connection's
+ * read and its write.
+ */
+function raceAfterRead(db: Database.Database, pattern: RegExp, race: () => void): void {
+  let fired = false;
+  const fire = () => {
+    if (!fired) {
+      fired = true;
+      race();
+    }
+  };
+  const pragma = db.pragma.bind(db);
+  db.pragma = ((source: string, options?: Database.PragmaOptions) => {
+    const result = pragma(source, options);
+    if (pattern.test(source)) fire();
+    return result;
+  }) as typeof db.pragma;
+  const prepare = db.prepare.bind(db);
+  db.prepare = ((source: string) => {
+    const statement = prepare(source);
+    if (!pattern.test(source)) return statement;
+    const get = statement.get.bind(statement);
+    statement.get = ((...params: unknown[]) => {
+      const row = get(...params);
+      fire();
+      return row;
+    }) as typeof statement.get;
+    return statement;
+  }) as typeof db.prepare;
+}
+
+const exec = promisify(execFile);
+const HELPERS = join(import.meta.dirname, 'helpers');
+
+/** Opens a StateStore on `path` in a separate node process: `ok` or `FAIL <message>`. */
+async function openInProcess(path: string): Promise<string> {
+  const { stdout } = await exec(
+    process.execPath,
+    [
+      '--experimental-transform-types',
+      '--no-warnings',
+      '--import',
+      join(HELPERS, 'ts-hooks.mjs'),
+      join(HELPERS, 'open-store.mjs'),
+      path,
+    ],
+    { timeout: 30_000 }
+  );
+  return stdout.trim();
+}
 
 describe('state database schema: index and truth layer in one runner', () => {
   let dir: string;
@@ -132,5 +188,68 @@ describe('state database schema: index and truth layer in one runner', () => {
       expect(() => new StateStore(path)).toThrow(/newer/);
       untouched();
     });
+  });
+
+  // STENO-REV-01: two sessions starting at once on one state file, or
+  // `stenographer proposals` run while the server starts.
+  describe('concurrent openers', () => {
+    it('skip a migration step another process applied after they read the version, never writing it back lower', () => {
+      const b = new Database(path);
+      const a = new Database(path);
+      // B has read user_version 0 when A runs the whole migration
+      raceAfterRead(b, /user_version/, () => migrate(a));
+      const versions: number[] = [];
+      const steps: Migration[] = MIGRATIONS.map((step) => (db) => {
+        step(db);
+        versions.push(db.pragma('user_version', { simple: true }) as number);
+      });
+
+      expect(() => migrate(b, steps)).not.toThrow();
+      // Nothing re-run behind A's back
+      expect(versions).toEqual([]);
+      expect(b.pragma('user_version', { simple: true })).toBe(SCHEMA_VERSION);
+      a.close();
+      b.close();
+
+      // ...and the file still opens
+      expect(() => new StateStore(path).close()).not.toThrow();
+    });
+
+    it('build the vector index once when another opener built it after they looked', () => {
+      const store = new StateStore(path);
+      if (store.vectorSearchBackend !== 'sqlite-vec') {
+        store.close();
+        return;
+      }
+      const dimensions = store.vectorDimensions;
+      const db = (store as unknown as { db: Database.Database }).db;
+      db.exec('DROP TABLE message_vectors');
+      // This store has looked for the table when another process builds it
+      raceAfterRead(db, /name = 'message_vectors'/, () => {
+        const other = new Database(path);
+        sqliteVec.load(other);
+        other.exec(
+          `CREATE VIRTUAL TABLE message_vectors USING vec0(chunk_id TEXT PRIMARY KEY, ` +
+            `session_id TEXT PARTITION KEY, embedding float[${dimensions}] distance_metric=cosine, +message_id TEXT)`
+        );
+        other.close();
+      });
+
+      expect(() => store.configureVectors(dimensions)).not.toThrow();
+      store.close();
+      expect(() => new StateStore(path).close()).not.toThrow();
+    });
+
+    it('in separate processes all open a new state file, which still opens afterwards', async () => {
+      for (let round = 0; round < 10; round++) {
+        const file = join(dir, `race-${round}.db`);
+        const results = await Promise.all([openInProcess(file), openInProcess(file), openInProcess(file)]);
+        expect(results).toEqual(['ok', 'ok', 'ok']);
+        expect(await openInProcess(file)).toBe('ok');
+        const db = new Database(file);
+        expect(db.pragma('user_version', { simple: true })).toBe(SCHEMA_VERSION);
+        db.close();
+      }
+    }, 120_000);
   });
 });

@@ -163,13 +163,20 @@ export class StateStore {
     const definition =
       `CREATE VIRTUAL TABLE message_vectors USING vec0(chunk_id TEXT PRIMARY KEY, ` +
       `session_id TEXT PARTITION KEY, embedding float[${dimensions}] distance_metric=cosine, +message_id TEXT)`;
-    const existing = this.db
-      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'message_vectors'")
-      .get() as { sql: string } | undefined;
-    if (existing?.sql === definition) return;
+    const existing = () =>
+      (
+        this.db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'message_vectors'").get() as
+          | { sql: string }
+          | undefined
+      )?.sql;
+    if (existing() === definition) return;
 
-    this.transaction(() => {
-      if (existing) this.db.exec('DROP TABLE message_vectors');
+    // Under the write lock, looked at again: another process opening the
+    // same file may have just built it
+    this.db.transaction(() => {
+      const current = existing();
+      if (current === definition) return;
+      if (current !== undefined) this.db.exec('DROP TABLE message_vectors');
       this.db.exec(definition);
       // In pages: the connection can't write while a cursor is open
       const page = this.db.prepare(
@@ -181,7 +188,7 @@ export class StateStore {
         for (const row of rows) this.insertVectors(row.id, row.session_id, this.decodeVectors(row.embedding));
         after = rows[rows.length - 1].rowid;
       }
-    });
+    }).immediate();
   }
 
   // ─────────────────────────────────────────────────────────

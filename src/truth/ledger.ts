@@ -255,11 +255,17 @@ export class TruthLedger {
       )
     `);
 
-    const columns = new Set(
-      (this.db.prepare('PRAGMA table_info(truth_entries)').all() as Array<{ name: string }>).map((c) => c.name)
-    );
-    for (const [name, type] of CHAIN_COLUMNS) {
-      if (!columns.has(name)) this.db.exec(`ALTER TABLE truth_entries ADD COLUMN ${name} ${type}`);
+    const missing = () => {
+      const columns = new Set(
+        (this.db.prepare('PRAGMA table_info(truth_entries)').all() as Array<{ name: string }>).map((c) => c.name)
+      );
+      return CHAIN_COLUMNS.filter(([name]) => !columns.has(name));
+    };
+    if (missing().length > 0) {
+      // Checked again under the write lock: another process may have just added them
+      this.tx(() => {
+        for (const [name, type] of missing()) this.db.exec(`ALTER TABLE truth_entries ADD COLUMN ${name} ${type}`);
+      });
     }
 
     this.db.exec(`
