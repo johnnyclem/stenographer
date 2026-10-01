@@ -53,11 +53,12 @@ mcp/stenographer/assert_tombstone {
 }
 expect allow
 
-# Filing a team wiki's lines needs trusted data.
+# Filing a team wiki's lines needs trusted data, and the person reviews
+# it: the file can override or strike TBs in its writers' names.
 mcp/stenographer/import_wiki_entries {
   file: "team.jsonl"
 }
-expect allow
+expect authority stenographer-notary
 
 # So does the legacy migration.
 mcp/stenographer/backfill_legacy_tombstones {}

@@ -23,8 +23,9 @@
 # their own name in the operator profile — notarizing, dismissing,
 # overriding, ruling, and minting a TB with `signedBy` — also needs the
 # `hitl` mark: the server takes that name from the caller there, so the
-# person approves each such call. The root config supplies an authority
-# permitting `hitl`.
+# person approves each such call. So does importing a team wiki file,
+# whose overrides, strikes and rulings apply in their writers' names.
+# The root config supplies an authority permitting `hitl`.
 #
 # OpenAPPA checks a call's requirements against the label its own result
 # would leave, so a rule that requires `trusted` cannot also declare a
@@ -175,14 +176,6 @@ delta = {}
 requires = { trust = "trusted" }
 effects = ["stenographer.changed"]
 
-# Files a team wiki's lines; TBs land as truth only when signed and
-# verifiable. Returns ids, counts and reasons.
-[[policy.tool]]
-name = "mcp/stenographer/import_wiki_entries"
-delta = { audience = ["self"] }
-requires = { trust = "trusted" }
-effects = ["stenographer.changed"]
-
 # Returns a count.
 [[policy.tool]]
 name = "mcp/stenographer/backfill_legacy_tombstones"
@@ -228,6 +221,16 @@ effects = ["stenographer.changed", "stenographer.ruled"]
 # was raised on (see the README's limits).
 [[policy.tool]]
 name = "mcp/stenographer/rule_on_objection"
+delta = { audience = ["self"] }
+requires = { trust = "trusted", attention = ["hitl"] }
+effects = ["stenographer.changed", "stenographer.ruled"]
+
+# Files a team wiki's lines; TBs land as truth only when signed and
+# verifiable. A file can carry overrides, strikes and rulings in other
+# people's names, which the import applies, so the person reviews the
+# import. Returns ids, counts and reasons.
+[[policy.tool]]
+name = "mcp/stenographer/import_wiki_entries"
 delta = { audience = ["self"] }
 requires = { trust = "trusted", attention = ["hitl"] }
 effects = ["stenographer.changed", "stenographer.ruled"]

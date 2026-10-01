@@ -546,6 +546,65 @@ describe('STENO-T-07: transitions travel, and reconciliation converges', () => {
     expect(result.held).toMatchObject([{ line: at + 1, reason: expect.stringMatching(/registry/) }]);
     expect(status(storeB.truth, tb.id)).toBe('contested');
   });
+
+  // STENO-REV-05: anyone can compute a one-line stream's hash, so without a
+  // registry a crafted file could strike or override any signed local TB.
+  describe('a strike or override of an entry this ledger made itself', () => {
+    const forged = (target: string, kind: 'strike' | 'override') =>
+      kind === 'strike'
+        ? streamLine({
+            id: 'rul-forged-1',
+            type: 'RULING',
+            ts: '2026-03-01T00:00:00Z',
+            author: 'bob',
+            kind: 'strike',
+            opinion: 'inadmissible',
+            target,
+            'x-steno': { links: [{ fromId: 'rul-forged-1', toId: target, type: 'strikes' }] },
+          })
+        : streamLine({
+            id: 'add-forged-1',
+            type: 'ADDENDUM',
+            ts: '2026-03-01T00:00:00Z',
+            author: 'bob',
+            evidence: [{ kind: 'commit', ref: 'f00d' }],
+            note: 'superseded',
+            'x-steno': { links: [{ fromId: 'add-forged-1', toId: target, type: 'overrides' }] },
+          });
+
+    for (const kind of ['strike', 'override'] as const) {
+      it(`${kind}: is held without a signer registry, and the TB stays truth`, () => {
+        const { tb } = seedLedger(storeB.truth);
+        const result = importWikiEntries(storeB.truth, { lines: [forged(tb.id, kind)] });
+        expect(result).toMatchObject({
+          committed: true,
+          inserted: 0,
+          held: [{ line: 1, reason: expect.stringMatching(/registry/) }],
+        });
+        expect(status(storeB.truth, tb.id)).toBe('contested');
+        expect(storeB.truth.getTruth('current').map((e) => e.id)).toContain(tb.id);
+      });
+
+      it(`${kind}: applies from a person the registry lists`, () => {
+        const { tb } = seedLedger(storeB.truth);
+        const team = SignerRegistry.load({ signers: [{ id: 'bob', role: 'human' }] });
+        const result = importWikiEntries(storeB.truth, { lines: [forged(tb.id, kind)] }, { signers: team });
+        expect(result).toMatchObject({ committed: true, inserted: 1, held: [] });
+      });
+    }
+
+    it('still applies, without a registry, to entries that came from the wiki (a carry-over into a new database)', () => {
+      const { tb, contest } = seedLedger(storeA.truth);
+      storeA.truth.fileRuling({ kind: 'strike', opinion: 'inadmissible', target: contest.id }, { author: 'kim' });
+      storeA.truth.overrideTombstone(tb.id, { evidence: [{ kind: 'commit', ref: 'feed123' }] }, { author: 'kim' });
+      const { lines } = exportWikiEntries(storeA.truth);
+      expect(importWikiEntries(storeB.truth, { lines })).toMatchObject({ committed: true, held: [] });
+      expect(status(storeB.truth, tb.id)).toBe('overridden');
+      const current = storeB.truth.getTruth('current').map((e) => e.id);
+      expect(storeB.truth.getEntry(contest.id)).toBeTruthy();
+      expect(current).not.toContain(contest.id);
+    });
+  });
 });
 
 describe('STENO-T-04 / STENO-T-05: confined, append-only wiki files', () => {

@@ -575,7 +575,8 @@ export interface ImportOptions {
    * TB lands as truth only when its author and signer are listed (people or
    * agents), and an override, strike or ruling applies only when a listed
    * person wrote it. Without one, any accountable identity passes, as on
-   * live operator paths.
+   * live operator paths, except that an override, strike or ruling of an
+   * entry this ledger made itself is held.
    */
   signers?: SignerRegistry | null;
   /** Embeddings for the claims and assertions of imported entries, by entry id (the engine computes them). */
@@ -693,7 +694,7 @@ function applyLine(
         result.held.push({ line: lineNo, id, reason: change.unknown });
         return;
       }
-      const distrust = ledger.getEntry(id) ? null : changeDistrust(change.entry, change.links, signers);
+      const distrust = ledger.getEntry(id) ? null : changeDistrust(ledger, change.entry, change.links, signers);
       if (distrust) {
         result.held.push({ line: lineNo, id, reason: distrust });
         return;
@@ -908,13 +909,39 @@ function entryRoute(d: DecodedWikiLine, entry: NewEntry, signers: SignerRegistry
  * Why an ADDENDUM or RULING can't be applied here, if it can't. An
  * override, a strike or any ruling is a person's act on live paths, so its
  * author must be one; a resolution may come from an agent.
+ *
+ * A line's hash shows it is unchanged, not who wrote it: anyone can write a
+ * one-line stream. So without a signer registry to say who the people are,
+ * an override, strike or ruling from the wiki applies only to entries that
+ * came from the wiki themselves (as trustworthy as the files they came
+ * from), never to one this ledger made: that is held.
  */
-function changeDistrust(entry: NewEntry, links: TruthLink[], signers: SignerRegistry | null): string | null {
+function changeDistrust(
+  ledger: TruthLedger,
+  entry: NewEntry,
+  links: TruthLink[],
+  signers: SignerRegistry | null
+): string | null {
   const judicial = entry.type === 'RULING' || links.some((l) => l.type === 'overrides' || l.type === 'strikes');
   try {
     resolveIdentity(entry.author, judicial ? ['human'] : ['human', 'agent'], 'author', signers);
   } catch (err) {
     return messageOf(err);
+  }
+  if (judicial && !signers) {
+    const target = (entry.body as { target?: unknown }).target;
+    const targets = [...links.filter((l) => l.fromId === entry.id).map((l) => l.toId), ...(typeof target === 'string' ? [target] : [])];
+    // (A local proposal can't be signed or dismissed from the wiki at all: admission refuses that)
+    const local = targets.find((id) => {
+      const target = ledger.getEntry(id);
+      return target?.origin === 'local' && (target.type === 'TB' || target.type === 'UV');
+    });
+    if (local) {
+      return (
+        `a ${entry.type === 'RULING' ? 'ruling' : 'override'} from the wiki changes ${local}, which this ledger made itself: ` +
+        'that applies only from a person a signer registry lists, and none is configured'
+      );
+    }
   }
   return null;
 }

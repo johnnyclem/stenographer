@@ -22,7 +22,15 @@ const BATTERY = join(INTEGRATION, 'stenographer');
 const NAMESPACE = 'mcp/stenographer/';
 
 /** Acts a person performs under their own name: each needs fresh human attention. */
-const PERSON_ACTS = ['sign_proposal', 'dismiss_proposal', 'override_tombstone', 'file_ruling', 'rule_on_objection'];
+const PERSON_ACTS = [
+  'sign_proposal',
+  'dismiss_proposal',
+  'override_tombstone',
+  'file_ruling',
+  'rule_on_objection',
+  // A wiki file applies overrides, strikes and rulings in its writers' names (STENO-REV-05)
+  'import_wiki_entries',
+];
 /** Writes that only draft for a person to notarize: not truth, so not trust-gated. */
 const DRAFTS = ['propose_tombstone'];
 

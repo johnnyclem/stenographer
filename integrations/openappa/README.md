@@ -33,8 +33,8 @@ that no rule names (or hands it to the deployment's `*` annotator).
 | Ledger reads: `get_truth`, `search_truth`, `get_contested`, `get_verification_queue`, `list_proposals`, `list_objections`, inline `export_wiki_entries` | result `self`, `suspicious` | Same: agent-written UVs and drafts, and quoted transcript lines. |
 | `get_status` | result `self` | Keeps the session's trust. |
 | `propose_tombstone` | none; records `stenographer.proposed` | A draft is not truth and runs from any session. It becomes truth only when a person signs it. |
-| Truth writes: `assert_uv`, `resolve_uv`, `assert_tombstone`, `import_wiki_entries`, `backfill_legacy_tombstones`, `export_wiki_entries` into a file | requires `trusted`; records `stenographer.changed` | Text that came from outside the session cannot become truth, contest a TB or settle a UV unless an authority approves the exact call. |
-| A person's acts: `sign_proposal`, `dismiss_proposal`, `override_tombstone`, `file_ruling`, `rule_on_objection`, and `assert_tombstone`/`resolve_uv` with `signedBy` | requires `trusted` and the `hitl` mark; records `stenographer.ruled` too | The person approves every act done in their name, every time, even from a trusted session. |
+| Truth writes: `assert_uv`, `resolve_uv`, `assert_tombstone`, `backfill_legacy_tombstones`, `export_wiki_entries` into a file | requires `trusted`; records `stenographer.changed` | Text that came from outside the session cannot become truth, contest a TB or settle a UV unless an authority approves the exact call. |
+| A person's acts: `sign_proposal`, `dismiss_proposal`, `override_tombstone`, `file_ruling`, `rule_on_objection`, `assert_tombstone`/`resolve_uv` with `signedBy`, and `import_wiki_entries` (a file applies overrides, strikes and rulings in its writers' names) | requires `trusted` and the `hitl` mark; records `stenographer.ruled` too | The person approves every act done in their name, every time, even from a trusted session. |
 
 What it does not cover:
 

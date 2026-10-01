@@ -53,11 +53,11 @@ under the same agent identity may have written, so that spelling enters
 `suspicious`; without it the result echoes the call's own draft.
 
 *Truth writes* — `assert_uv`, `resolve_uv`, `assert_tombstone`,
-`import_wiki_entries`, `backfill_legacy_tombstones`, and
-`export_wiki_entries` with `file`. They need trusted data and record
-`stenographer.changed` (`stenographer.exported` for the export). A
-suspicious trajectory cannot assert a UV, contest a TB, settle a UV or
-file a team wiki unless an authority approves the exact call.
+`backfill_legacy_tombstones`, and `export_wiki_entries` with `file`.
+They need trusted data and record `stenographer.changed`
+(`stenographer.exported` for the export). A suspicious trajectory cannot
+assert a UV, contest a TB or settle a UV unless an authority approves
+the exact call.
 
 *A person's acts* — `sign_proposal`, `dismiss_proposal`,
 `override_tombstone`, `file_ruling`, `rule_on_objection`, and the
@@ -67,7 +67,9 @@ operator profile the server takes the person's name from the caller and
 checks it against its signer registry, if one is configured. Each call
 needs trusted data and the `hitl` mark, so the person approves every act
 done in their name, and records `stenographer.changed` and
-`stenographer.ruled`.
+`stenographer.ruled`. `import_wiki_entries` is gated the same way: a
+team wiki file can carry overrides, strikes and rulings in its writers'
+names, which the import applies, so the person reviews each import.
 
 Results that carry ledger entries are restricted to `self`. Write results
 keep the session's trust: see the first limit below.

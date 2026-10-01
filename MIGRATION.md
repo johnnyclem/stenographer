@@ -200,7 +200,7 @@ stenographer start ./log.jsonl ./new.db --mode catchup --profile operator --wiki
 #   then call import_wiki_entries {"file": "carry-over.jsonl"}
 ```
 
-The export is a hash-chained v2 stream, so its signed TBs land as truth in the new database (with `--signer-registry`, when their signers are listed); anything else arrives as a reconciliation proposal to sign (see [Team wiki: truth format v2](#team-wiki-truth-format-v2)).
+The export is a hash-chained v2 stream, so its signed TBs land as truth in the new database (with `--signer-registry`, when their signers are listed); anything else arrives as a reconciliation proposal to sign (see [Team wiki: truth format v2](#team-wiki-truth-format-v2)). Into a fresh database every entry comes from the file, so its overrides and strikes apply too. In a database that already has entries of its own, an override, strike or ruling of one of them applies only with a `--signer-registry` that lists its author as a person; without one it is held.
 
 **Intentional re-index.** A restart no longer re-reads a log. To rebuild derived state (after changing `supersedeThreshold`, say), use a fresh state path as above.
 
