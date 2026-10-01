@@ -44,7 +44,7 @@
 - A UTF-8 BOM at the start of a log is stripped. (STENO-IDX-27)
 - `live` and `daemon` wait for a log that doesn't exist yet instead of exiting with ENOENT. (STENO-IDX-28)
 - Claude Code tool results (file reads, grep and test output), caveats and subagent prompts are no longer mined as the user's decisions and corrections. (STENO-IDX-08)
-- Patterns no longer match inside words ("will use", "factually", "autocorrection:"). "Use X instead of Y" records X, not "of Y". First-person tool narration isn't a decision. A sentence-initial "Actually, …" correction is kept. On the labeled corpus, precision went from 0.27 to 1.00 and recall from 0.63 to 1.00 (a development set; CI floors 0.95 / 0.90). (STENO-IDX-07)
+- Patterns no longer match inside words ("will use", "factually", "autocorrection:"). "Use X instead of Y" records X, not "of Y". First-person tool narration isn't a decision. A sentence-initial "Actually, …" correction is kept. Polarity isn't read inside quotations, and first-person narration of the next step ("Let me X instead of Y") isn't a correction. On the labeled corpus (46 turns), precision went from 0.25 to 1.00 and recall from 0.60 to 1.00 (a development set; CI floors 0.95 / 0.90). (STENO-IDX-07)
 - An Anthropic log whose first turn is string content no longer loses its `tool_use` blocks when detection picks the OpenAI adapter: both chat adapters share one normalizer, and either reads `tool_calls`, content blocks and `created`. (STENO-IDX-09)
 - Under the hashed embedder, unrelated decisions no longer supersede each other. (STENO-IDX-06)
 - An offline start, or a mistyped `--embeddings`, can no longer mix two embedding spaces in one database. (STENO-IDX-24)

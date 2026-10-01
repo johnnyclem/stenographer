@@ -47,6 +47,16 @@ const INSTEAD_OF = /^(.+?),?\s+(?:instead of|rather than)\s+(.+)$/i;
 const COMMA_NOT = /^(.+?),\s+(?:and\s+)?not\s+(.+)$/i;
 
 /**
+ * First-person narration of the assistant's next step ("Let me …",
+ * "Now I'll …"): a sentence that only says how it will proceed, "X instead
+ * of Y" or not, is not a recorded choice.
+ */
+const FIRST_PERSON_ACTION = new RegExp(
+  `^(?:(?:ok(?:ay)?|now|next|first|then|so)[,]?\\s+)*(?:let me|i(?:${APOS}ll| will| am going to|${APOS}m going to))\\b`,
+  'i'
+);
+
+/**
  * First-person narration of tool use ("I'll use the Read tool to …",
  * "I'll use Grep to find …") — what the agent is about to do, not a choice
  * anyone made.
@@ -100,10 +110,28 @@ function clean(text: string): string {
   return trimmed.length > MAX_ASSERTION_LENGTH ? trimmed.slice(0, MAX_ASSERTION_LENGTH).trimEnd() : trimmed;
 }
 
-/** Splits "X instead of Y" / "X rather than Y" / "X, not Y" into the choice and what it rejects. */
+/**
+ * Splits "X instead of Y" / "X rather than Y" / "X, not Y" into the choice
+ * and what it rejects — unless the phrase is quoted, not said.
+ */
 function splitPolarity(text: string): { chosen: string; rejected: string } {
   const match = text.match(INSTEAD_OF) ?? text.match(COMMA_NOT);
-  return match ? { chosen: clean(match[1]), rejected: clean(match[2]) } : { chosen: clean(text), rejected: '' };
+  return match && !insideQuotes(text, match[1].length)
+    ? { chosen: clean(match[1]), rejected: clean(match[2]) }
+    : { chosen: clean(text), rejected: '' };
+}
+
+/**
+ * Whether position `at` falls inside a quotation ("…", `…`, “…”, '…'). A
+ * single quote between letters is an apostrophe (don't, that's), not a
+ * quotation mark.
+ */
+function insideQuotes(text: string, at: number): boolean {
+  const before = text.slice(0, at);
+  const count = (re: RegExp) => (before.match(re) ?? []).length;
+  if (count(/"/g) % 2 === 1 || count(/`/g) % 2 === 1) return true;
+  if (count(/\u201C/g) > count(/\u201D/g)) return true;
+  return count(/(?<![\p{L}\p{N}])['\u2018]|['\u2019](?![\p{L}\p{N}])/gu) % 2 === 1;
 }
 
 function isAssertion(text: string): boolean {
@@ -294,6 +322,8 @@ export function extractStructure(message: ConversationMessage): ExtractedStructu
 
     const decision = matchFirst(DECISION_PATTERNS, sentence);
     if (decision !== null) {
+      // Reported, not decided: "the ADR says \"we decided to use X\""
+      if (insideQuotes(sentence, sentence.length - decision.length)) continue;
       const { chosen } = splitPolarity(decision);
       if (TOOL_NARRATION.some((re) => re.test(chosen))) continue;
       if (isAssertion(chosen) && !result.decisions.includes(chosen)) result.decisions.push(chosen);
@@ -331,13 +361,15 @@ function correctionOf(sentence: string): { from: string; to: string } | null {
   }
 
   const notBut = sentence.match(NOT_BUT);
-  if (notBut) {
+  if (notBut && !insideQuotes(sentence, notBut.index!)) {
     // "The budget is not 30 but 100" → "The budget is 100", replacing "The budget is 30"
     const prefix = sentence.slice(0, notBut.index);
     return { from: clean(prefix + notBut[1]), to: clean(prefix + notBut[2]) };
   }
 
   const insteadOf = sentence.match(INSTEAD_OF);
-  if (insteadOf) return { from: clean(insteadOf[2]), to: clean(insteadOf[1]) };
+  if (insteadOf && !insideQuotes(sentence, insteadOf[1].length) && !FIRST_PERSON_ACTION.test(sentence)) {
+    return { from: clean(insteadOf[2]), to: clean(insteadOf[1]) };
+  }
   return null;
 }
