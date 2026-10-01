@@ -29,7 +29,7 @@ The design principle that matters most if these converge: **two axes, not one.**
 
 You don't need to adopt anything to interoperate. In rough order of coupling:
 
-1. **JSONL interop (lowest coupling, recommended first).** `export_wiki_entries` emits signed TB/UV records as append-only JSONL — one entry per line, readable with `cat`, diffable in a PR. Stenographer-specific fields (links, provenance, agent session) travel under a namespaced `x-steno` key you can ignore. `import_wiki_entries` ingests the same format losslessly; the round-trip invariant `import(export(ledger)) == ledger` is tested and gates release (`test/wiki-interop.test.ts`). Short-hand could read this file at compaction time without touching stenographer's SQLite or code.
+1. **JSONL interop (lowest coupling, recommended first).** `export_wiki_entries` writes [truth format v2](../spec/truth-format/README.md): one ledger's append-only, hash-chained line stream, one entry per line, readable with `cat`, diffable in a PR. Every status change (contested, overridden, verified, refuted, struck) is an appended `TRANSITION` line; a reader's current status for an entry is its latest TRANSITION's, else the entry line's own, and an unknown status fails closed. Stenographer-specific fields (links, provenance, agent session) travel under a namespaced `x-steno` key you can ignore. The spec ships a JSON Schema and golden fixtures (`spec/truth-format/fixtures/`) to run in your own tests. Short-hand can read these files at compaction time without touching stenographer's SQLite or code.
 
 2. **Library API.** `@stenographer/core` exports `TruthLedger`, `exportWikiEntries`/`importWikiEntries`, and all record types (`src/truth/types.ts`). The ledger takes a `better-sqlite3` `Database` — it does not require the rest of stenographer.
 
@@ -52,7 +52,7 @@ Two viable shapes:
 
 - **Option A — the ledger becomes L4's backing store.** Compaction produces candidate invariants as `PROPOSAL(kind: uv)` entries; signing promotes them; L4 reads `getTruth('current')`. Strongest version of the idea: compaction gains accountability and a dispute mechanism for free, and "invariant" stops being a confidence claim it can't back. Cost: short-hand takes a dependency on stenographer's schema and its signing workflow becomes part of your compaction loop.
 
-- **Option B — separate tools, JSONL sync at the seam.** L4 stays yours; at compaction time you import the current-truth JSONL as high-priority input, and optionally emit your candidate invariants as a JSONL file stenographer ingests as proposals. No code dependency, format-level contract only, and the round-trip test already protects the seam.
+- **Option B — separate tools, JSONL sync at the seam.** L4 stays yours; at compaction time you import the current-truth JSONL as high-priority input, and optionally emit your candidate invariants as a JSONL file stenographer ingests as proposals. No code dependency, format-level contract only, and the spec's golden fixtures protect the seam. Write candidates as the suite PROPOSAL envelope the spec defines.
 
 Pragmatic recommendation: **start with B.** It's an afternoon of work against a tested, stable format, it proves whether ledger entries actually improve compaction quality, and it leaves A available with better evidence. A is a real architectural commitment and shouldn't be bought on adjacency alone. The final call is Johnny's (it's a reserved §13 decision) — this handoff's job is to make sure it's made with the seams visible.
 
@@ -61,15 +61,15 @@ Pragmatic recommendation: **start with B.** It's an afternoon of work against a 
 From §13, unresolved as of this handoff:
 
 1. **UV TTL** — open UVs currently live forever (no expiry, no staleness marker). If you ingest UVs into compaction, assume the pile can grow.
-2. **Who counts as a signer** — the floor is: `command` evidence (reproducible executable checks) self-signs; everything else needs a human. Whether trusted agents get signing rights for some entry kinds is undecided. Relevant if short-hand's compactor would want to sign its own promotions (today it can't, and the contempt check would reject the obvious workaround).
+2. **Who counts as a signer** — the floor is: only a check stenographer executed itself self-signs (1.0 ships no runner, and submitted command output is recorded as `claimed-command`); everything else needs a human. Whether trusted agents get signing rights for some entry kinds is undecided. Relevant if short-hand's compactor would want to sign its own promotions (today it can't, and the contempt check would reject the obvious workaround).
 3. **Contested-TB posture** — contested TBs stay authoritative-with-asterisk (stability over caution). If that flips to UV-grade trust, your compaction weighting changes.
 
 ## Pointers
 
 - `src/truth/types.ts` — record types, link types, consumption-rules constant, ULID
 - `src/truth/ledger.ts` — the storage layer; the override protocol and contempt check live here
-- `src/truth/wiki.ts` — the JSONL format (`WikiEntryLine` is the line shape)
-- `test/wiki-interop.test.ts` — the round-trip invariant; read this first if you build against the JSONL
+- `spec/truth-format/` — the normative JSONL format, its JSON Schema and golden fixtures; read this first if you build against the JSONL
+- `src/truth/wiki.ts` — the reference codec (`decodeWikiLine`, `checkWikiChain`, `wikiLineHash`)
 - `test/truth.test.ts` — lifecycle, override protocol, contempt, rulings
 - README §"Asserted Truth Layer (TB/UV v2)" — user-facing summary
 - Rollout: everything defaults to `truthMode: 'shadow'` (Phase 0 — auto-close still runs, proposals accumulate for observation). Phase 1 (`assert`) is the one-way door and hasn't been opened.

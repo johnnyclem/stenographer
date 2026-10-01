@@ -6,23 +6,39 @@
  */
 
 import { watch, existsSync, statSync, readdirSync, type FSWatcher } from 'node:fs';
-import { join, basename } from 'node:path';
-import { Tailer, JsonlAdapter, type LogAdapter } from '../indexer/tailer.js';
-import { getAdapter, detectAdapter } from '../indexer/adapters.js';
+import { join, basename, resolve } from 'node:path';
+import { Tailer, logSessionId, type LogAdapter, type IngestPosition } from '../indexer/tailer.js';
+import { getAdapter, matchAdapterFromLines } from '../indexer/adapters.js';
+import { contentId } from '../indexer/ids.js';
 import { StateStore } from '../store/index.js';
 import { ImportanceDetector, extractStructure } from '../indexer/importance.js';
 import { GraphRAGRetriever, type QueryContext, type RetrievedChunk } from '../indexer/graphrag.js';
-import { createEmbedder, cosineSimilarity, type Embedder } from '../indexer/embeddings.js';
+import {
+  createEmbedder,
+  cosineSimilarity,
+  chunkText,
+  embeddingText,
+  describeEmbedder,
+  sameEmbedder,
+  type Embedder,
+  type EmbedderIdentity,
+} from '../indexer/embeddings.js';
 import { RestServer } from '../api/rest.js';
+import { resolveRestToken, type RestToken } from '../api/auth.js';
 import {
   exportWikiEntries,
   importWikiEntries,
+  wikiLineTexts,
   type ImportResult,
 } from '../truth/wiki.js';
+import { appendWikiFile, defaultWikiDir, readWikiFile, type WikiFileTarget } from '../truth/wiki-file.js';
 import type { TruthFilter } from '../truth/ledger.js';
 import type { Objection, ObjectionMode, ObjectionStatus, ObjectionStats } from '../truth/objections.js';
 import { createSinkTransport, type ObjectionTransport } from '../truth/delivery.js';
 import { formatProposalNotice, raiseForNotarization } from '../truth/notary.js';
+import { submitProposalEnvelope } from '../truth/intake.js';
+import { ContemptError } from '../truth/ledger.js';
+import { SignerRegistry, resolveIdentity, type SignerRole } from '../truth/identity.js';
 import type {
   Evidence,
   VerifyBy,
@@ -33,6 +49,7 @@ import type {
   RulingEntry,
   ProposalBody,
   TombstonedLiteral,
+  FiledRulingKind,
 } from '../truth/types.js';
 import type {
   StenographerAPI,
@@ -43,15 +60,50 @@ import type {
   EntityNode,
   EntityRelation,
   IndexedDecision,
+  IndexedMessage,
 } from '../types.js';
 
-// Calibrated against all-MiniLM-L6-v2: rewrites of the same decision score
-// ~0.46-0.94, unrelated decisions in the same conversation score ~0.06
+// Until the embedder is known; each embedder carries its calibrated threshold
 const DEFAULT_SUPERSEDE_THRESHOLD = 0.45;
 const DEFAULT_DAEMON_REST_PORT = 8787;
 
+/** index_meta key holding the identity of the embedder the vectors were made with. */
+const EMBEDDER_META_KEY = 'embedder';
+/** Messages re-embedded per transaction by --reembed. */
+const REEMBED_BATCH = 256;
+
+/**
+ * The state database holds vectors from another embedder. Mixing embedding
+ * spaces makes every similarity score meaningless, so the engine refuses to
+ * start rather than silently degrade.
+ */
+export class EmbedderMismatchError extends Error {
+  constructor(
+    readonly pinned: EmbedderIdentity,
+    readonly requested: EmbedderIdentity
+  ) {
+    super(
+      `state database is pinned to embedder ${describeEmbedder(pinned)}, but this run uses ` +
+        `${describeEmbedder(requested)}. Vectors from different embedders aren't comparable. Start with ` +
+        `--embeddings ${pinned.kind === 'hashed' ? 'hashed' : pinned.model} (or --embeddings auto), or pass ` +
+        '--reembed to re-embed every stored message and truth entry under the new embedder.'
+    );
+    this.name = 'EmbedderMismatchError';
+  }
+}
+
 /** Registered identity for the embedding-similarity supersession detector. */
 const DETECTOR_AUTHOR = 'detector:supersession';
+
+/**
+ * What supersession matching needs, embedded before the commit transaction
+ * (which can't await): the decisions active before the message, and the
+ * texts it asserts.
+ */
+interface SupersessionContext {
+  candidates: Array<{ decision: IndexedDecision; embedding: number[] }>;
+  embeddings: Map<string, number[]>;
+}
 
 export class Stenographer implements StenographerAPI {
   readonly config: StenographerConfig;
@@ -60,28 +112,41 @@ export class Stenographer implements StenographerAPI {
 
   private detector: ImportanceDetector;
   private embedder: Embedder | null = null;
+  /** Keyed by absolute log path; at most one tailer per log. */
   private tailers: Map<string, Tailer> = new Map();
   private dirWatcher: FSWatcher | null = null;
+  private stopped = false;
   private restServer: RestServer | null = null;
+  private restAuth: RestToken | null = null;
   private sessionId: string;
+  /** Every session this engine's logs have carried (the current one included). */
+  private sessionsSeen = new Set<string>();
   private indexing: Promise<void> = Promise.resolve();
   private supersedeThreshold: number;
   private truthMode: 'shadow' | 'assert';
   private objectionMode: ObjectionMode;
   private sinkTransports: ObjectionTransport[];
+  private signers: SignerRegistry | null;
 
   constructor(config: StenographerConfig) {
     this.config = config;
-    this.sessionId = `session_${Date.now()}`;
+    // Until a line names its harness session (Claude Code's sessionId), a
+    // log's session is its basename — stable across restarts, never minted
+    this.sessionId = logSessionId(config.logPath);
     this.store = new StateStore(config.statePath || './stenographer.db');
     this.detector = new ImportanceDetector();
-    this.retriever = new GraphRAGRetriever();
+    // Vector candidates come from the persistent index (chunks, session partitions)
+    this.retriever = new GraphRAGRetriever(undefined, {
+      vectorSearch: (embedding, k, sessionId) =>
+        this.store.searchSimilar(embedding, k, sessionId).map(({ message, score }) => ({ id: message.id, score })),
+    });
     this.supersedeThreshold = config.supersedeThreshold ?? DEFAULT_SUPERSEDE_THRESHOLD;
     this.truthMode = config.truthMode ?? 'shadow';
     this.objectionMode = config.objectionMode ?? 'shadow';
     // Validate sinks up front: a bad or non-loopback URL fails at startup,
     // not at the first objection
     this.sinkTransports = (config.objectionSinks ?? []).map(createSinkTransport);
+    this.signers = config.signerRegistry ? SignerRegistry.load(config.signerRegistry) : null;
   }
 
   /** Session scope for queries: single session in file modes, all in watch mode. */
@@ -93,6 +158,15 @@ export class Stenographer implements StenographerAPI {
     return this.sessionId;
   }
 
+  /**
+   * Whether `sessionId` is one this engine's own logs carry: the current
+   * session, or one a line it indexed named. Other sessions writing to the
+   * same state file (their transcripts, their gate hooks) are not.
+   */
+  carriesSession(sessionId: string): boolean {
+    return sessionId === this.sessionId || this.sessionsSeen.has(sessionId);
+  }
+
   // ─────────────────────────────────────────────────────────
   // Lifecycle & modes
   // ─────────────────────────────────────────────────────────
@@ -102,25 +176,36 @@ export class Stenographer implements StenographerAPI {
       this.store.objectionDelivery.register(transport);
     }
 
-    this.embedder = await createEmbedder(this.config.embeddingModel);
-    this.retriever.setEmbedder(this.embedder);
+    await this.ensureEmbedder();
+
+    // A log indexed before keeps its session across restarts
+    if (this.config.mode !== 'watch') {
+      const checkpoint = this.store.getCheckpoint(this.config.logPath);
+      if (checkpoint?.sessionId) this.sessionId = checkpoint.sessionId;
+    }
+    // Ingestion resumes at each log's checkpoint instead of re-reading it,
+    // so the in-memory graph is rebuilt from what earlier runs committed
+    await this.hydrateRetriever();
 
     switch (this.config.mode) {
       case 'live':
-        await this.startFileTailer(this.config.logPath, this.sessionId, true);
+      case 'daemon':
+        await this.startFileTailer(this.config.logPath, this.sessionId, {
+          follow: true,
+          replayExisting: true,
+        }).start();
         break;
 
       case 'catchup':
-        await this.startFileTailer(this.config.logPath, this.sessionId, false);
+        await this.startFileTailer(this.config.logPath, this.sessionId, {
+          follow: false,
+          replayExisting: true,
+        }).start();
         await this.flush();
         break;
 
       case 'watch':
         await this.startDirectoryWatch(this.config.logPath);
-        break;
-
-      case 'daemon':
-        await this.startFileTailer(this.config.logPath, this.sessionId, true);
         break;
 
       default:
@@ -132,13 +217,29 @@ export class Stenographer implements StenographerAPI {
       this.config.restPort ?? (this.config.mode === 'daemon' ? DEFAULT_DAEMON_REST_PORT : undefined);
     if (restPort !== undefined) {
       const restHost = this.config.restHost ?? '127.0.0.1';
-      this.restServer = new RestServer(this);
+      const auth = this.config.restInsecure
+        ? null
+        : resolveRestToken(this.config.statePath || './stenographer.db', this.config.restToken);
+      this.restAuth = auth;
+      this.restServer = new RestServer(this, {
+        token: auth?.token,
+        insecure: this.config.restInsecure,
+        allowedHosts: [restHost, ...(this.config.restAllowedHosts ?? [])],
+      });
       await this.restServer.start(restPort, restHost);
       console.error(`🌐 REST API listening on http://${restHost}:${this.restServer.port}`);
+      if (!auth) {
+        console.error('⚠️  REST API has no bearer token (--rest-insecure): any local process can read transcripts');
+      } else if (auth.path) {
+        console.error(`🔑 REST bearer token${auth.created ? ' created' : ''}: ${auth.path} (send Authorization: Bearer <contents>)`);
+      } else {
+        console.error(`🔑 REST bearer token: ${this.config.restToken ? 'as configured' : 'in memory only (in-memory state)'}`);
+      }
     }
   }
 
   stop(): void {
+    this.stopped = true;
     for (const tailer of this.tailers.values()) {
       tailer.stop();
     }
@@ -165,22 +266,150 @@ export class Stenographer implements StenographerAPI {
     return this.restServer?.port ?? null;
   }
 
-  private async resolveAdapter(filePath: string): Promise<LogAdapter> {
-    if (this.config.adapter) {
-      return getAdapter(this.config.adapter);
-    }
-    if (existsSync(filePath)) {
-      return detectAdapter(filePath);
-    }
-    return new JsonlAdapter();
+  /** The bearer token REST requires; null when REST is off or started with --rest-insecure. */
+  get restToken(): string | null {
+    return this.restServer ? (this.restAuth?.token ?? null) : null;
   }
 
-  private async startFileTailer(filePath: string, sessionId: string, follow: boolean): Promise<void> {
-    const adapter = await this.resolveAdapter(filePath);
-    const tailer = new Tailer(filePath, { sessionId, adapter, follow });
-    tailer.on('message', (msg: ConversationMessage) => this.enqueue(msg));
-    this.tailers.set(filePath, tailer);
-    await tailer.start();
+  /** Where that token is stored (`<state dir>/rest-token`); null when configured or in memory. */
+  get restTokenPath(): string | null {
+    return this.restServer ? (this.restAuth?.path ?? null) : null;
+  }
+
+  /** The embedder in use (and the state database is pinned to), once started. */
+  get embedderIdentity(): EmbedderIdentity | null {
+    return this.embedder?.identity ?? null;
+  }
+
+  /**
+   * Creates the embedder and pins the state database to it. A database
+   * whose vectors came from another embedder is refused — unless `reembed`
+   * is set, which recomputes every stored vector first. A database from
+   * before pinning is assumed to match (with a warning) unless re-embedded.
+   */
+  private async openEmbedder(): Promise<Embedder> {
+    const pinned = this.store.getMeta<EmbedderIdentity>(EMBEDDER_META_KEY);
+    const embedder = this.config.embedder ?? (await createEmbedder(this.config.embeddingModel, { pinned }));
+    const identity = embedder.identity;
+    const legacy = !pinned && this.store.hasEmbeddings();
+
+    if (pinned && !sameEmbedder(pinned, identity) && !this.config.reembed) {
+      throw new EmbedderMismatchError(pinned, identity);
+    }
+    this.store.configureVectors(identity.dimensions);
+    if (this.config.reembed) {
+      await this.reembed(embedder);
+    } else if (legacy) {
+      console.error(
+        `⚠️  ${this.config.statePath || './stenographer.db'} predates embedder pinning; assuming its vectors ` +
+          `came from ${describeEmbedder(identity)}. If they didn't, restart with --reembed.`
+      );
+    }
+    this.store.setMeta(EMBEDDER_META_KEY, identity);
+    if (this.config.supersedeThreshold === undefined) {
+      this.supersedeThreshold = embedder.supersedeThreshold;
+    }
+    this.retriever.setEmbedder(embedder);
+    return embedder;
+  }
+
+  /** Recomputes every stored vector — messages and truth entries — under `embedder`. */
+  private async reembed(embedder: Embedder): Promise<void> {
+    const started = Date.now();
+    let batch: Array<{ id: string; vectors: number[][] }> = [];
+    let count = 0;
+    const commit = () => {
+      const pending = batch;
+      batch = [];
+      this.store.transaction(() => {
+        for (const { id, vectors } of pending) this.store.setMessageEmbeddings(id, vectors);
+      });
+    };
+    for (const message of this.store.listMessageTexts()) {
+      batch.push({ id: message.id, vectors: await this.embedMessage(message, embedder) });
+      count++;
+      if (batch.length >= REEMBED_BATCH) commit();
+    }
+    commit();
+
+    const truth = this.store.listTruthEmbeddingTexts();
+    const vectors = await Promise.all(truth.map((entry) => embedder.embed(entry.text)));
+    this.store.transaction(() => {
+      truth.forEach((entry, i) => this.store.setTruthEmbedding(entry.id, vectors[i]));
+    });
+    console.error(
+      `🔁 Re-embedded ${count} messages and ${truth.length} truth entries under ` +
+        `${describeEmbedder(embedder.identity)} (${Date.now() - started} ms)`
+    );
+  }
+
+  /**
+   * A message's vectors, one per window of its content and tool calls;
+   * none when there's nothing to embed. A vector with no direction (text
+   * with no features) is dropped: it would score the same against every
+   * query.
+   */
+  private async embedMessage(
+    msg: { content: string; toolCalls?: ConversationMessage['toolCalls'] },
+    embedder: Embedder = this.embedder!
+  ): Promise<number[][]> {
+    const text = embeddingText(msg);
+    if (!text.trim()) return [];
+    const vectors: number[][] = [];
+    for (const chunk of chunkText(text)) {
+      const vector = await embedder.embed(chunk);
+      if (vector.some((v) => v !== 0)) vectors.push(vector);
+    }
+    return vectors;
+  }
+
+  /** Rebuilds the in-memory GraphRAG graph (messages, mentions, entities) from the store. */
+  private async hydrateRetriever(): Promise<void> {
+    // Collect first: the store's cursor must not stay open across an await
+    const pending: Promise<void>[] = [];
+    for (const m of this.store.iterateMessages(this.scope, { embeddings: false })) {
+      pending.push(this.retriever.indexMessage(toConversationMessage(m), undefined, retrieverInfo(m)));
+    }
+    await Promise.all(pending);
+    for (const entity of this.store.getEntities(this.scope)) {
+      this.retriever.indexEntity(entity);
+    }
+    for (const relation of this.store.getRelations()) {
+      this.retriever.indexRelation(relation.from, relation.to, relation.relation);
+    }
+  }
+
+  /**
+   * Creates and registers the tailer for a log. Registration is synchronous,
+   * before anything awaits, so two events for one new file can't both start
+   * a tailer for it.
+   */
+  private startFileTailer(
+    filePath: string,
+    sessionId: string,
+    options: { follow: boolean; replayExisting: boolean }
+  ): Tailer {
+    const source = resolve(filePath);
+    const checkpoint = this.store.getCheckpoint(source);
+    const tailer = new Tailer(filePath, {
+      sessionId: checkpoint?.sessionId ?? sessionId,
+      // No --adapter: detect from the first complete lines, not at open,
+      // so a log created empty isn't locked into the wrong format
+      adapter: this.config.adapter ? getAdapter(this.config.adapter) : undefined,
+      detect: matchAdapterFromLines,
+      follow: options.follow,
+      replayExisting: options.replayExisting,
+      resumeFrom: checkpoint,
+    });
+    tailer.on('message', (msg: ConversationMessage, position: IngestPosition) => this.enqueue(msg, position));
+    tailer.on('progress', (position: IngestPosition) => this.enqueueCheckpoint(position, tailer.getSessionId()));
+    if (!this.config.adapter) {
+      tailer.on('adapter', (adapter: LogAdapter) => {
+        console.error(`📄 ${filePath}: ${adapter.constructor.name}`);
+      });
+    }
+    this.tailers.set(source, tailer);
+    return tailer;
   }
 
   private async startDirectoryWatch(dirPath: string): Promise<void> {
@@ -188,43 +417,112 @@ export class Stenographer implements StenographerAPI {
       throw new Error(`Watch mode requires an existing directory: ${dirPath}`);
     }
 
-    const tailFile = async (name: string) => {
-      if (!name.endsWith('.jsonl')) return;
+    // Files found by the startup scan hold history, replayed as shadow;
+    // files that appear afterwards are live sessions
+    let scanning = true;
+    const tailFile = (name: string): Promise<void> => {
+      if (this.stopped || !name.endsWith('.jsonl')) return Promise.resolve();
       const filePath = join(dirPath, name);
-      if (this.tailers.has(filePath)) return;
-      if (!existsSync(filePath)) return;
+      const source = resolve(filePath);
+      if (this.tailers.has(source) || !existsSync(filePath)) return Promise.resolve();
       // One session per log file, named after it. Claude Code names each
       // session log after its session id, and receivers (smallchat's
       // messenger) route objections by that id — so the bare basename is the
       // session id, with no prefix.
-      await this.startFileTailer(filePath, basename(name, '.jsonl'), true);
+      const tailer = this.startFileTailer(filePath, basename(name, '.jsonl'), {
+        follow: true,
+        replayExisting: scanning,
+      });
+      tailer.on('removed', () => {
+        // The session log is gone: stop following it. If it comes back, the
+        // directory watch starts a new tailer, which resumes at the
+        // checkpoint only if it is recognizably the same log.
+        tailer.stop();
+        if (this.tailers.get(source) === tailer) this.tailers.delete(source);
+      });
+      return tailer.start();
     };
 
-    // Tail files already present, then watch for new ones
+    // Watch first, so a session created during the scan isn't missed
+    this.dirWatcher = watch(dirPath, (_event, name) => {
+      if (!name) return;
+      tailFile(name.toString()).catch((err) => console.error(`⚠️  tailing ${name}:`, err));
+    });
+    this.dirWatcher.on('error', (err) => console.error(`⚠️  watching ${dirPath}:`, err));
+
     for (const name of readdirSync(dirPath)) {
       await tailFile(name);
     }
-
-    this.dirWatcher = watch(dirPath, (_event, name) => {
-      if (name) void tailFile(name.toString());
-    });
+    scanning = false;
   }
 
   // ─────────────────────────────────────────────────────────
   // Indexing pipeline
   // ─────────────────────────────────────────────────────────
 
-  private enqueue(msg: ConversationMessage): void {
+  private enqueue(msg: ConversationMessage, position?: IngestPosition): void {
     // Serialize indexing so messages are processed in arrival order
     this.indexing = this.indexing
-      .then(() => this.indexMessage(msg))
+      .then(() => (this.stopped ? undefined : this.indexMessage(msg, position)))
       .catch((err) => {
         console.error(`Failed to index message ${msg.id}:`, err);
       });
   }
 
-  private async indexMessage(msg: ConversationMessage): Promise<void> {
+  /** Lines that produced no message still move the checkpoint, in order. */
+  private enqueueCheckpoint(position: IngestPosition, sessionId: string): void {
+    this.indexing = this.indexing
+      .then(() => {
+        if (!this.stopped) this.saveCheckpoint(position, sessionId);
+      })
+      .catch((err) => {
+        console.error(`Failed to checkpoint ${position.source}:`, err);
+      });
+  }
+
+  private saveCheckpoint(position: IngestPosition, sessionId: string): void {
+    this.store.saveCheckpoint({
+      source: position.source,
+      dev: position.dev,
+      inode: position.inode,
+      headHash: position.headHash,
+      headLength: position.headLength,
+      offset: position.offset,
+      seq: position.seq,
+      sessionId,
+    });
+  }
+
+  /**
+   * Indexes one message in two phases: derive (async — scoring, embedding)
+   * with nothing written, then commit the message, everything derived from
+   * it and the log checkpoint in one transaction. A restart resumes after
+   * the last committed line; a line can't be half-applied or applied twice.
+   */
+  private async indexMessage(msg: ConversationMessage, position?: IngestPosition): Promise<void> {
     const sessionId = msg.sessionId || this.sessionId;
+    this.sessionsSeen.add(sessionId);
+    // File modes follow one log: its latest session is the query scope
+    if (this.config.mode !== 'watch') this.sessionId = sessionId;
+    const checkpoint = () => {
+      if (position) this.saveCheckpoint(position, sessionId);
+    };
+
+    // A line already indexed — a rewritten or re-read log, a transcript
+    // copied into a resumed session — is a no-op for every derived record
+    const indexed = this.store.getMessage(msg.id);
+    if (indexed && indexed.content === msg.content) {
+      const moved = indexed.sessionId !== sessionId;
+      this.store.transaction(() => {
+        if (moved) this.store.reattributeMessage(msg.id, sessionId);
+        checkpoint();
+      });
+      // Now in this session's scope, which the startup hydration didn't cover
+      if (moved) {
+        await this.retriever.indexMessage({ ...toConversationMessage(indexed), sessionId }, undefined, retrieverInfo(indexed));
+      }
+      return;
+    }
 
     // Score importance against recent history (detector only looks at the
     // last 20 messages, so don't load the whole session)
@@ -240,101 +538,134 @@ export class Stenographer implements StenographerAPI {
       }));
     const score = this.detector.score(msg, history);
 
-    // Extract entities, decisions, corrections
+    // Extract entities, decisions, corrections — from user and assistant
+    // prose only; tool output and tagged records assert nothing
     const extracted = extractStructure(msg);
 
     // Embed once; shared by the vector store and the GraphRAG index
-    const embedding = await this.embedder!.embed(msg.content);
-    await this.retriever.indexMessage(msg, embedding);
+    const vectors = await this.embedMessage(msg);
+    const embedding = vectors[0] ?? [];
 
-    // Index entities (in-memory graph + durable store)
-    for (const entity of extracted.entities) {
-      const node: EntityNode = {
-        id: entity.name,
-        type: entity.type,
-        value: entity.value,
-        firstSeen: msg.timestamp,
-        lastSeen: msg.timestamp,
-        references: 1,
-      };
+    // Each sentence yields a decision or a correction, never both
+    const corrections = extracted.corrections;
+    const supersession = await this.prepareSupersession(sessionId, msg.id, [
+      ...extracted.decisions,
+      ...corrections.map((c) => c.to),
+    ]);
+
+    // stop() closed the store while this message was being derived
+    if (this.stopped) return;
+
+    const nodes: EntityNode[] = extracted.entities.map((entity) => ({
+      id: entity.name,
+      type: entity.type,
+      value: entity.value,
+      firstSeen: msg.timestamp,
+      lastSeen: msg.timestamp,
+      references: 1,
+    }));
+    const replay = this.config.mode === 'catchup' || position?.replay === true;
+    let raised: Objection[] = [];
+
+    this.store.transaction(() => {
+      for (const node of nodes) {
+        this.store.upsertEntity(node);
+      }
+
+      // Entities mentioned in the same message are related — record
+      // co-mention edges for graph traversal
+      for (let i = 0; i < nodes.length; i++) {
+        for (let j = i + 1; j < nodes.length; j++) {
+          this.store.upsertRelation({
+            from: nodes[i].id,
+            to: nodes[j].id,
+            relation: 'co_mentioned',
+            firstSeen: msg.timestamp,
+            lastSeen: msg.timestamp,
+          });
+        }
+      }
+
+      this.store.addMessage({
+        id: msg.id,
+        sessionId,
+        role: msg.role,
+        content: msg.content,
+        timestamp: msg.timestamp,
+        embedding,
+        ...(vectors.length > 1 ? { chunkEmbeddings: vectors } : {}),
+        importanceScore: score,
+        entityIds: nodes.map((n) => n.id),
+        tags: msg.tags,
+        toolCalls: msg.toolCalls ?? (msg.toolCall ? [msg.toolCall] : undefined),
+      });
+
+      raised = this.scanForObjections(msg, sessionId, replay);
+
+      // Decisions: append-only with supersession. A new decision close enough
+      // to an active one is a fresher version of the same fact — the old
+      // record is closed (kept, with provenance) and points at its successor.
+      extracted.decisions.forEach((description, index) => {
+        this.recordDecision(sessionId, description, index, msg, supersession);
+      });
+
+      // Corrections: the corrected statement is the new current version.
+      // If it matches an active decision, supersede it; either way the
+      // correction is recorded as a tombstone with provenance.
+      corrections.forEach((correction, index) => {
+        this.recordCorrection(sessionId, correction, index, msg, supersession);
+      });
+
+      checkpoint();
+    });
+
+    // The in-memory graph follows the committed record
+    await this.retriever.indexMessage({ ...msg, sessionId }, embedding, {
+      entityIds: nodes.map((n) => n.id),
+      importance: score.total,
+      seq: this.store.getMessageSeq(msg.id) ?? undefined,
+    });
+    for (const node of nodes) {
       this.retriever.indexEntity(node);
-      this.store.upsertEntity(node);
     }
-
-    // Entities mentioned in the same message are related — record
-    // co-mention edges for graph traversal
-    for (let i = 0; i < extracted.entities.length; i++) {
-      for (let j = i + 1; j < extracted.entities.length; j++) {
-        const from = extracted.entities[i].name;
-        const to = extracted.entities[j].name;
-        this.retriever.indexRelation(from, to, 'co_mentioned');
-        this.retriever.indexRelation(to, from, 'co_mentioned');
-        this.store.upsertRelation({
-          from,
-          to,
-          relation: 'co_mentioned',
-          firstSeen: msg.timestamp,
-          lastSeen: msg.timestamp,
-        });
+    for (let i = 0; i < nodes.length; i++) {
+      for (let j = i + 1; j < nodes.length; j++) {
+        this.retriever.indexRelation(nodes[i].id, nodes[j].id, 'co_mentioned');
+        this.retriever.indexRelation(nodes[j].id, nodes[i].id, 'co_mentioned');
       }
     }
 
-    // Store the message
-    this.store.addMessage({
-      id: msg.id,
-      sessionId,
-      role: msg.role,
-      content: msg.content,
-      timestamp: msg.timestamp,
-      embedding,
-      importanceScore: score,
-      entityIds: extracted.entities.map((e) => e.name),
-    });
+    // Push as discovered — don't hold up indexing on a receiver
+    if (raised.some((o) => o.delivered)) void this.store.objectionDelivery.pump();
+  }
 
-    // Real-time objections (§12): opposing counsel reads the same stream.
-    // Catch-up replays history, so its objections are recorded for shadow
-    // judging but never delivered as if they were live.
+  /**
+   * Real-time objections (§12): opposing counsel reads the same stream.
+   * Replayed history — catch-up, and whatever a log already held when
+   * tailing started, in every mode — is recorded for shadow judging but
+   * never delivered as if it were live.
+   */
+  private scanForObjections(msg: ConversationMessage, sessionId: string, replay: boolean): Objection[] {
+    const mode = replay && this.objectionMode === 'deliver' ? 'shadow' : this.objectionMode;
     try {
-      const raised = this.store.objections.scan(
-        msg,
-        sessionId,
-        this.objectionMode === 'deliver' && this.config.mode === 'catchup' ? 'shadow' : this.objectionMode
-      );
-      // Push as discovered — don't hold up indexing on a receiver
-      if (raised.some((o) => o.delivered)) void this.store.objectionDelivery.pump();
+      // Its own savepoint: counsel failing must never cost the record
+      return this.store.transaction(() => this.store.objections.scan(msg, sessionId, mode));
     } catch (err) {
-      // Counsel failing must never cost the record
       console.error(`Objection scan failed for message ${msg.id}:`, err);
-    }
-
-    // Decisions: append-only with supersession. A new decision close enough
-    // to an active one is a fresher version of the same fact — the old
-    // record is closed (kept, with provenance) and points at its successor.
-    for (const decisionText of extracted.decisions) {
-      await this.recordDecision(sessionId, decisionText, msg);
-    }
-
-    // Corrections: the corrected statement is the new current version.
-    // If it matches an active decision, supersede it; either way the
-    // correction is recorded as a tombstone with provenance.
-    // A message like "actually, we decided to use X" matches both the
-    // decision and correction patterns — skip corrections that restate a
-    // decision already extracted from this same message.
-    const corrections = extracted.corrections.filter(
-      (c) => !extracted.decisions.some((d) => c.from.includes(d) || d.includes(c.from))
-    );
-    for (const correction of corrections) {
-      await this.recordCorrection(sessionId, correction.from, msg);
+      return [];
     }
   }
 
-  private async recordDecision(
+  private recordDecision(
     sessionId: string,
     description: string,
-    msg: ConversationMessage
-  ): Promise<void> {
-    const newId = `decision_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    const match = await this.findSupersededDecision(sessionId, description, msg.id);
+    index: number,
+    msg: ConversationMessage,
+    supersession: SupersessionContext
+  ): void {
+    // Derived from the source line, so re-deriving it can't mint a twin
+    const newId = contentId('decision', 'decision', msg.id, String(index), description);
+    const match = this.matchSuperseded(sessionId, description, supersession);
 
     this.store.addDecision(sessionId, {
       id: newId,
@@ -344,88 +675,104 @@ export class Stenographer implements StenographerAPI {
     });
 
     if (match) {
-      // Detection is proposal-only: the detector may never write truth.
-      this.writeSupersessionProposal(sessionId, match, { id: newId, description }, msg);
-
-      if (this.truthMode === 'shadow') {
-        // Phase 0: auto-close continues alongside proposals
-        this.store.supersedeDecision(match.decision.id, newId);
-        this.store.addTombstone(sessionId, {
-          id: `tombstone_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-          superseded: match.decision.description,
-          correctedTo: description,
-          reason: 'Superseded by newer decision',
-          sourceMessageId: msg.id,
-          supersededDecisionId: match.decision.id,
-          timestamp: msg.timestamp,
-        });
-      }
+      this.recordSupersession(sessionId, match, { id: newId, description, timestamp: msg.timestamp }, msg, {
+        id: contentId('tombstone', 'decision', msg.id, String(index), description),
+        reason: 'Superseded by newer decision',
+      });
     }
   }
 
-  private async recordCorrection(
+  private recordCorrection(
     sessionId: string,
-    correctedStatement: string,
-    msg: ConversationMessage
-  ): Promise<void> {
-    const match = await this.findSupersededDecision(sessionId, correctedStatement, msg.id);
-
-    let supersededDecisionId: string | undefined;
-    let supersededText = '';
-    let newId: string | undefined;
+    correction: { to: string; from: string },
+    index: number,
+    msg: ConversationMessage,
+    supersession: SupersessionContext
+  ): void {
+    const correctedStatement = correction.to;
+    const match = this.matchSuperseded(sessionId, correctedStatement, supersession);
+    const tombstoneId = contentId('tombstone', 'correction', msg.id, String(index), correctedStatement);
 
     if (match) {
       // The correction is the fresher version of a settled decision:
       // record it as a new decision; closing the old one is truth-mode-gated.
-      newId = `decision_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      const newId = contentId('decision', 'correction', msg.id, String(index), correctedStatement);
       this.store.addDecision(sessionId, {
         id: newId,
         description: correctedStatement,
         sourceMessageId: msg.id,
         timestamp: msg.timestamp,
       });
-      this.writeSupersessionProposal(
+      this.recordSupersession(
         sessionId,
         match,
-        { id: newId, description: correctedStatement },
-        msg
+        { id: newId, description: correctedStatement, timestamp: msg.timestamp },
+        msg,
+        { id: tombstoneId, reason: 'Correction superseded prior decision' }
       );
-      supersededDecisionId = match.decision.id;
-      supersededText = match.decision.description;
-    }
-
-    if (this.truthMode === 'shadow') {
-      // Phase 0: legacy auto-close + inferred tombstone continue
-      if (match && newId) {
-        this.store.supersedeDecision(match.decision.id, newId);
-      }
+    } else if (this.truthMode === 'shadow') {
+      // Phase 0: the inferred tombstone continues; it names what the
+      // correction replaces when the sentence does ("X instead of Y")
       this.store.addTombstone(sessionId, {
-        id: `tombstone_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-        superseded: supersededText,
+        id: tombstoneId,
+        superseded: correction.from,
         correctedTo: correctedStatement,
-        reason: match ? 'Correction superseded prior decision' : 'Correction detected',
+        reason: 'Correction detected',
         sourceMessageId: msg.id,
-        supersededDecisionId,
         timestamp: msg.timestamp,
       });
-    } else if (!match) {
+    } else {
       // Assert mode, unmatched correction: still worth a reviewable proposal
-      this.store.truth.addProposal(
-        {
-          kind: 'tombstone',
-          draft: {
-            claim: `Correction detected: ${correctedStatement}`,
-            evidence: [{ kind: 'message', ref: msg.id, detail: correctedStatement }],
+      this.fileDetectorProposal(msg, () =>
+        this.store.truth.addProposal(
+          {
+            kind: 'tombstone',
+            draft: {
+              claim: `Correction detected: ${correctedStatement}`,
+              evidence: [{ kind: 'message', ref: msg.id, detail: correctedStatement }],
+            },
+            signal: { source: 'supersession-detector', detail: 'correction pattern, no matching decision' },
+            targetRef: `correction:${msg.id}`,
           },
-          signal: { source: 'supersession-detector', detail: 'correction pattern, no matching decision' },
-          targetRef: `correction:${msg.id}`,
-        },
-        {
-          author: DETECTOR_AUTHOR,
-          provenance: { kind: 'sourceMessageId', ref: msg.id },
-          timestamp: msg.timestamp,
-        }
+          {
+            author: DETECTOR_AUTHOR,
+            provenance: { kind: 'sourceMessageId', ref: msg.id },
+            timestamp: msg.timestamp,
+          }
+        )
       );
+    }
+  }
+
+  /**
+   * A new decision and an active one are versions of one fact: the newer
+   * closes the older, whichever was indexed first — watch mode replays logs
+   * in directory order, not time order. Detection is proposal-only (the
+   * detector may never write truth); in shadow mode (Phase 0) the auto-close
+   * and the inferred tombstone continue alongside the proposal.
+   */
+  private recordSupersession(
+    sessionId: string,
+    match: { decision: IndexedDecision; score: number },
+    incoming: { id: string; description: string; timestamp: string },
+    msg: ConversationMessage,
+    tombstone: { id: string; reason: string }
+  ): void {
+    const late = isAfter(match.decision.timestamp, incoming.timestamp);
+    const [older, newer] = late ? [incoming, match.decision] : [match.decision, incoming];
+    this.writeSupersessionProposal(sessionId, older, newer, match.score, msg);
+
+    if (this.truthMode === 'shadow') {
+      this.store.supersedeDecision(older.id, newer.id);
+      this.store.addTombstone(sessionId, {
+        id: tombstone.id,
+        superseded: older.description,
+        correctedTo: newer.description,
+        reason: late ? 'Superseded by a newer version indexed earlier' : tombstone.reason,
+        sourceMessageId: msg.id,
+        supersededDecisionId: older.id,
+        timestamp: msg.timestamp,
+      });
     }
   }
 
@@ -433,60 +780,137 @@ export class Stenographer implements StenographerAPI {
    * Writes a PROPOSAL(kind: tombstone) for a detected supersession — the
    * detector's only write surface into the truth layer. Signing it (an
    * accountable author) is what closes the superseded decision in assert
-   * mode; dismissing it costs nothing.
+   * mode; dismissing it costs nothing. Proposals are deduped per
+   * (superseded, successor) pair, so a second successor of one decision
+   * gets its own proposal instead of being swallowed by the first.
    */
   private writeSupersessionProposal(
     sessionId: string,
-    match: { decision: IndexedDecision; score: number },
+    superseded: { id: string; description: string },
     successor: { id: string; description: string },
+    score: number,
     msg: ConversationMessage
   ): void {
-    this.store.truth.addProposal(
-      {
-        kind: 'tombstone',
-        draft: {
-          claim: `"${match.decision.description}" is superseded by "${successor.description}"`,
-          evidence: [{ kind: 'message', ref: msg.id, detail: successor.description }],
+    this.fileDetectorProposal(msg, () =>
+      this.store.truth.addProposal(
+        {
+          kind: 'tombstone',
+          draft: {
+            claim: `"${superseded.description}" is superseded by "${successor.description}"`,
+            evidence: [{ kind: 'message', ref: msg.id, detail: successor.description }],
+          },
+          signal: {
+            source: 'supersession-detector',
+            score,
+            threshold: this.supersedeThreshold,
+          },
+          targetRef: `${superseded.id}->${successor.id}`,
+          meta: {
+            supersededDecisionId: superseded.id,
+            successorDecisionId: successor.id,
+            sessionId,
+          },
         },
-        signal: {
-          source: 'supersession-detector',
-          score: match.score,
-          threshold: this.supersedeThreshold,
-        },
-        targetRef: match.decision.id,
-        meta: {
-          supersededDecisionId: match.decision.id,
-          successorDecisionId: successor.id,
-          sessionId,
-        },
-      },
-      {
-        author: DETECTOR_AUTHOR,
-        provenance: { kind: 'sourceMessageId', ref: msg.id },
-        timestamp: msg.timestamp,
-      }
+        {
+          author: DETECTOR_AUTHOR,
+          provenance: { kind: 'sourceMessageId', ref: msg.id },
+          timestamp: msg.timestamp,
+        }
+      )
     );
   }
 
-  /** Finds the active decision most similar to the given text, if above threshold. */
-  private async findSupersededDecision(
+  /**
+   * Files a detector proposal in its own savepoint, inside the message's
+   * transaction. The ledger admits every entry the way it admits a live
+   * write, and an entry it refuses (one it can't canonicalize, say) must
+   * not cost the record it was derived from: the message, its decisions
+   * and the checkpoint commit without the proposal.
+   */
+  private fileDetectorProposal(msg: ConversationMessage, write: () => unknown): void {
+    try {
+      this.store.transaction(write);
+    } catch (err) {
+      console.error(`⚠️  The ledger refused a proposal derived from message ${msg.id}: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+
+  /**
+   * Applies a signed supersession. When the superseded decision was already
+   * closed by another version, the newer of that chain's current version
+   * and the signed successor closes the other — so signing every proposal
+   * against one decision, in any order, leaves one current version.
+   */
+  private applySupersession(supersededId: string, successorId: string): void {
+    const superseded = this.store.getDecision(supersededId);
+    const successor = this.store.getDecision(successorId);
+    if (!superseded || !successor || successor.superseded) return;
+    if (!superseded.superseded) {
+      this.store.supersedeDecision(supersededId, successorId);
+      return;
+    }
+    const chain = this.store.getDecisionChain(supersededId);
+    const current = chain[chain.length - 1];
+    if (!current || current.superseded || current.id === successorId) return;
+    const [older, newer] = isAfter(successor.timestamp, current.timestamp) ? [current, successor] : [successor, current];
+    this.store.supersedeDecision(older.id, newer.id);
+  }
+
+  /**
+   * Where a new decision looks for the versions it supersedes: its session
+   * in file modes; in watch mode every session in the database, because
+   * each conversation (and each /clear) is a new log, but one project's
+   * decisions supersede each other across them.
+   */
+  private supersessionScope(sessionId: string): string | null {
+    return this.config.mode === 'watch' ? null : sessionId;
+  }
+
+  /**
+   * Embeds, ahead of the commit, the decisions a message could supersede —
+   * those active before it; a message never supersedes decisions it
+   * asserted itself — and the texts it asserts.
+   */
+  private async prepareSupersession(
+    sessionId: string,
+    messageId: string,
+    texts: string[]
+  ): Promise<SupersessionContext> {
+    const context: SupersessionContext = { candidates: [], embeddings: new Map() };
+    if (texts.length === 0) return context;
+
+    const active = this.store
+      .getActiveDecisions(this.supersessionScope(sessionId))
+      .filter((d) => d.sourceMessageId !== messageId);
+    if (active.length === 0) return context;
+
+    for (const decision of active) {
+      context.candidates.push({ decision, embedding: await this.embedder!.embed(decision.description) });
+    }
+    for (const text of texts) {
+      if (!context.embeddings.has(text)) context.embeddings.set(text, await this.embedder!.embed(text));
+    }
+    return context;
+  }
+
+  /** The still-active candidate most similar to the given text, if above threshold. */
+  private matchSuperseded(
     sessionId: string,
     text: string,
-    excludeSourceMessageId?: string
-  ): Promise<{ decision: IndexedDecision; score: number } | null> {
-    // A message never supersedes decisions it asserted itself
-    const active = this.store
-      .getActiveDecisions(sessionId)
-      .filter((d) => !excludeSourceMessageId || d.sourceMessageId !== excludeSourceMessageId);
-    if (active.length === 0) return null;
+    supersession: SupersessionContext
+  ): { decision: IndexedDecision; score: number } | null {
+    const textEmbedding = supersession.embeddings.get(text);
+    if (!textEmbedding) return null;
 
-    const textEmbedding = await this.embedder!.embed(text);
+    // Re-read inside the transaction: an earlier text in this message (or a
+    // signing while this one was being derived) may have closed a candidate
+    const active = new Set(this.store.getActiveDecisions(this.supersessionScope(sessionId)).map((d) => d.id));
     let best: IndexedDecision | null = null;
     let bestScore = 0;
 
-    for (const decision of active) {
-      const decisionEmbedding = await this.embedder!.embed(decision.description);
-      const score = cosineSimilarity(textEmbedding, decisionEmbedding);
+    for (const { decision, embedding } of supersession.candidates) {
+      if (!active.has(decision.id)) continue;
+      const score = cosineSimilarity(textEmbedding, embedding);
       if (score > bestScore) {
         bestScore = score;
         best = decision;
@@ -503,13 +927,7 @@ export class Stenographer implements StenographerAPI {
   // ─────────────────────────────────────────────────────────
 
   async getRecentMessages(n: number): Promise<ConversationMessage[]> {
-    return this.store.getRecentMessages(this.scope, n).map((m) => ({
-      id: m.id,
-      role: m.role as ConversationMessage['role'],
-      content: m.content,
-      timestamp: m.timestamp,
-      sessionId: m.sessionId,
-    }));
+    return this.store.getRecentMessages(this.scope, n).map(toConversationMessage);
   }
 
   async getEntities(): Promise<EntityNode[]> {
@@ -547,61 +965,74 @@ export class Stenographer implements StenographerAPI {
   }
 
   async searchSimilar(query: string, k: number): Promise<ConversationMessage[]> {
-    if (!this.embedder) {
-      this.embedder = await createEmbedder(this.config.embeddingModel);
-    }
-    const embedding = await this.embedder.embed(query);
-    return this.store.searchSimilar(embedding, k, this.scope).map(({ message }) => ({
-      id: message.id,
-      role: message.role as ConversationMessage['role'],
-      content: message.content,
-      timestamp: message.timestamp,
-      sessionId: message.sessionId,
-    }));
+    const embedding = await (await this.ensureEmbedder()).embed(query);
+    return this.store.searchSimilar(embedding, k, this.scope).map(({ message }) => toConversationMessage(message));
   }
 
-  /** Hybrid GraphRAG search (vector + entity graph traversal). */
+  /**
+   * Hybrid GraphRAG search: messages ranked by reciprocal rank fusion of
+   * vector similarity, entity-graph evidence, recency and importance.
+   */
   async searchGraphRAG(ctx: QueryContext): Promise<RetrievedChunk[]> {
-    return this.retriever.search(ctx);
+    await this.ensureEmbedder();
+    return this.retriever.search({ ...ctx, sessionId: ctx.sessionId ?? this.scope ?? undefined });
   }
 
+  /**
+   * A markdown frame of the current state for an LLM, within `tokenBudget`
+   * (estimated at 4 characters per token) across every section. Each
+   * section has a share of the budget — recent messages 50%, decisions 35%,
+   * entities 15% — and what one leaves unused passes to the others. Within
+   * a section, items get room in priority order: the newest message, then
+   * the rest of the recent window by importance; the newest decisions; the
+   * most-referenced entities. Messages and decisions are shown in order.
+   */
   async buildContextFrame(tokenBudget: number): Promise<string> {
-    const messages = this.store.getRecentMessages(this.scope, 10).reverse();
-    const decisions = this.store.getActiveDecisions(this.scope);
-    const entities = this.store.getEntities(this.scope);
+    const limit = Math.max(0, Math.floor(tokenBudget)) * CHARS_PER_TOKEN;
+    const recent = this.store.getRecentMessages(this.scope, FRAME_MESSAGE_WINDOW); // newest first
+    const decisions = this.store.getActiveDecisions(this.scope); // oldest first
+    const entities = this.store
+      .getEntities(this.scope)
+      .sort((a, b) => b.references - a.references || b.lastSeen.localeCompare(a.lastSeen));
 
-    const parts: string[] = [];
+    const sections: FrameSection[] = [
+      {
+        header: '## Entities',
+        items: entities.map((e) => `- ${clip(e.value, FRAME_ENTITY_CHARS)} (${e.type})`),
+        priority: entities.map((_, i) => i),
+        share: 0.15,
+      },
+      {
+        header: '## Decisions',
+        items: decisions.map((d) => `- ${clip(d.description, FRAME_ITEM_CHARS)}`),
+        priority: decisions.map((_, i) => decisions.length - 1 - i),
+        share: 0.35,
+      },
+      {
+        header: '## Recent Messages',
+        // Shown oldest first
+        items: [...recent].reverse().map((m) => `${m.role}: ${clip(embeddingText(m), FRAME_ITEM_CHARS)}`),
+        priority: recent
+          .map((m, age) => ({ age, importance: m.importanceScore.total }))
+          .sort((a, b) => (a.age === 0 ? -1 : b.age === 0 ? 1 : b.importance - a.importance || a.age - b.age))
+          .map(({ age }) => recent.length - 1 - age),
+        share: 0.5,
+      },
+    ];
 
-    // Add entities (most compact)
-    if (entities.length > 0) {
-      parts.push(`## Entities\n${entities.map((e) => `- ${e.value} (${e.type})`).join('\n')}`);
-    }
+    // Fill order: messages, decisions, entities — by share, then leftovers
+    const fillOrder = [sections[2], sections[1], sections[0]];
+    let remaining = limit;
+    for (const section of fillOrder) remaining -= fillSection(section, Math.min(remaining, Math.floor(limit * section.share)));
+    for (const section of fillOrder) remaining -= fillSection(section, remaining);
 
-    // Add decisions
-    if (decisions.length > 0) {
-      parts.push(`## Decisions\n${decisions.map((d) => `- ${d.description}`).join('\n')}`);
-    }
-
-    // Add recent messages (most expensive)
-    let currentTokens = estimateTokens(parts.join('\n'));
-    const recentMessages: string[] = [];
-
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const msg = messages[i];
-      const msgText = `\n${msg.role}: ${msg.content.slice(0, 200)}`;
-      const msgTokens = estimateTokens(msgText);
-
-      if (currentTokens + msgTokens > tokenBudget) break;
-
-      recentMessages.unshift(msgText);
-      currentTokens += msgTokens;
-    }
-
-    if (recentMessages.length > 0) {
-      parts.push(`## Recent Messages${recentMessages.join('')}`);
-    }
-
-    return parts.join('\n\n');
+    return sections
+      .filter((section) => section.chosen && section.chosen.size > 0)
+      .map((section) => {
+        const shown = [...section.chosen!].sort((a, b) => a - b).map((i) => section.items[i]);
+        return [section.header, ...shown].join('\n');
+      })
+      .join('\n\n');
   }
 
   async getStatus(): Promise<{
@@ -619,13 +1050,22 @@ export class Stenographer implements StenographerAPI {
 
   private async ensureEmbedder(): Promise<Embedder> {
     if (!this.embedder) {
-      this.embedder = await createEmbedder(this.config.embeddingModel);
+      this.embedder = await this.openEmbedder();
     }
     return this.embedder;
   }
 
   getTruthMode(): 'shadow' | 'assert' {
     return this.truthMode;
+  }
+
+  /**
+   * Validates an identity for an act only `roles` may perform: canonical,
+   * never anonymous or reserved, and — when a signer registry is configured
+   * — listed with one of those roles. Returns the canonical spelling.
+   */
+  resolveIdentity(raw: string, roles: SignerRole[], what: string): string {
+    return resolveIdentity(raw, roles, what, this.signers);
   }
 
   /** The review inbox. */
@@ -639,7 +1079,8 @@ export class Stenographer implements StenographerAPI {
   /**
    * Mints the TB/UV from a proposal under an accountable signer, and closes
    * the superseded decision the proposal targeted (idempotent in shadow
-   * mode, where auto-close already did it).
+   * mode, where auto-close already did it). Agent drafts are refused here:
+   * they mint only through notarizeProposal.
    */
   async signProposal(
     proposalId: string,
@@ -647,7 +1088,8 @@ export class Stenographer implements StenographerAPI {
     edits?: Record<string, unknown>,
     agentSessionId?: string
   ): Promise<TbEntry | UvEntry> {
-    return this.mintProposal(proposalId, signedBy, edits, { agentSessionId });
+    const signer = this.resolveIdentity(signedBy, ['human'], 'signer');
+    return this.mintProposal(proposalId, signer, edits, { agentSessionId });
   }
 
   /**
@@ -663,13 +1105,33 @@ export class Stenographer implements StenographerAPI {
     targetRef?: string;
     proposedBy: string;
     agentSessionId?: string;
-  }): Promise<{ proposal: ProposalEntry; raisedTo: string[]; undelivered: Array<{ url: string; error?: string }> }> {
+  }): Promise<{
+    proposal: ProposalEntry;
+    /** Set when the drafter already had an open draft for this targetRef: that one is returned, unchanged. */
+    dedupedInto?: string;
+    raisedTo: string[];
+    undelivered: Array<{ url: string; error?: string }>;
+  }> {
+    const proposedBy = this.resolveIdentity(input.proposedBy, ['agent', 'human'], 'drafter');
+    const prior = input.targetRef
+      ? this.store.truth.findOpenProposal({
+          kind: 'tombstone',
+          targetRef: input.targetRef,
+          author: proposedBy,
+          requiresNotary: true,
+          source: 'agent-draft',
+        })
+      : null;
     const embedding = await (await this.ensureEmbedder()).embed(input.claim);
     const proposal = this.store.truth.draftTombstone(input, {
-      author: input.proposedBy,
+      author: proposedBy,
       agentSessionId: input.agentSessionId ?? null,
       embedding,
     });
+    // Already raised when it was first drafted — don't page the notary twice
+    if (prior && prior.id === proposal.id) {
+      return { proposal, dedupedInto: proposal.id, raisedTo: [], undelivered: [] };
+    }
     console.error(formatProposalNotice(proposal));
     const results = await raiseForNotarization(
       this.config.objectionSinks ?? [],
@@ -693,7 +1155,22 @@ export class Stenographer implements StenographerAPI {
     notary: string,
     edits?: Record<string, unknown>
   ): Promise<TbEntry | UvEntry> {
-    return this.mintProposal(proposalId, notary, edits, { notarized: true });
+    const signer = this.resolveIdentity(notary, ['human'], 'notary');
+    return this.mintProposal(proposalId, signer, edits, { notarized: true });
+  }
+
+  /**
+   * Files a truth format v2 PROPOSAL envelope that a tool authoring truth
+   * outside stenographer submitted on its own (REST `POST /proposals`), by
+   * the proposals-stream intake: an open proposal that only a person can
+   * turn into truth, by notarizing it. It is filed under the envelope's
+   * author, who must be a person or an agent (listed as one when a signer
+   * registry is configured), so that author can't notarize it. `duplicate`
+   * means this envelope was submitted before; one a proposals stream filed
+   * first is a ProposalConflictError.
+   */
+  async submitProposal(envelope: Record<string, unknown>): Promise<{ outcome: 'filed' | 'duplicate'; proposal: ProposalEntry }> {
+    return submitProposalEnvelope(this.store.truth, envelope, (author) => this.resolveIdentity(author, ['agent', 'human'], 'author'));
   }
 
   /** Where a notary approves a proposal over REST, when the API is up. */
@@ -723,10 +1200,7 @@ export class Stenographer implements StenographerAPI {
 
     const meta = proposal?.body.meta;
     if (meta?.supersededDecisionId && meta?.successorDecisionId) {
-      this.store.supersedeDecision(
-        meta.supersededDecisionId as string,
-        meta.successorDecisionId as string
-      );
+      this.applySupersession(meta.supersededDecisionId as string, meta.successorDecisionId as string);
     }
     return entry;
   }
@@ -736,10 +1210,15 @@ export class Stenographer implements StenographerAPI {
     dismissedBy: string,
     reason: string
   ): Promise<ProposalEntry> {
-    return this.store.truth.dismissProposal(proposalId, dismissedBy, reason);
+    const dismisser = this.resolveIdentity(dismissedBy, ['human'], 'dismisser');
+    return this.store.truth.dismissProposal(proposalId, dismisser, reason);
   }
 
-  /** Direct TB, skipping the proposal path — for authors who already know. */
+  /**
+   * Direct TB, skipping the proposal path — for authors who already know.
+   * The signer may be a person or (single-user setups) an agent identity;
+   * a registry decides which, when configured.
+   */
   async assertTombstone(input: {
     claim: string;
     evidence: Evidence[];
@@ -748,11 +1227,13 @@ export class Stenographer implements StenographerAPI {
     author?: string;
     agentSessionId?: string;
   }): Promise<TbEntry> {
+    const signedBy = this.resolveIdentity(input.signedBy, ['human', 'agent'], 'signer');
+    const author = input.author ? this.resolveIdentity(input.author, ['human', 'agent'], 'author') : signedBy;
     const embedding = await (await this.ensureEmbedder()).embed(input.claim);
     return this.store.truth.assertTombstone(
-      { claim: input.claim, evidence: input.evidence, signedBy: input.signedBy, literals: input.literals },
+      { claim: input.claim, evidence: input.evidence, signedBy, literals: input.literals },
       {
-        author: input.author ?? input.signedBy,
+        author,
         agentSessionId: input.agentSessionId ?? null,
         embedding,
       }
@@ -763,10 +1244,11 @@ export class Stenographer implements StenographerAPI {
     assertion: string;
     basis: string;
     verifyBy: VerifyBy;
-    contests?: string;
+    contests?: string | null;
     author: string;
     agentSessionId?: string;
   }): Promise<UvEntry> {
+    const author = this.resolveIdentity(input.author, ['human', 'agent'], 'author');
     const embedding = await (await this.ensureEmbedder()).embed(input.assertion);
     return this.store.truth.assertUv(
       {
@@ -775,7 +1257,7 @@ export class Stenographer implements StenographerAPI {
         verifyBy: input.verifyBy,
         contests: input.contests,
       },
-      { author: input.author, agentSessionId: input.agentSessionId ?? null, embedding }
+      { author, agentSessionId: input.agentSessionId ?? null, embedding }
     );
   }
 
@@ -789,6 +1271,8 @@ export class Stenographer implements StenographerAPI {
       opinion?: string;
       mintTombstone?: string;
       agentSessionId?: string;
+      /** False refuses any resolution that would mint a TB (the MCP agent profile). */
+      allowMint?: boolean;
     }
   ): Promise<{
     uv: UvEntry;
@@ -796,34 +1280,38 @@ export class Stenographer implements StenographerAPI {
     tombstone: TbEntry | null;
     ruling: RulingEntry | null;
   }> {
+    const author = this.resolveIdentity(opts.author, ['human', 'agent'], 'resolver');
+    const signedBy = opts.signedBy ? this.resolveIdentity(opts.signedBy, ['human'], 'signer') : undefined;
     const uv = this.store.truth.getEntry(uvId) as UvEntry | null;
     const embedding = uv
       ? await (await this.ensureEmbedder()).embed(uv.body.assertion)
       : undefined;
     return this.store.truth.resolveUv(uvId, resolution, evidence, {
-      author: opts.author,
-      signedBy: opts.signedBy,
+      author,
+      signedBy,
       opinion: opts.opinion,
       mintTombstone: opts.mintTombstone,
       agentSessionId: opts.agentSessionId ?? null,
+      allowMint: opts.allowMint,
       embedding,
     });
   }
 
-  /** The force path — fails without evidence. */
+  /** The force path — fails without evidence. A person's act. */
   async overrideTombstone(
     tbId: string,
     addendum: { evidence: Evidence[]; note?: string },
     opts: { author: string; agentSessionId?: string }
   ): Promise<{ tombstone: TbEntry; addendum: AddendumEntry }> {
     return this.store.truth.overrideTombstone(tbId, addendum, {
-      author: opts.author,
+      author: this.resolveIdentity(opts.author, ['human'], 'author'),
       agentSessionId: opts.agentSessionId ?? null,
     });
   }
 
+  /** Rulings are judgments: a person's act. */
   async fileRuling(input: {
-    kind: 'strike' | 'promotion' | 'contempt';
+    kind: FiledRulingKind;
     opinion: string;
     target: string;
     author: string;
@@ -831,7 +1319,10 @@ export class Stenographer implements StenographerAPI {
   }): Promise<{ ruling: RulingEntry; conductTombstone: TbEntry | null }> {
     return this.store.truth.fileRuling(
       { kind: input.kind, opinion: input.opinion, target: input.target },
-      { author: input.author, agentSessionId: input.agentSessionId ?? null }
+      {
+        author: this.resolveIdentity(input.author, ['human'], 'ruling author'),
+        agentSessionId: input.agentSessionId ?? null,
+      }
     );
   }
 
@@ -846,8 +1337,8 @@ export class Stenographer implements StenographerAPI {
     context?: string,
     k: number = 10
   ): Promise<Array<UvEntry & { queueRank: { contesting: boolean; relevance: number; deprioritized: boolean } }>> {
-    const uvs = this.store.truth.getOpenUvs();
     const ctxEmbedding = context ? await (await this.ensureEmbedder()).embed(context) : null;
+    const uvs = ctxEmbedding ? await this.withEmbeddings(this.store.truth.getOpenUvs()) : this.store.truth.getOpenUvs();
 
     const scored = uvs.map((uv) => {
       const contesting = Boolean(uv.body.contests);
@@ -892,9 +1383,10 @@ export class Stenographer implements StenographerAPI {
     k: number = 5,
     filter: TruthFilter = 'current'
   ): Promise<Array<(TbEntry | UvEntry) & { relevance: number }>> {
-    const entries = this.store.truth.getTruth(filter);
-    if (entries.length === 0) return [];
+    const found = this.store.truth.getTruth(filter);
+    if (found.length === 0) return [];
     const queryEmbedding = await (await this.ensureEmbedder()).embed(query);
+    const entries = await this.withEmbeddings(found);
 
     return entries
       .map((entry) => {
@@ -909,6 +1401,27 @@ export class Stenographer implements StenographerAPI {
           Number(b.type === 'TB') - Number(a.type === 'TB')
       )
       .slice(0, k);
+  }
+
+  /**
+   * Fills in the embedding of entries that have none (imported by a caller
+   * without an embedder, or before 1.0 embedded imports) and caches it, so
+   * relevance ranking never scores a relevant entry 0 for lack of one.
+   */
+  private async withEmbeddings<T extends (TbEntry | UvEntry) & { embedding: number[] | null }>(entries: T[]): Promise<T[]> {
+    if (entries.every((e) => e.embedding)) return entries;
+    const embedder = await this.ensureEmbedder();
+    const filled: T[] = [];
+    for (const entry of entries) {
+      if (entry.embedding) {
+        filled.push(entry);
+        continue;
+      }
+      const embedding = await embedder.embed(entry.type === 'TB' ? entry.body.claim : entry.body.assertion);
+      this.store.truth.cacheEmbedding(entry.id, embedding);
+      filled.push({ ...entry, embedding });
+    }
+    return filled;
   }
 
   async getTruthStats(): Promise<{
@@ -941,21 +1454,29 @@ export class Stenographer implements StenographerAPI {
    * The judge rules. Sustained lands in the record as corroboration for
    * the TB; overruled is signal for tightening the matcher. Either way the
    * ruling is an ordinary RULING in the ledger, with a written opinion.
+   * The judge is a person, and never the session the objection was raised
+   * against: the defendant doesn't rule on its own objection.
    */
   async ruleOnObjection(
     objectionId: string,
     outcome: 'sustained' | 'overruled',
     opts: { author: string; opinion: string; agentSessionId?: string }
   ): Promise<{ objection: Objection; ruling: RulingEntry }> {
+    const author = this.resolveIdentity(opts.author, ['human'], 'judge');
     const objection = this.store.objections.get(objectionId);
     if (!objection) throw new Error(`no such objection: ${objectionId}`);
     if (objection.status !== 'pending') {
       throw new Error(`objection ${objectionId} was already ${objection.status}`);
     }
+    if (opts.agentSessionId && opts.agentSessionId.trim() === objection.sessionId.trim()) {
+      throw new ContemptError(
+        `contempt of corpus: session ${objection.sessionId} cannot rule on objection ${objectionId} raised against it`
+      );
+    }
     const ruling = this.store.truth.fileObjectionRuling(
       { objectionId, tbId: objection.tbId, outcome, opinion: opts.opinion },
       {
-        author: opts.author,
+        author,
         agentSessionId: opts.agentSessionId ?? null,
         provenance: { kind: 'sourceMessageId', ref: objection.messageId },
       }
@@ -977,22 +1498,84 @@ export class Stenographer implements StenographerAPI {
     await this.store.objectionDelivery.pump();
   }
 
-  /** The tuning dial: a falling sustain rate means tighten the matcher. */
-  async getObjectionStats(): Promise<ObjectionStats & { mode: ObjectionMode }> {
-    return { ...this.store.objections.stats(), mode: this.objectionMode };
+  /**
+   * The tuning dial: a falling sustain rate means tighten the matcher.
+   * `deadLettered` counts objections a receiver refused for good or never
+   * took within its attempts.
+   */
+  async getObjectionStats(): Promise<ObjectionStats & { mode: ObjectionMode; deadLettered: number }> {
+    return {
+      ...this.store.objections.stats(),
+      mode: this.objectionMode,
+      deadLettered: this.store.objectionDelivery.deadLetterCount(),
+    };
   }
 
-  /** §8 export: signed truth only, x-steno namespaced extras. */
-  async exportWikiEntries(options: { since?: string; path?: string } = {}): Promise<{
-    lines: string[];
+  /** A file in the wiki directory (`wikiDir`, default `<state dir>/wiki`); never the state file. */
+  private wikiFile(file: string): WikiFileTarget {
+    const statePath = this.config.statePath || './stenographer.db';
+    const memory = statePath === ':memory:';
+    return {
+      dir: this.config.wikiDir ?? defaultWikiDir(memory ? './stenographer.db' : statePath),
+      file,
+      statePath: memory ? undefined : statePath,
+    };
+  }
+
+  /**
+   * §8 export, truth format v2 (spec/truth-format): this ledger's
+   * hash-chained line stream — TB, UV, and the addenda and rulings that
+   * change a status, with a TRANSITION line for each change. Never
+   * proposals. With `file` (inside the wiki directory, and this ledger's
+   * own: one writer per file), appends the lines the file doesn't hold yet;
+   * without it, returns the lines after `sinceSeq` (or, deprecated, from
+   * the first line written after `since`).
+   */
+  async exportWikiEntries(options: { sinceSeq?: number; since?: string; file?: string } = {}): Promise<{
+    lines?: string[];
     count: number;
+    lastSeq: number;
+    skipped: Array<{ id: string; error: string }>;
+    file?: string;
+    appended?: number;
+    present?: number;
   }> {
-    return exportWikiEntries(this.store.truth, options);
+    if (options.file === undefined) {
+      return exportWikiEntries(this.store.truth, { sinceSeq: options.sinceSeq, since: options.since });
+    }
+    if (options.sinceSeq !== undefined || options.since !== undefined) {
+      throw new Error('a file export appends whatever the file lacks: sinceSeq and since apply to inline exports only');
+    }
+    const target = this.wikiFile(options.file);
+    const stream = exportWikiEntries(this.store.truth);
+    const written = appendWikiFile(target, stream.lines);
+    return {
+      file: target.file,
+      count: stream.count,
+      lastSeq: stream.lastSeq,
+      appended: written.appended,
+      present: written.present,
+      skipped: stream.skipped,
+    };
   }
 
-  /** §8 import: wiki entries keep their ids/authors; conflicts become proposals. */
-  async importWikiEntries(input: { path?: string; lines?: string[] }): Promise<ImportResult> {
-    return importWikiEntries(this.store.truth, input);
+  /**
+   * §8 import: one transaction per file, whose v2 lines must chain.
+   * Entries keep their ids and authors; a TB lands as truth only signed and
+   * verifiable (hash-chained, and a signer the registry lists, when there
+   * is one) — otherwise as a reconciliation proposal. Status changes are
+   * applied from the addenda and rulings that cause them. Imported claims
+   * and assertions are embedded, so search ranks them.
+   */
+  async importWikiEntries(input: { file?: string; lines?: string[] }): Promise<ImportResult> {
+    const lines = input.lines ?? readWikiFile(this.wikiFile(input.file ?? ''));
+    const embedder = await this.ensureEmbedder();
+    const embeddings = new Map<string, number[]>();
+    for (const [id, text] of wikiLineTexts(lines)) {
+      // Only what this import can add: a re-import embeds nothing
+      if (!this.store.truth.getEntry(id)) embeddings.set(id, await embedder.embed(text));
+    }
+    return importWikiEntries(this.store.truth, { lines }, { signers: this.signers, embeddings });
   }
 
   /**
@@ -1016,6 +1599,22 @@ export class Stenographer implements StenographerAPI {
   }
 }
 
+function retrieverInfo(m: IndexedMessage): { entityIds: string[]; importance: number; seq?: number } {
+  return { entityIds: m.entityIds, importance: m.importanceScore.total, seq: m.seq };
+}
+
+function toConversationMessage(m: IndexedMessage): ConversationMessage {
+  return {
+    id: m.id,
+    role: m.role as ConversationMessage['role'],
+    content: m.content,
+    timestamp: m.timestamp,
+    sessionId: m.sessionId,
+    ...(m.toolCalls ? { toolCalls: m.toolCalls } : {}),
+    ...(m.tags ? { tags: m.tags } : {}),
+  };
+}
+
 function toDecision(d: IndexedDecision): Decision {
   return {
     id: d.id,
@@ -1028,7 +1627,44 @@ function toDecision(d: IndexedDecision): Decision {
   };
 }
 
-function estimateTokens(text: string): number {
-  // Rough heuristic: ~4 chars per token
-  return Math.ceil(text.length / 4);
+/** Whether timestamp `a` is strictly later than `b`; unparseable timestamps are never later. */
+function isAfter(a: string, b: string): boolean {
+  const ta = Date.parse(a);
+  const tb = Date.parse(b);
+  return Number.isFinite(ta) && Number.isFinite(tb) && ta > tb;
+}
+
+// Context frame: ~4 characters per token
+const CHARS_PER_TOKEN = 4;
+const FRAME_MESSAGE_WINDOW = 20;
+const FRAME_ITEM_CHARS = 200;
+const FRAME_ENTITY_CHARS = 48;
+
+interface FrameSection {
+  header: string;
+  items: string[];
+  /** Item indexes, most deserving of room first. */
+  priority: number[];
+  share: number;
+  chosen?: Set<number>;
+}
+
+/** Adds the section's items that fit in `allowance` characters, in priority order; returns what they cost. */
+function fillSection(section: FrameSection, allowance: number): number {
+  const chosen = (section.chosen ??= new Set());
+  let spent = 0;
+  for (const index of section.priority) {
+    if (chosen.has(index)) continue;
+    // The first item also pays for the header and the blank line before it
+    const cost = section.items[index].length + 1 + (chosen.size === 0 ? section.header.length + 2 : 0);
+    if (cost > allowance - spent) continue;
+    chosen.add(index);
+    spent += cost;
+  }
+  return spent;
+}
+
+function clip(text: string, max: number): string {
+  const flat = text.replace(/\s+/g, ' ').trim();
+  return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
 }

@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { StateStore } from '../src/store/index.js';
 import { TruthLedger, TruthWriteError, ContemptError } from '../src/truth/ledger.js';
+import { exportWikiEntries } from '../src/truth/wiki.js';
 import type { Evidence, TbEntry } from '../src/truth/types.js';
 
 const commandEvidence: Evidence[] = [
@@ -180,13 +181,21 @@ describe('TruthLedger', () => {
       { author: 'sam' }
     );
 
-    const result = ledger.resolveUv(uv.id, 'verified', commandEvidence, { author: 'alex' });
+    // Command output the resolver says it saw is a claim: it doesn't self-sign
+    expect(() => ledger.resolveUv(uv.id, 'verified', commandEvidence, { author: 'alex' })).toThrow(/signedBy/);
+    expect((ledger.getEntry(tombstone.id) as TbEntry).body.status).toBe('contested');
+
+    const result = ledger.resolveUv(uv.id, 'verified', commandEvidence, {
+      author: 'alex',
+      signedBy: 'johnny',
+      opinion: 'reran the suite myself; the window slides',
+    });
     expect(result.uv.body.status).toBe('verified');
     expect((ledger.getEntry(tombstone.id) as TbEntry).body.status).toBe('overridden');
-    // Command evidence self-signs: a successor TB is minted without a human signer
-    expect(result.tombstone).not.toBeNull();
-    expect(result.tombstone!.body.signedBy).toBe('alex');
-    expect(result.ruling).toBeNull();
+    expect(result.tombstone!.body.signedBy).toBe('johnny');
+    expect(result.tombstone!.body.evidence).toEqual([{ ...commandEvidence[0], kind: 'claimed-command' }]);
+    expect(result.addendum.body.evidence[0].kind).toBe('claimed-command');
+    expect(result.ruling!.body.kind).toBe('promotion');
     // Overridden TB drops out of current truth
     expect(ledger.getTruth('current').map((e) => e.id)).not.toContain(tombstone.id);
   });
@@ -382,7 +391,7 @@ describe('TruthLedger', () => {
       },
       { author: 'sam' }
     );
-    ledger.resolveUv(uv.id, 'verified', commandEvidence, { author: 'alex' });
+    ledger.resolveUv(uv.id, 'verified', commandEvidence, { author: 'alex', signedBy: 'lee', opinion: 'reproduced' });
 
     // Audit: who changed the TB and on what basis always has an answer
     const flipped = ledger.getEntry(tombstone.id) as TbEntry;
@@ -391,5 +400,287 @@ describe('TruthLedger', () => {
     const addendum = ledger.getEntry(overrideLinks[0].fromId)!;
     expect(addendum.type).toBe('ADDENDUM');
     expect(addendum.author).toBe('alex');
+  });
+});
+
+// F14: a struck contesting UV still counted as an open contest, so striking
+// an inadmissible contest left the TB contested, citing the struck UV.
+describe('a struck contest', () => {
+  let store: StateStore;
+  beforeEach(() => {
+    store = new StateStore(':memory:');
+  });
+  afterEach(() => store.close());
+
+  const contestedTb = () => {
+    const ledger = store.truth;
+    const tb = ledger.assertTombstone({ claim: 'LOG_BUDGET is 100', evidence: commitEvidence, signedBy: 'johnny' }, { author: 'johnny' });
+    const contest = (assertion: string) =>
+      ledger.assertUv(
+        { assertion, basis: 'a dashboard', verifyBy: { kind: 'ask', value: 'ops' }, contests: tb.id },
+        { author: 'alex' }
+      );
+    return { ledger, tb, contest };
+  };
+  const statusOf = (id: string) => (store.truth.getEntry(id)!.body as { status: string }).status;
+
+  it('no longer contests: the TB is active again, and nothing cites the struck UV', () => {
+    const { ledger, tb, contest } = contestedTb();
+    const uv = contest('LOG_BUDGET is 30 in staging');
+    expect(statusOf(tb.id)).toBe('contested');
+    ledger.fileRuling({ kind: 'strike', opinion: 'inadmissible: no evidence', target: uv.id }, { author: 'kim' });
+    expect(statusOf(tb.id)).toBe('active');
+    expect(ledger.getContested()).toEqual([]);
+    expect(ledger.verify().ok).toBe(true);
+  });
+
+  it('leaves the TB contested while another contest is open, citing only that one', () => {
+    const { ledger, tb, contest } = contestedTb();
+    const struck = contest('LOG_BUDGET is 30 in staging');
+    const open = contest('LOG_BUDGET is 30 in prod');
+    ledger.fileRuling({ kind: 'strike', opinion: 'inadmissible: no evidence', target: struck.id }, { author: 'kim' });
+    expect(statusOf(tb.id)).toBe('contested');
+    expect(ledger.getContested().map((c) => c.contestedBy.map((u) => u.id))).toEqual([[open.id]]);
+  });
+
+  it('travels: the stream has the TB back to active, caused by the strike', () => {
+    const { ledger, tb, contest } = contestedTb();
+    const uv = contest('LOG_BUDGET is 30 in staging');
+    const { ruling } = ledger.fileRuling({ kind: 'strike', opinion: 'inadmissible: no evidence', target: uv.id }, { author: 'kim' });
+    const lines = exportWikiEntries(ledger).lines.map((l) => JSON.parse(l));
+    const transitions = lines.filter((l) => l.type === 'TRANSITION').map((l) => [l.target, l.status, l.cause.kind, l.cause.ref]);
+    expect(transitions).toEqual([
+      [tb.id, 'contested', 'contest', uv.id],
+      [uv.id, 'struck', 'strike', ruling.id],
+      [tb.id, 'active', 'strike', ruling.id],
+    ]);
+  });
+});
+
+describe('TruthLedger authority invariants', () => {
+  let store: StateStore;
+  let ledger: TruthLedger;
+
+  beforeEach(() => {
+    store = new StateStore(':memory:');
+    ledger = store.truth;
+  });
+
+  afterEach(() => {
+    store.close();
+  });
+
+  const uvBy = (author: string, extra: { contests?: string; agentSessionId?: string } = {}) =>
+    ledger.assertUv(
+      {
+        assertion: 'Retries are idempotent.',
+        basis: 'I wrote it',
+        verifyBy: { kind: 'command', value: 'npm test' },
+        ...(extra.contests ? { contests: extra.contests } : {}),
+      },
+      { author, agentSessionId: extra.agentSessionId }
+    );
+
+  const tb = (overrides: Partial<{ signedBy: string }> = {}): TbEntry =>
+    ledger.assertTombstone(
+      {
+        claim: 'The rate limiter uses a fixed window, not sliding',
+        evidence: commitEvidence,
+        signedBy: overrides.signedBy ?? 'johnny',
+      },
+      { author: overrides.signedBy ?? 'johnny' }
+    );
+
+  // ── Contempt of corpus uses canonical identities (STENO-T-19) ──
+
+  it('rejects self-corroboration through case, whitespace, width and invisible-character variants', () => {
+    for (const variant of ['Alice', ' alice ', 'ALICE', 'ａｌｉｃｅ', 'al​ice']) {
+      const uv = uvBy('alice');
+      expect(() => ledger.resolveUv(uv.id, 'verified', commandEvidence, { author: variant }), variant).toThrow(
+        ContemptError
+      );
+    }
+  });
+
+  it('checks the human signer too: a UV author cannot promote their own belief through a proxy resolver', () => {
+    const tombstone = tb();
+    const uv = ledger.assertUv(
+      { assertion: 'Budget is 30 again.', basis: 'mine', verifyBy: { kind: 'inspect', value: 'config.ts' }, contests: tombstone.id },
+      { author: 'alice' }
+    );
+    expect(() =>
+      ledger.resolveUv(uv.id, 'verified', [{ kind: 'file', ref: 'config.ts:3' }], {
+        author: 'bot-1',
+        signedBy: 'Alice',
+        opinion: 'looks right',
+      })
+    ).toThrow(ContemptError);
+    expect((ledger.getEntry(tombstone.id) as TbEntry).body.status).toBe('contested');
+  });
+
+  it('compares agent sessions canonically', () => {
+    const uv = uvBy('agent:parent', { agentSessionId: 'sess_1' });
+    expect(() =>
+      ledger.resolveUv(uv.id, 'verified', commandEvidence, { author: 'agent:sub', agentSessionId: ' sess_1 ' })
+    ).toThrow(ContemptError);
+  });
+
+  it("a TB's own author cannot refute the contest against it", () => {
+    const tombstone = tb({ signedBy: 'johnny' });
+    const uv = uvBy('sam', { contests: tombstone.id });
+    expect(() => ledger.resolveUv(uv.id, 'refuted', commandEvidence, { author: 'Johnny' })).toThrow(ContemptError);
+    // Conceding is not corroboration: the TB's author may verify the contest
+    expect(() =>
+      ledger.resolveUv(uv.id, 'verified', commandEvidence, { author: 'johnny', signedBy: 'lee', opinion: 'conceded' })
+    ).not.toThrow();
+  });
+
+  it('a resolution that would mint a TB is refused when minting is not allowed', () => {
+    const tombstone = tb();
+    const uv = uvBy('sam', { contests: tombstone.id });
+    expect(() =>
+      ledger.resolveUv(uv.id, 'verified', commandEvidence, { author: 'alex', allowMint: false })
+    ).toThrow(/notar/);
+    expect((ledger.getEntry(uv.id) as { body: { status: string } }).body.status).toBe('open');
+    // Refuting mints nothing, so it is allowed
+    expect(ledger.resolveUv(uv.id, 'refuted', commandEvidence, { author: 'alex', allowMint: false }).tombstone).toBeNull();
+  });
+
+  // ── Reserved identities (STENO-T-24) ──
+
+  it("reserves 'migration' and 'detector:*' as author as well as signer", () => {
+    const input = { claim: 'x', evidence: commitEvidence, signedBy: 'bob' };
+    expect(() => ledger.assertTombstone(input, { author: 'migration' })).toThrow(/reserved/);
+    expect(() => ledger.assertTombstone(input, { author: ' Migration ' })).toThrow(/reserved/);
+    expect(() => ledger.assertTombstone(input, { author: 'detector:supersession' })).toThrow(/reserved/);
+    expect(() => ledger.assertTombstone({ ...input, signedBy: 'detector:x' }, { author: 'bob' })).toThrow(/reserved/);
+    expect(() =>
+      ledger.assertUv({ assertion: 'a', basis: 'b', verifyBy: { kind: 'ask', value: 'x' } }, { author: 'migration' })
+    ).toThrow(/reserved/);
+    expect(() =>
+      ledger.draftTombstone({ claim: 'x', evidence: commitEvidence }, { author: 'detector:supersession' })
+    ).toThrow(/reserved/);
+    // Detectors still file proposals through their own path
+    expect(() =>
+      ledger.addProposal(
+        { kind: 'tombstone', draft: { claim: 'c', evidence: [{ kind: 'message', ref: 'm1' }] }, signal: { source: 'supersession-detector' } },
+        { author: 'detector:supersession' }
+      )
+    ).not.toThrow();
+  });
+
+  it('rejects identities carrying control characters', () => {
+    expect(() =>
+      ledger.assertTombstone({ claim: 'x', evidence: commitEvidence, signedBy: 'johnny\n' }, { author: 'johnny' })
+    ).toThrow();
+    expect(() =>
+      ledger.assertUv({ assertion: 'a', basis: 'b', verifyBy: { kind: 'ask', value: 'x' } }, { author: 'sam\u0007' })
+    ).toThrow(TruthWriteError);
+  });
+
+  // ── Dedupe never crosses authors (STENO-T-26) ──
+
+  it('dedupes open proposals only within the same author and notary requirement', () => {
+    const detector = ledger.addProposal(
+      { kind: 'tombstone', draft: { claim: 'detector draft', evidence: [{ kind: 'message', ref: 'm' }] }, signal: { source: 'supersession-detector' }, targetRef: 'decision_42' },
+      { author: 'detector:supersession' }
+    );
+    const draft = ledger.draftTombstone(
+      { claim: 'agent draft', evidence: commitEvidence, literals: [{ dead: 'oldThingy' }], targetRef: 'decision_42' },
+      { author: 'agent:a' }
+    );
+    expect(draft.id).not.toBe(detector.id);
+    expect(draft.body.requiresNotary).toBe(true);
+    expect(draft.body.draft).toMatchObject({ claim: 'agent draft', literals: [{ dead: 'oldThingy' }] });
+
+    const otherAgent = ledger.draftTombstone(
+      { claim: 'another agent draft', evidence: commitEvidence, targetRef: 'decision_42' },
+      { author: 'agent:b' }
+    );
+    expect(otherAgent.id).not.toBe(draft.id);
+
+    const again = ledger.draftTombstone(
+      { claim: 'agent draft, restated', evidence: commitEvidence, targetRef: 'decision_42' },
+      { author: 'Agent:A' }
+    );
+    expect(again.id).toBe(draft.id);
+    expect(
+      ledger.findOpenProposal({ kind: 'tombstone', targetRef: 'decision_42', author: 'agent:a', requiresNotary: true, source: 'agent-draft' })!.id
+    ).toBe(draft.id);
+  });
+
+  // A proposal filed under the drafter's name from elsewhere (a REST
+  // submission, an intake) matched on author, kind, target and notary
+  // requirement, so the drafter's next draft was folded into it.
+  it("dedupes a draft only into the same source's proposal, not one filed under the drafter's name from elsewhere", () => {
+    const submitted = ledger.addProposal(
+      {
+        kind: 'tombstone',
+        draft: { claim: 'submitted claim', evidence: commitEvidence },
+        signal: { source: 'compaction-candidate' },
+        targetRef: 'config:LOG_BUDGET',
+        requiresNotary: true,
+      },
+      { author: 'agent:a' }
+    );
+    const draft = ledger.draftTombstone({ claim: 'drafted claim', evidence: commitEvidence, targetRef: 'config:LOG_BUDGET' }, { author: 'agent:a' });
+    expect(draft.id).not.toBe(submitted.id);
+    expect(draft.body.draft).toMatchObject({ claim: 'drafted claim' });
+    expect(ledger.draftTombstone({ claim: 'restated', evidence: commitEvidence, targetRef: 'config:LOG_BUDGET' }, { author: 'agent:a' }).id).toBe(draft.id);
+    expect(
+      ledger.findOpenProposal({ kind: 'tombstone', targetRef: 'config:LOG_BUDGET', author: 'agent:a', requiresNotary: true, source: 'compaction-candidate' })!.id
+    ).toBe(submitted.id);
+  });
+
+  // ── Rulings and filters reject unknown values (STENO-T-23) ──
+
+  it('rejects an unknown ruling kind instead of falling through to contempt', () => {
+    expect(() =>
+      ledger.fileRuling({ kind: 'bogus' as 'strike', opinion: 'the agent opinion', target: 'x' }, { author: 'johnny' })
+    ).toThrow(/kind/);
+    expect(ledger.getStats()).toMatchObject({ tombstones: 0, rulings: 0 });
+  });
+
+  it('rejects an unknown truth filter instead of building invalid SQL', () => {
+    expect(() => ledger.getTruth('bogus' as 'current')).toThrow(TruthWriteError);
+  });
+
+  // ── contests: null proposals are signable (STENO-T-08) ──
+
+  it('signs a UV proposal whose draft carries contests: null', () => {
+    const proposal = ledger.addProposal(
+      {
+        kind: 'uv',
+        draft: {
+          assertion: 'The cron box has a stale hosts file.',
+          basis: 'deploys skip it',
+          verifyBy: { kind: 'ask', value: 'ops' },
+          contests: null,
+          status: 'open',
+        },
+        signal: { source: 'wiki-reconciliation', detail: 'wiki entry W contradicts the local copy' },
+        targetRef: 'W',
+      },
+      { author: 'detector:wiki-sync' }
+    );
+    const minted = ledger.signProposal(proposal.id, 'johnny');
+    expect(minted.type).toBe('UV');
+    expect((minted.body as { contests?: string | null }).contests).toBeNull();
+    expect((minted.body as { status: string }).status).toBe('open');
+  });
+
+  it('lets signing edits unset a contest with null', () => {
+    const tombstone = tb();
+    const proposal = ledger.addProposal(
+      {
+        kind: 'uv',
+        draft: { assertion: 'a', basis: 'b', verifyBy: { kind: 'ask', value: 'x' }, contests: tombstone.id },
+        signal: { source: 'manual-flag' },
+      },
+      { author: 'detector:manual' }
+    );
+    const minted = ledger.signProposal(proposal.id, 'johnny', { contests: null });
+    expect((minted.body as { contests?: string | null }).contests).toBeNull();
+    expect((ledger.getEntry(tombstone.id) as TbEntry).body.status).toBe('active');
   });
 });

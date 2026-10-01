@@ -21,7 +21,7 @@ Grade every consumed entry, highest signal first:
 | Grade | What it is | How dispatch should treat it | Suggested weight |
 |---|---|---|---|
 | **verified** | TB whose evidence includes a reproducible check (`command` or `test` kind), or a UV resolved `verified` by one | Authoritative. May **rewrite dispatch**: forward a superseded selector to its successor, demote/redirect a dead tool | 1.0 |
-| **asserted** | Signed TB whose evidence is judgment-grade (`commit`, `file`, `wiki`, `message`) — stands on the signer's accountability | Authoritative for **ranking**, not rewiring: prefer the successor, keep the old selector callable | 0.75 |
+| **asserted** | Signed TB whose evidence is judgment-grade (`commit`, `file`, `wiki`, `message`) or `claimed-command` (command output someone reported, which stenographer did not run) — stands on the signer's accountability | Authoritative for **ranking**, not rewiring: prefer the successor, keep the old selector callable | 0.75 |
 | **migration** | Backfilled pre-assertion TB (`author: "migration"`, `signedBy: null`) — queryably second-class by design | Weak ranking bias only | 0.5 |
 | **contested** | Any TB with `status: "contested"` (a live UV disputes it) | Still truth, one notch down; carry the contest into the tool's annotation so the caller can see the asterisk | ×0.8 multiplier on its base grade |
 | **advisory** | Open UV | **Never moves a tool in the table.** Zero ranking weight. Attach as a warning annotation (tool description, `doesNotUnderstand`-style hint) — flag, don't block | 0 (surfaced, not scored) |
@@ -31,11 +31,11 @@ The verified > asserted ordering is the point of the ask, and it's computable to
 
 ## Computing the grade (client-side, ~20 lines)
 
-Pseudocode against the JSONL line shape (`WikiEntryLine` in `src/truth/wiki.ts`) or the exported types:
+Pseudocode against [truth format v2](../spec/truth-format/README.md) lines or the exported types. `status` is the entry's current status by the spec's fold: its latest `TRANSITION` line's status, else the entry line's own. An unknown status is excluded (fail closed):
 
 ```
 grade(entry):
-  if entry is struck, or status in {overridden, refuted}   -> excluded
+  if status in {struck, overridden, refuted}, or unknown    -> excluded
   if entry.type == UV:
     status == open      -> advisory
     status == verified  -> treat like verified TB (normally a TB was minted alongside; prefer that)
@@ -49,13 +49,13 @@ grade(entry):
 
 Notes on the edges:
 
-- A TB minted by `resolve_uv` from `command` evidence carries that evidence — it grades verified by the rule above, no lineage-walking needed.
+- Since 1.0, stenographer records command output a caller submits as `claimed-command`; `command` is reserved for checks stenographer ran itself, and 1.0 ships no runner. So a 1.0 ledger has no new `command` evidence, and `claimed-command` grades asserted by the rule above. Lines exported by 0.x may still carry `command` for output nobody re-ran.
 - A TB minted under a **promotion RULING** (human ruled non-command evidence sufficient) grades **asserted**: the gavel adds accountability, not reproducibility. Don't be tempted to bump it.
-- `x-steno.links` carries `contests`/`overrides`/`verifies` backrefs if you want to render *why* an entry has its status; you don't need links to compute the grade.
+- Each `TRANSITION` line names its `cause` (the contesting UV, the overriding addendum, the strike) if you want to render *why* an entry has its status; you don't need it to compute the grade.
 
 ## Integration shape
 
-**Compile time (recommended, lowest coupling).** Add a compile input — e.g. `--truth ./truth.jsonl` — produced by stenographer's `export_wiki_entries`. During table construction:
+**Compile time (recommended, lowest coupling).** Add a compile input — e.g. `--truth ./truth.jsonl` — produced by stenographer's `export_wiki_entries`. Check the file's hash chain and fold statuses as the spec says. During table construction:
 
 1. Match entries to tools. First pass: exact/substring match of tool selectors against entry text (`claim`/`assertion`) and entity values. Fallback: embedding similarity if smallchat already embeds selectors; skip otherwise — a missed match costs nothing, a wrong rewrite costs trust.
 2. Apply by grade: verified supersessions become selector forwards (the Obj-C deprecated-selector move: old selector stays in the table, dispatches to the successor, annotation says why and cites the entry id). Asserted/migration entries adjust ranking weights. Advisory UVs attach to the tool's metadata so the calling agent sees the dragon marker.
@@ -63,9 +63,9 @@ Notes on the edges:
 
 **Runtime (optional, later).** If smallchat runs beside a live stenographer, the MCP tools `get_truth(truthFilter: "current")` and `search_truth(query)` serve the same entries with the §7 consumption rules embedded in the tool descriptions. Compile-time JSONL should come first — it's deterministic and testable.
 
-**Write-back (the interesting loop).** Dispatch telemetry is a truth *source*: a tool that failed the same way ten times is a UV waiting to be written. Smallchat may file these under a registered identity (e.g. `smallchat:compiler` — generic names like `system`/`assistant` are rejected at the schema level) with a `verifyBy` of kind `command` (the repro invocation). Two hard rules from the ledger, enforced at write time:
+**Write-back (the interesting loop).** Dispatch telemetry is a truth *source*: a tool that failed the same way ten times is a UV waiting to be written. Smallchat may file these under its own identity with a `verifyBy` of kind `command` (the repro invocation). Over MCP that identity is bound by the server, not passed per call: start the stenographer smallchat talks to with `--agent-identity smallchat:compiler` (the agent profile's tools take no author argument; generic names like `system`/`assistant` and the reserved `migration`/`detector:*` are rejected). Two hard rules from the ledger, enforced at write time:
 
-- Smallchat can **assert UVs and file proposals, not TBs** — minting truth needs an accountable signer, and `command`-evidence resolutions are the only self-signing path.
+- Smallchat can **assert UVs and draft tombstones (`propose_tombstone`), not mint TBs** — in the default agent profile no tool mints a TB without a person's notarization, including `resolve_uv` on a contest. Command output smallchat submits is recorded as `claimed-command` and never self-signs, so a resolution that mints a TB needs a person's signature even on a single-user `--allow-agent-assert` server.
 - **Contempt of corpus:** smallchat cannot verify or sign its own UVs, and neither can anything sharing its agent session. Its telemetry proposes; someone (or some independent check) else confirms.
 
 ## The consumption contract (short form)
@@ -78,8 +78,8 @@ One flag, one behavior, one test: `--truth truth.jsonl` such that when the file 
 
 ## Pointers
 
-- `src/truth/wiki.ts` — `WikiEntryLine`, the JSONL shape to parse (`x-steno` is ignorable)
+- `spec/truth-format/` — the JSONL format (normative), its JSON Schema, and golden fixtures to run in your tests (`x-steno` is ignorable)
 - `src/truth/types.ts` — evidence kinds, statuses, link types; `CONSUMPTION_RULES` constant
-- `test/wiki-interop.test.ts` — the format's round-trip guarantees
+- `src/truth/wiki.ts` — the reference codec
 - MCP: `export_wiki_entries`, `get_truth`, `search_truth`, `assert_uv`, `list_proposals`
 - Weights (1.0 / 0.75 / 0.5 / ×0.8) are starting values, not gospel — tune against real dispatch outcomes, but keep the *ordering* fixed: verified > asserted > migration, contested below its base, open UV never a ranking input.

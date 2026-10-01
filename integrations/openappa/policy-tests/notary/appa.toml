@@ -1,0 +1,38 @@
+# Offline policy replay: the stenographer battery under a root whose only
+# authority reviews the `hitl` mark. Nothing here can approve data below
+# `trusted`, so a ledger write from a suspicious trajectory is denied
+# outright. `appa replay` supplies the review: it approves every offer.
+include = ["../../stenographer/appa.toml"]
+
+[policy]
+version = 2
+
+[[policy.authority]]
+name = "stenographer-notary"
+hint = "Review the exact ledger act and the name it is signed with."
+# Deliberately attention only: it cannot lift a trust requirement.
+permits = { attention = ["hitl"] }
+
+# This tool brings in text written outside the session.
+[[policy.tool]]
+name = "mcp/web/fetch"
+delta = { trust = "suspicious" }
+
+# This tool tests the trust a stenographer result leaves.
+[[policy.tool]]
+name = "mcp/shell/run_command"
+requires = { trust = "trusted" }
+delta = {}
+
+# This tool tests who can receive a stenographer result.
+[[policy.tool]]
+name = "mcp/mail/send"
+requires = { audience = { contains = ["$to"] } }
+delta = {}
+
+[externals]
+timeout_ms = 30000
+max_body_bytes = 1048576
+
+[externals.authorities.stenographer-notary]
+builtin = "hitl"

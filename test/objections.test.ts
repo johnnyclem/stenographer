@@ -5,8 +5,8 @@ import { join } from 'node:path';
 import Database from 'better-sqlite3';
 import { Stenographer } from '../src/core/stenographer.js';
 import { TruthLedger } from '../src/truth/ledger.js';
-import { findLiteralHits, assertedText } from '../src/truth/objections.js';
-import { entryToWikiLine, wikiLineToEntry, importWikiEntries } from '../src/truth/wiki.js';
+import { findLiteralHits, assertedText, ObjectionLog } from '../src/truth/objections.js';
+import { exportWikiEntries, decodeWikiLine, importWikiEntries } from '../src/truth/wiki.js';
 import { TbInputSchema, type TbEntry } from '../src/truth/types.js';
 import type { StenographerConfig } from '../src/types.js';
 
@@ -46,6 +46,13 @@ describe('literal matcher (precision over recall)', () => {
     expect(() => TbInputSchema.parse({ ...base, literals: [{ dead: '30' }] })).toThrow(/subject/);
     expect(() => TbInputSchema.parse({ ...base, literals: [{ dead: 'ab' }] })).toThrow(/subject/);
     expect(() => TbInputSchema.parse({ ...base, literals: [{ subject: 'X', dead: '30' }] })).not.toThrow();
+  });
+
+  it('splits acronyms in subjects, so maxHTTPRetries matches MAX_HTTP_RETRIES (STENO-T-12)', () => {
+    const literal = { subject: 'maxHTTPRetries', dead: '5', current: '3' };
+    expect(findLiteralHits('MAX_HTTP_RETRIES = 5', literal)).toHaveLength(1);
+    expect(findLiteralHits('max_http_retries: 5', literal)).toHaveLength(1);
+    expect(findLiteralHits('maxHttpRetries = 5', literal)).toHaveLength(1);
   });
 
   it('reads the new side of edits and skips the old side', () => {
@@ -299,6 +306,72 @@ describe('engine objections (§12)', () => {
   });
 });
 
+describe('objection dedupe is per session (STENO-T-14)', () => {
+  it('objects to the same message id in a second session', () => {
+    const db = new Database(':memory:');
+    const ledger = new TruthLedger(db);
+    ledger.assertTombstone(
+      { claim: 'LOG_BUDGET 30 is dead', evidence: [{ kind: 'commit', ref: 'a1' }], signedBy: 'jc', literals: [LOG_BUDGET] },
+      { author: 'jc' }
+    );
+    const log = new ObjectionLog(db, ledger);
+    // Adapters without native ids derive one from the line, so a boilerplate
+    // line in two sessions arrives with the same message id
+    const msg = { id: 'msg_1a2b3c4d', role: 'assistant' as const, content: 'Plan: LOG_BUDGET = 30', timestamp: '2026-09-18T10:00:00Z' };
+
+    expect(log.scan(msg, 'sessionA', 'deliver')).toHaveLength(1);
+    expect(log.scan(msg, 'sessionA', 'deliver')).toHaveLength(0);
+    const second = log.scan(msg, 'sessionB', 'deliver');
+    expect(second).toHaveLength(1);
+    expect(second[0].sessionId).toBe('sessionB');
+  });
+
+  it('a shadow objection does not silence the first delivered one in its session', () => {
+    // Replayed history (and the gate in shadow mode) records shadow
+    // objections; counsel hasn't said anything yet, so a live assertion of
+    // the same literal is still objected to — once
+    const db = new Database(':memory:');
+    const ledger = new TruthLedger(db);
+    ledger.assertTombstone(
+      { claim: 'LOG_BUDGET 30 is dead', evidence: [{ kind: 'commit', ref: 'a1' }], signedBy: 'jc', literals: [LOG_BUDGET] },
+      { author: 'jc' }
+    );
+    const log = new ObjectionLog(db, ledger);
+    const msg = (id: string) => ({ id, role: 'assistant' as const, content: 'LOG_BUDGET = 30', timestamp: '2026-09-18T10:00:00Z' });
+
+    expect(log.scan(msg('replayed'), 'S', 'shadow').map((o) => o.delivered)).toEqual([false]);
+    expect(log.scan(msg('replayed-again'), 'S', 'shadow')).toHaveLength(0);
+    expect(log.scan(msg('live'), 'S', 'deliver').map((o) => [o.messageId, o.delivered])).toEqual([['live', true]]);
+    expect(log.scan(msg('live-again'), 'S', 'deliver')).toHaveLength(0);
+  });
+
+  it('migrates a 0.x objections table to the per-session key, keeping its rows', () => {
+    const db = new Database(':memory:');
+    db.exec(`
+      CREATE TABLE objections (
+        id TEXT PRIMARY KEY, created_at TEXT NOT NULL, session_id TEXT NOT NULL, message_id TEXT NOT NULL,
+        tb_id TEXT NOT NULL, dead TEXT NOT NULL, record TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+        delivered INTEGER NOT NULL DEFAULT 0, ruling_id TEXT,
+        UNIQUE(message_id, tb_id, dead)
+      );
+    `);
+    const ledger = new TruthLedger(db);
+    const tb = ledger.assertTombstone(
+      { claim: 'LOG_BUDGET 30 is dead', evidence: [{ kind: 'commit', ref: 'a1' }], signedBy: 'jc', literals: [LOG_BUDGET] },
+      { author: 'jc' }
+    );
+    const record = JSON.stringify({ literal: LOG_BUDGET, objection: 'x', exhibit: { tombstone: tb, contestedBy: [] }, transcriptLine: 'LOG_BUDGET = 30', source: 'text' });
+    db.prepare(`INSERT INTO objections (id, created_at, session_id, message_id, tb_id, dead, record, status, delivered) VALUES ('01OLD', '2026-09-01T00:00:00Z', 'sessionA', 'm1', ?, '30', ?, 'overruled', 1)`).run(tb.id, record);
+
+    const log = new ObjectionLog(db, ledger);
+    expect(log.get('01OLD')).toMatchObject({ sessionId: 'sessionA', messageId: 'm1', status: 'overruled' });
+    const msg = { id: 'm1', role: 'assistant' as const, content: 'LOG_BUDGET = 30', timestamp: '2026-09-18T10:00:00Z' };
+    expect(log.scan(msg, 'sessionB', 'deliver')).toHaveLength(1);
+    // Overruled in sessionA: still settled there
+    expect(log.scan({ ...msg, id: 'm2' }, 'sessionA', 'deliver')).toHaveLength(0);
+  });
+});
+
 describe('REST /flags', () => {
   let dir: string;
   let engine: Stenographer;
@@ -337,6 +410,8 @@ describe('REST /flags', () => {
     await settle(engine);
 
     const base = `http://localhost:${engine.restPort}`;
+    const headers = { Authorization: `Bearer ${engine.restToken}` };
+    const fetch = (url: string, init: RequestInit = {}) => globalThis.fetch(url, { ...init, headers });
     const all = await (await fetch(`${base}/flags`)).json();
     expect(all).toHaveLength(2);
     expect(all[0]).toHaveProperty('exhibit');
@@ -364,11 +439,20 @@ describe('wiki interop carries literals', () => {
     );
     expect('literals' in without.body).toBe(false);
 
-    for (const entry of [withLiterals, without]) {
-      const line = entryToWikiLine(entry);
-      expect(JSON.stringify(wikiLineToEntry(line).body)).toBe(JSON.stringify(entry.body));
-    }
-    expect(entryToWikiLine(withLiterals).literals).toEqual([LOG_BUDGET]);
+    const { lines } = exportWikiEntries(ledger);
+    const [withLine, withoutLine] = lines.map((l) => decodeWikiLine(l).line);
+    // The literals travel as written: the same bytes as the stored body's
+    expect(JSON.stringify(withLine.literals)).toBe(JSON.stringify(withLiterals.body.literals));
+    expect(withLine.literals).toEqual([LOG_BUDGET]);
+    expect('literals' in withoutLine).toBe(false);
+
+    // Imported elsewhere, the TB objects to the same literals, and travels on unchanged
+    const other = new TruthLedger(new Database(':memory:'));
+    expect(importWikiEntries(other, { lines })).toMatchObject({ committed: true, inserted: 2 });
+    expect(other.getMatchableTombstones().map((t) => t.body.literals)).toEqual([[LOG_BUDGET]]);
+    expect(JSON.stringify(other.getEntry(withLiterals.id)!.body)).toBe(JSON.stringify(withLiterals.body));
+    const again = exportWikiEntries(other).lines.map((l) => decodeWikiLine(l).line);
+    expect(again.map((l) => l.literals)).toEqual([withLine.literals, undefined]);
   });
 
   it('rejects wiki lines whose literals cannot be matched precisely', () => {

@@ -17,6 +17,8 @@ const DRAFT = {
   rationale: 'config.ts was bumped in a1b2c3',
 };
 const AGENT = 'claude-code:@ingest';
+/** The REST bearer token every route requires. */
+const REST_TOKEN = 'notary-tests-rest-token-0123456789';
 
 describe('agent-drafted tombstones (ledger)', () => {
   const ledger = () => new TruthLedger(new Database(':memory:'));
@@ -108,9 +110,12 @@ describe('agent-drafted tombstones (MCP + REST)', () => {
     server = new StenographerServer({
       logPath: join(dir, 'log.jsonl'),
       statePath: ':memory:',
+      restToken: REST_TOKEN,
       mode: 'catchup',
       embeddingModel: 'hashed',
       restPort: 0,
+      // No MCP client is attached here, so name the agent explicitly
+      agentIdentity: AGENT,
       ...overrides,
     });
     await server.engine.start();
@@ -123,7 +128,11 @@ describe('agent-drafted tombstones (MCP + REST)', () => {
   const post = (url: string, body: unknown, secret?: string) =>
     fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...(secret ? { 'X-Notary-Secret': secret } : {}) },
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${REST_TOKEN}`,
+        ...(secret ? { 'X-Notary-Secret': secret } : {}),
+      },
       body: JSON.stringify(body),
     });
 
@@ -134,7 +143,7 @@ describe('agent-drafted tombstones (MCP + REST)', () => {
       notarySecret: 'n0tary',
     });
 
-    const result = await call('propose_tombstone', { ...DRAFT, proposedBy: AGENT, agentSessionId: 'sess-1' });
+    const result = await call('propose_tombstone', DRAFT);
     expect(result.status).toMatch(/awaiting notarization/);
     expect(result.raisedTo).toEqual([url]);
 
@@ -144,7 +153,8 @@ describe('agent-drafted tombstones (MCP + REST)', () => {
       kind: 'proposal',
       proposal_id: result.proposal.id,
       drafted_by: AGENT,
-      session_ids: 'sess-1',
+      // The server binds the session: this one, not a caller-supplied id
+      session_ids: server!.engine.getSessionId(),
       notarize_url: `${base}/proposals/${result.proposal.id}/notarize`,
     });
     expect(events[0].body.content).toContain(DRAFT.claim);
@@ -152,13 +162,14 @@ describe('agent-drafted tombstones (MCP + REST)', () => {
 
   it('an agent cannot sign its draft over MCP; a person notarizes it over REST', async () => {
     const { call, base } = await start({ notarySecret: 'n0tary' });
-    const { proposal } = await call('propose_tombstone', { ...DRAFT, proposedBy: AGENT });
+    const { proposal } = await call('propose_tombstone', DRAFT);
 
+    // sign_proposal isn't served to agents at all
     await expect(call('sign_proposal', { proposalId: proposal.id, signedBy: 'johnny' })).rejects.toThrow(
-      /must be notarized by a person/
+      /operator tool/
     );
 
-    const inbox = await (await fetch(`${base}/proposals?status=open`)).json();
+    const inbox = await (await fetch(`${base}/proposals?status=open`, { headers: { Authorization: `Bearer ${REST_TOKEN}` } })).json();
     expect(inbox.map((p: { id: string }) => p.id)).toEqual([proposal.id]);
 
     const notarize = `${base}/proposals/${proposal.id}/notarize`;
@@ -175,9 +186,32 @@ describe('agent-drafted tombstones (MCP + REST)', () => {
     expect((await post(notarize, { notary: 'johnny' }, 'n0tary')).status).toBe(422);
   });
 
+  it('REST notary bodies are validated like the operator profile: malformed requests are 400s, nothing is minted', async () => {
+    const { call, base } = await start({ notarySecret: 'n0tary' });
+    const { proposal } = await call('propose_tombstone', DRAFT);
+    const notarize = `${base}/proposals/${proposal.id}/notarize`;
+
+    // Malformed percent-encoding in the id, as on every other route
+    expect((await post(`${base}/proposals/%E0%A4%A/notarize`, { notary: 'johnny' }, 'n0tary')).status).toBe(400);
+    // edits takes exactly what sign_proposal's edits takes in the operator profile
+    for (const edits of [{ signedBy: 'someone-else' }, { claim: 5 }, { literals: 'legacyRateLimiter' }, 'claim']) {
+      const res = await post(notarize, { notary: 'johnny', edits }, 'n0tary');
+      expect(res.status, JSON.stringify(edits)).toBe(400);
+      expect((await res.json()).error).toMatch(/edits/);
+    }
+    // ...and the body itself: no stray fields standing in for an identity
+    expect((await post(notarize, { notary: 'johnny', signedBy: 'alex' }, 'n0tary')).status).toBe(400);
+    expect((await post(`${base}/proposals/${proposal.id}/dismiss`, { dismissedBy: 'johnny', reason: '' }, 'n0tary')).status).toBe(400);
+
+    expect(await call('list_proposals', { status: 'open' })).toHaveLength(1);
+    const ok = await post(notarize, { notary: 'johnny', edits: { claim: 'LOG_BUDGET 30 is dead; config.ts sets 100' } }, 'n0tary');
+    expect(ok.status).toBe(200);
+    expect((await ok.json()).body.claim).toBe('LOG_BUDGET 30 is dead; config.ts sets 100');
+  });
+
   it('a person can decline a draft over REST, with a reason', async () => {
     const { call, base } = await start({ notarySecret: 'n0tary' });
-    const { proposal } = await call('propose_tombstone', { ...DRAFT, proposedBy: AGENT });
+    const { proposal } = await call('propose_tombstone', DRAFT);
     const res = await post(`${base}/proposals/${proposal.id}/dismiss`, { dismissedBy: 'johnny', reason: 'still 30 in prod' }, 'n0tary');
     expect(res.status).toBe(200);
     expect((await res.json()).body).toMatchObject({ status: 'dismissed', dismissReason: 'still 30 in prod' });
@@ -185,18 +219,40 @@ describe('agent-drafted tombstones (MCP + REST)', () => {
 
   it('REST notarization is off when no notary secret is configured', async () => {
     const { call, base } = await start();
-    const { proposal } = await call('propose_tombstone', { ...DRAFT, proposedBy: AGENT });
+    const { proposal } = await call('propose_tombstone', DRAFT);
     expect((await post(`${base}/proposals/${proposal.id}/notarize`, { notary: 'johnny' }, 'anything')).status).toBe(403);
   });
 
-  it('--require-notary stops agents asserting tombstones directly', async () => {
-    const { call } = await start({ requireNotary: true });
+  it('REST notary names are checked against the signer registry', async () => {
+    const { call, base } = await start({
+      notarySecret: 'n0tary',
+      signerRegistry: { signers: [{ id: 'johnny', role: 'human' }, { id: 'claude-code:*', role: 'agent' }] },
+    });
+    const { proposal } = await call('propose_tombstone', DRAFT);
+    const notarize = `${base}/proposals/${proposal.id}/notarize`;
+
+    const unlisted = await post(notarize, { notary: 'mallory' }, 'n0tary');
+    expect(unlisted.status).toBe(422);
+    expect((await unlisted.json()).error).toMatch(/registry/);
+    expect((await post(notarize, { notary: 'claude-code:@other' }, 'n0tary')).status).toBe(422);
+    expect((await post(`${base}/proposals/${proposal.id}/dismiss`, { dismissedBy: 'detector:x', reason: 'r' }, 'n0tary')).status).toBe(422);
+
+    const ok = await post(notarize, { notary: ' Johnny ' }, 'n0tary');
+    expect(ok.status).toBe(200);
+    expect((await ok.json()).body.signedBy).toBe('johnny');
+  });
+
+  it('the agent profile (the default) stops agents asserting tombstones directly', async () => {
+    const { call } = await start();
     await expect(call('assert_tombstone', { ...DRAFT, signedBy: 'johnny' })).rejects.toThrow(/propose_tombstone/);
   });
 
-  it('without --require-notary, assert_tombstone keeps working', async () => {
-    const { call } = await start();
-    const tb = await call('assert_tombstone', { ...DRAFT, signedBy: 'johnny' });
+  it('--allow-agent-assert lets a single-user agent assert, under its own identity only', async () => {
+    const { call } = await start({ allowAgentAssert: true });
+    const { rationale: _rationale, ...tbArgs } = DRAFT;
+    await expect(call('assert_tombstone', { ...tbArgs, signedBy: 'johnny' })).rejects.toThrow(/signedBy/);
+    const tb = await call('assert_tombstone', tbArgs);
     expect(tb.type).toBe('TB');
+    expect(tb.body.signedBy).toBe(AGENT);
   });
 });

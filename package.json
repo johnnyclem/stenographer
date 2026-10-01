@@ -1,6 +1,6 @@
 {
   "name": "@stenographer/core",
-  "version": "0.1.0-alpha.2",
+  "version": "1.0.0",
   "description": "MCP court reporter — queryable conversation index with GraphRAG",
   "type": "module",
   "main": "./dist/index.js",
@@ -9,11 +9,13 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
-    }
+    },
+    "./spec/*": "./spec/*"
   },
   "files": [
     "dist",
-    "dist-cli"
+    "dist-cli",
+    "spec"
   ],
   "bin": {
     "stenographer": "./dist-cli/index.js"
@@ -21,23 +23,27 @@
   "scripts": {
     "build": "tsc && tsc -p tsconfig.cli.json",
     "test": "vitest run",
+    "test:openappa": "node integrations/openappa/run-checks.mjs",
     "lint": "tsc --noEmit"
   },
   "dependencies": {
     "@huggingface/transformers": "^4.2.0",
     "@modelcontextprotocol/sdk": "^1.30.0",
-    "better-sqlite3": "^11.0.0",
+    "better-sqlite3": "^13.0.3",
     "sqlite-vec": "^0.1.9",
-    "zod": "^3.22.0"
+    "zod": "^3.25.28",
+    "zod-to-json-schema": "^3.25.2"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.0",
-    "@types/node": "^20.11.0",
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/node": "^22.0.0",
+    "ajv": "^8.20.0",
+    "ajv-formats": "^3.0.1",
     "typescript": "^5.3.0",
     "vitest": "^4.1.10"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "license": "MIT",
   "overrides": {

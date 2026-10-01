@@ -7,20 +7,37 @@
  * webhooks, never the attached MCP client, which is the drafting agent —
  * and only mints once that person notarizes it.
  *
- * The notary paths are the ones an agent's tools don't reach:
+ * The notary paths are the ones the agent MCP profile doesn't serve:
  * - REST `POST /proposals/:id/notarize` with `X-Notary-Secret`, the secret
  *   the operator shares with their approval UI (smallchat) and not with
  *   agents;
+ * - `sign_proposal` in the operator MCP profile, for a notary UI;
  * - `stenographer notarize <id>`, which requires an interactive terminal.
  *
  * This is a guard against an agent approving its own draft through its
- * tools, not a sandbox: an agent with arbitrary shell access and the
- * operator's secrets can do anything the operator can.
+ * MCP tools, not a sandbox. The secret lives in the environment of the
+ * process that serves REST — typically the agent-spawned MCP server — so an
+ * agent that can read that environment or its MCP config, edit that config
+ * to the operator profile, or drive a terminal as the operator can do what
+ * the operator can. Separating those needs OS-level separation (the agent
+ * runs as another user or in a sandbox); see the README's threat model.
  */
 
-import { createHmac, timingSafeEqual } from 'node:crypto';
-import { CHANNEL_NAME, SENDER, post, type ObjectionSinkConfig } from './delivery.js';
+import { timingSafeEqual } from 'node:crypto';
+import {
+  CHANNEL_NAME,
+  SENDER,
+  post,
+  redactUrl,
+  webhookHeaders,
+  webhookId,
+  type ObjectionSinkConfig,
+} from './delivery.js';
+import { displayText } from './display.js';
 import type { ProposalEntry, TombstonedLiteral } from './types.js';
+
+/** Longest claim a notice shows; the draft itself is in the review inbox. */
+const MAX_NOTICE_CLAIM = 2_000;
 
 /** Header the notary secret travels in on REST notary routes. */
 export const NOTARY_SECRET_HEADER = 'x-notary-secret';
@@ -33,16 +50,21 @@ export function notarySecretMatches(expected: string | undefined, given: string 
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
-/** One line a person can read in a chat or a terminal. */
+/**
+ * One line a person can read in a chat or a terminal (plus the drafter's
+ * reason on a second). Everything the drafter wrote is escaped, so control
+ * characters can't conceal or overwrite the claim being approved.
+ */
 export function formatProposalNotice(p: ProposalEntry): string {
   const draft = p.body.draft as { claim?: string; literals?: TombstonedLiteral[] };
   const literals = (draft.literals ?? [])
     .map((l) => `${l.subject ? `${l.subject} = ` : ''}${l.dead}${l.current ? ` → ${l.current}` : ''}`)
     .join(', ');
   return (
-    `✍️ ${p.author} drafted a tombstone for your approval (${p.id}): ${draft.claim ?? ''}` +
-    (literals ? ` — would object to ${literals}` : '') +
-    (p.body.signal.detail ? `\nWhy: ${p.body.signal.detail}` : '')
+    `✍️ ${displayText(p.author)} drafted a tombstone for your approval (${displayText(p.id)}): ` +
+    displayText(draft.claim ?? '', MAX_NOTICE_CLAIM) +
+    (literals ? ` — would object to ${displayText(literals, MAX_NOTICE_CLAIM)}` : '') +
+    (p.body.signal.detail ? `\nWhy: ${displayText(p.body.signal.detail, MAX_NOTICE_CLAIM)}` : '')
   );
 }
 
@@ -60,7 +82,8 @@ export function proposalMeta(p: ProposalEntry, notarizeUrl?: string): Record<str
 /**
  * Raises a draft to every operator-configured receiver. Best effort: a
  * receiver that's down misses the push, but the draft stays in the review
- * inbox (`GET /proposals?status=open`) until a person rules on it.
+ * inbox (`GET /proposals?status=open`) until a person rules on it. Results
+ * name each receiver by its redacted URL (they reach the drafting agent).
  */
 export async function raiseForNotarization(
   sinks: ObjectionSinkConfig[],
@@ -84,15 +107,16 @@ export async function raiseForNotarization(
           );
         } else {
           const body = JSON.stringify({ type: 'stenographer.proposal', proposal, notarizeUrl: notarizeUrl ?? null });
-          const headers: Record<string, string> = { 'X-Stenographer-Event': 'proposal' };
-          if (sink.secret) {
-            headers['X-Stenographer-Signature'] = 'sha256=' + createHmac('sha256', sink.secret).update(body).digest('hex');
-          }
+          const id = webhookId('stenographer.proposal', [proposal.id]);
+          const headers: Record<string, string> = {
+            'X-Stenographer-Event': 'proposal',
+            ...(sink.secret ? webhookHeaders(sink.secret, id, body) : { 'webhook-id': id }),
+          };
           await post(sink.url, body, headers);
         }
-        return { url: sink.url };
+        return { url: redactUrl(sink.url) };
       } catch (err) {
-        return { url: sink.url, error: err instanceof Error ? err.message : String(err) };
+        return { url: redactUrl(sink.url), error: err instanceof Error ? err.message : String(err) };
       }
     })
   );
