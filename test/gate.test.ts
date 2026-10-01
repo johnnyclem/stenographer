@@ -351,6 +351,30 @@ describe('gate: call digest', () => {
   });
 });
 
+// F11: pin the cross-repo contract, not just key-order independence. The
+// vectors are smallchat's spec/call-digest/vectors.json, copied verbatim
+// (smallchat owns the contract; refresh the copy when it changes).
+describe('gate: call digest conformance (smallchat spec/call-digest)', () => {
+  const vectors = JSON.parse(readFileSync(join(__dirname, 'fixtures', 'call-digest', 'vectors.json'), 'utf8')) as {
+    domain: string;
+    vectors: Array<{ name: string; toolId: string; arguments: Record<string, unknown>; digest: string }>;
+    invalid: Array<{ name: string; toolId: string; arguments?: unknown; nonFinite?: { key: string; value: string } }>;
+  };
+
+  it('uses the contract domain', () => {
+    expect(vectors.domain).toBe('smallchat.call.v1');
+  });
+
+  it.each(vectors.vectors.map((v) => [v.name, v] as const))('reproduces the digest: %s', (_name, v) => {
+    expect(callDigest(v.toolId, v.arguments)).toBe(v.digest);
+  });
+
+  it.each(vectors.invalid.map((v) => [v.name, v] as const))('rejects: %s', (_name, v) => {
+    const args = v.nonFinite ? { [v.nonFinite.key]: Number(v.nonFinite.value) } : v.arguments;
+    expect(() => callDigest(v.toolId, args as Record<string, unknown>)).toThrow();
+  });
+});
+
 describe('asserting fields', () => {
   it('reads each known tool by its asserting fields only', () => {
     expect(assertingFields('Write', { file_path: 'a', content: 'c' })).toEqual([{ field: 'content', text: 'c' }]);

@@ -122,11 +122,28 @@ export function harnessToolId(toolName: string): string {
   return mcp ? `${mcp[1]}/${mcp[2]}` : `claude-code/${toolName}`;
 }
 
+/** A lone UTF-16 surrogate: no UTF-8 encoding, so no canonical bytes. */
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
 /**
- * The suite's canonical call digest (smallchat.call.v1):
+ * The suite's canonical call digest (smallchat.call.v1, owned by smallchat's
+ * spec/call-digest, whose vectors test/gate.test.ts runs):
  * sha256hex("smallchat.call.v1" 0x00 toolId 0x00 JCS(arguments)).
+ * `toolId` is `<providerId>/<toolName>`, both non-empty, the provider
+ * without `/`, with no U+0000 and no lone surrogate; `args` is a JSON
+ * object with finite numbers. Anything else throws rather than digesting
+ * a different value.
  */
 export function callDigest(toolId: string, args: Record<string, unknown>): string {
+  if (typeof toolId !== 'string' || !/^[^/]+\/[\s\S]+$/.test(toolId)) {
+    throw new TypeError(`call digest: '${toolId}' is not a canonical tool id (<providerId>/<toolName>)`);
+  }
+  if (toolId.includes('\u0000') || LONE_SURROGATE.test(toolId)) {
+    throw new TypeError('call digest: a tool id cannot contain U+0000 or a lone surrogate');
+  }
+  if (!args || typeof args !== 'object' || Array.isArray(args)) {
+    throw new TypeError('call digest: arguments must be a JSON object');
+  }
   return sha256Hex(`smallchat.call.v1\u0000${toolId}\u0000${canonicalize(args)}`);
 }
 
