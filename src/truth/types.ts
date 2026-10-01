@@ -387,6 +387,25 @@ export const UvInputSchema = z.object({
     .transform((v) => v ?? undefined),
 });
 
+/**
+ * Corrections a notary may make to a draft when signing it: the draft's own
+ * fields, nothing else (never a signer). The operator profile's
+ * sign_proposal and the REST notary route both take exactly this.
+ */
+export const DraftEditsSchema = z
+  .object({
+    claim: z.string().min(1),
+    evidence: z.array(EvidenceSchema.strict()).min(1),
+    literals: z.array(StrictTombstonedLiteralSchema),
+    assertion: z.string().min(1),
+    basis: z.string().min(1),
+    verifyBy: VerifyBySchema.strict(),
+    contests: z.string().min(1).nullable(),
+  })
+  .partial()
+  .strict()
+  .describe('Corrections to the draft, applied at signing time (TB: claim/evidence/literals; UV: assertion/basis/verifyBy/contests)');
+
 // ─────────────────────────────────────────────────────────────
 // Downstream consumption rules (§7) — shipped verbatim inside
 // MCP tool descriptions so consuming agents inherit them.

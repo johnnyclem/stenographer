@@ -34,6 +34,7 @@ import {
   EvidenceSchema,
   VerifyBySchema,
   StrictTombstonedLiteralSchema,
+  DraftEditsSchema,
   FILED_RULING_KINDS,
 } from '../truth/types.js';
 import { createMcpChannelTransport, type ObjectionSinkConfig } from '../truth/delivery.js';
@@ -145,20 +146,6 @@ const WikiFile = z
   );
 const Signer = (description: string) =>
   z.string().min(1).describe(`${description} — checked against the signer registry when one is configured`);
-
-const DraftEdits = z
-  .object({
-    claim: z.string().min(1),
-    evidence: z.array(EvidenceSchema.strict()).min(1),
-    literals: z.array(StrictTombstonedLiteralSchema),
-    assertion: z.string().min(1),
-    basis: z.string().min(1),
-    verifyBy: VerifyBySchema.strict(),
-    contests: z.string().min(1).nullable(),
-  })
-  .partial()
-  .strict()
-  .describe('Corrections to the draft, applied at signing time (TB: claim/evidence/literals; UV: assertion/basis/verifyBy/contests)');
 
 const UvFields = {
   assertion: Text('The belief, in full sentences — no shorthand'),
@@ -667,7 +654,7 @@ export class StenographerServer {
           'Notarize a proposal: sign it under a person\'s identity, minting the real TB/UV with a signs-link back. ' +
           'This is the notary act — it signs agent drafts too. edits corrects the draft at signing time; the signed ' +
           'version is what is true, the draft is history. The drafter cannot sign its own draft (contempt of corpus).',
-        input: args({ proposalId: Id('The open proposal'), signedBy: Signer('The person signing'), edits: DraftEdits.optional() }),
+        input: args({ proposalId: Id('The open proposal'), signedBy: Signer('The person signing'), edits: DraftEditsSchema.optional() }),
         annotations: DESTRUCTIVE,
         run: ({ proposalId, signedBy, edits }) => e.notarizeProposal(proposalId, signedBy, edits),
       }),

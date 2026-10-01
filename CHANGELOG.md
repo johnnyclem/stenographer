@@ -57,6 +57,7 @@
 - **Delivery retries per objection, with backoff and dead-lettering.** Transient failures (network, 5xx, 408, 429) back off from 15 s, doubling up to an hour. A permanent refusal (other 4xx, 3xx) or the 8th failure dead-letters that objection for that receiver, and later objections are delivered anyway. Before, retries were every 15 s forever, in order, so one refused objection blocked every later one. A batch refused as a whole is retried one objection at a time, and a partial webhook batch is sent once its oldest objection has waited 5 minutes. New per-sink settings: `maxAttempts`, `retryBaseMs` and `maxBatchDelayMs`. (STENO-T-15)
 - **Sink URLs are redacted** in logs, in `createSinkTransport` errors and in `propose_tombstone`'s `raisedTo`/`undelivered`: they show the scheme, host and port, plus `/…` when the URL has a path or query. (STENO-T-17)
 - **Notices escape control characters.** `formatObjection` and `formatProposalNotice` render C0/C1 controls, line separators and bidi overrides in agent-written text as visible escapes (`\u001b`, `\r`, …), and cap each objection line at 2,000 characters. (STENO-T-22)
+- **REST notary bodies are validated like the operator profile.** `POST /proposals/:id/notarize` takes exactly `{notary, edits?}` and `/dismiss` exactly `{dismissedBy, reason}`, and `edits` takes only what `sign_proposal`'s `edits` takes in the operator profile (the draft's `claim`, `evidence`, `literals`, `assertion`, `basis`, `verifyBy`, `contests`). Any other field, a wrong type or a blank `reason` is a `400` before anything is written. Before, unknown `edits` keys were passed to the ledger, and a type error there came back as `422`. Malformed percent-encoding in the proposal id is a `400`, as on every other route (was a `500`).
 
 ### Added
 
@@ -84,7 +85,7 @@
 - `--embeddings auto`, `--reembed` and `--supersede-threshold`. `StenographerConfig.embedder` accepts an `Embedder` instance.
 - `get_status` and `GET /status` report the embedder (`embedder`).
 - Exports: `assertableProse`, `EmbedderMismatchError`, `EmbedderIdentity`, `sameEmbedder`, `describeEmbedder`, `DEFAULT_EMBEDDING_MODEL`, `MessageTagSchema`.
-- Library: `TruthLedger.ensureSchema(db)` and `ensureDeliverySchema(db)`, the truth layer's schema setup (migration 4 runs them, with `ensureObjectionSchema`).
+- Library: `TruthLedger.ensureSchema(db)` and `ensureDeliverySchema(db)`, the truth layer's schema setup (migration 4 runs them, with `ensureObjectionSchema`); `DraftEditsSchema`, the notary's `edits`, shared by the operator profile and the REST notary route.
 
 ### Fixed
 

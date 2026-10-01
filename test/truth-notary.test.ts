@@ -186,6 +186,29 @@ describe('agent-drafted tombstones (MCP + REST)', () => {
     expect((await post(notarize, { notary: 'johnny' }, 'n0tary')).status).toBe(422);
   });
 
+  it('REST notary bodies are validated like the operator profile: malformed requests are 400s, nothing is minted', async () => {
+    const { call, base } = await start({ notarySecret: 'n0tary' });
+    const { proposal } = await call('propose_tombstone', DRAFT);
+    const notarize = `${base}/proposals/${proposal.id}/notarize`;
+
+    // Malformed percent-encoding in the id, as on every other route
+    expect((await post(`${base}/proposals/%E0%A4%A/notarize`, { notary: 'johnny' }, 'n0tary')).status).toBe(400);
+    // edits takes exactly what sign_proposal's edits takes in the operator profile
+    for (const edits of [{ signedBy: 'someone-else' }, { claim: 5 }, { literals: 'legacyRateLimiter' }, 'claim']) {
+      const res = await post(notarize, { notary: 'johnny', edits }, 'n0tary');
+      expect(res.status, JSON.stringify(edits)).toBe(400);
+      expect((await res.json()).error).toMatch(/edits/);
+    }
+    // ...and the body itself: no stray fields standing in for an identity
+    expect((await post(notarize, { notary: 'johnny', signedBy: 'alex' }, 'n0tary')).status).toBe(400);
+    expect((await post(`${base}/proposals/${proposal.id}/dismiss`, { dismissedBy: 'johnny', reason: '' }, 'n0tary')).status).toBe(400);
+
+    expect(await call('list_proposals', { status: 'open' })).toHaveLength(1);
+    const ok = await post(notarize, { notary: 'johnny', edits: { claim: 'LOG_BUDGET 30 is dead; config.ts sets 100' } }, 'n0tary');
+    expect(ok.status).toBe(200);
+    expect((await ok.json()).body.claim).toBe('LOG_BUDGET 30 is dead; config.ts sets 100');
+  });
+
   it('a person can decline a draft over REST, with a reason', async () => {
     const { call, base } = await start({ notarySecret: 'n0tary' });
     const { proposal } = await call('propose_tombstone', DRAFT);

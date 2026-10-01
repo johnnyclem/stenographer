@@ -36,6 +36,7 @@ import { createServer, type Server, type IncomingMessage, type ServerResponse } 
 import { z } from 'zod';
 import type { Stenographer } from '../core/stenographer.js';
 import { TruthWriteError } from '../truth/ledger.js';
+import { DraftEditsSchema } from '../truth/types.js';
 import { NOTARY_SECRET_HEADER, notarySecretMatches } from '../truth/notary.js';
 import { allowedHostNames, bearerMatches, hostHeaderName, originAllowed } from './auth.js';
 import { ContextConsultSchema, answerContextConsult } from './appa-context.js';
@@ -79,6 +80,14 @@ const QUERIES = {
   contextFrame: z.object({ budget: count(2000, MAX_BUDGET) }),
 };
 
+const nonBlank = (what: string) => z.string().refine((v) => v.trim().length > 0, `${what} is required`);
+
+/** Notary request bodies: exactly what the operator profile's tools take, no stray identities. */
+const BODIES = {
+  notarize: z.object({ notary: nonBlank('notary'), edits: DraftEditsSchema.optional() }).strict(),
+  dismiss: z.object({ dismissedBy: nonBlank('dismissedBy'), reason: nonBlank('reason') }).strict(),
+};
+
 /** A request the caller has to fix: answered with its status, never 500. */
 class RequestError extends Error {
   constructor(
@@ -94,6 +103,15 @@ function parseQuery<T extends z.ZodTypeAny>(schema: T, url: URL): z.infer<T> {
   if (!result.success) {
     const issues = result.error.issues.map((i) => `${i.path.join('.') || 'query'}: ${i.message}`);
     throw new RequestError(400, `Invalid query parameter — ${issues.join('; ')}`);
+  }
+  return result.data;
+}
+
+function parseBody<T extends z.ZodTypeAny>(schema: T, body: Record<string, unknown>): z.infer<T> {
+  const result = schema.safeParse(body);
+  if (!result.success) {
+    const issues = result.error.issues.map((i) => `${i.path.join('.') || 'body'}: ${i.message}`);
+    throw new RequestError(400, `Invalid request body — ${issues.join('; ')}`);
   }
   return result.data;
 }
@@ -337,33 +355,19 @@ export class RestServer {
       return;
     }
 
-    let body: Record<string, unknown>;
-    try {
-      body = await readJson(req);
-    } catch (err) {
-      sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
-      return;
-    }
-
-    const proposalId = decodeURIComponent(match[1]);
+    // Malformed requests are the caller's to fix (400, 413), before anything is written
+    const proposalId = decodeSegment(match[1]);
+    const body = await readJson(req);
     try {
       if (match[2] === 'notarize') {
-        const notary = body.notary;
-        if (typeof notary !== 'string' || !notary.trim()) {
-          sendJson(res, 400, { error: 'notary is required' });
-          return;
-        }
-        const edits = body.edits && typeof body.edits === 'object' ? (body.edits as Record<string, unknown>) : undefined;
+        const { notary, edits } = parseBody(BODIES.notarize, body);
         sendJson(res, 200, await engine.notarizeProposal(proposalId, notary, edits));
       } else {
-        const { dismissedBy, reason } = body as { dismissedBy?: unknown; reason?: unknown };
-        if (typeof dismissedBy !== 'string' || typeof reason !== 'string') {
-          sendJson(res, 400, { error: 'dismissedBy and reason are required' });
-          return;
-        }
+        const { dismissedBy, reason } = parseBody(BODIES.dismiss, body);
         sendJson(res, 200, await engine.dismissProposal(proposalId, dismissedBy, reason));
       }
     } catch (err) {
+      if (err instanceof RequestError) throw err;
       // Ledger rules (contempt, already-signed, invalid literals) are the caller's to fix
       const status = err instanceof TruthWriteError || (err as { name?: string })?.name === 'ZodError' ? 422 : 500;
       sendJson(res, status, { error: err instanceof Error ? err.message : String(err) });
