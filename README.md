@@ -71,11 +71,13 @@ npx stenographer start ./conversation.jsonl --embeddings hashed
 | `--rest-port` | port number | `8787` in daemon mode, off otherwise | Serve the REST API on this port |
 | `--objections` | `off` \| `shadow` \| `deliver` | `shadow` | Real-time objections to tombstoned literals (see [Real-time objections](#real-time-objections)) |
 | `--objection-channel` | URL (repeatable) | — | smallchat channel bridge to push each objection to as it's raised. Secret from `SMALLCHAT_CHANNEL_SECRET` |
-| `--objection-webhook` | URL (repeatable) | — | Webhook for harnesses that can't be interrupted: objections arrive in batches. HMAC key from `STENOGRAPHER_WEBHOOK_SECRET` |
+| `--objection-webhook` | URL (repeatable) | — | Webhook for harnesses that can't be interrupted: objections arrive in batches. Standard Webhooks signing key from `STENOGRAPHER_WEBHOOK_SECRET` (at least 24 bytes) |
 | `--objection-batch-size` | number | `3` | Batch size for `--objection-webhook` |
 | `--no-mcp-channel` | — | — | Don't push objections to the attached MCP client as Claude Code channel events |
 | `--require-notary` | — | off | Agents can't assert tombstones directly: they draft with `propose_tombstone` and a person notarizes (see [Agent-drafted tombstones](#agent-drafted-tombstones-notarization)). REST notary routes need `STENOGRAPHER_NOTARY_SECRET` |
-| `--rest-host` | hostname/IP | `127.0.0.1` | Interface for the REST API to bind to. The API has no authentication, so it stays loopback-only unless you explicitly opt into wider exposure (e.g. `0.0.0.0` behind a trusted network boundary) |
+| `--rest-host` | hostname/IP | `127.0.0.1` | Interface for the REST API to bind to. The API serves transcripts, so it stays loopback-only unless you explicitly opt into wider exposure (e.g. `0.0.0.0` behind a trusted network boundary) |
+| `--rest-allow-host` | host name (repeatable) | — | Also answer to this `Host` name. Loopback names and `--rest-host` always are; anything else gets 421 (see [REST API](#rest-api-daemon-mode-or---rest-port)) |
+| `--rest-insecure` | — | off | Serve REST without a bearer token. Host and Origin checks still apply |
 
 Positional args: `stenographer start <log-path> [state-path]` — `state-path` defaults to `./stenographer.db`.
 
@@ -144,9 +146,41 @@ GET /proposals?status=open&kind=tombstone
 
 POST /proposals/:id/notarize  {notary, edits?}      X-Notary-Secret required
 POST /proposals/:id/dismiss   {dismissedBy, reason} X-Notary-Secret required
+POST /appa/context            OpenAPPA consult (kind: context), read-only
 ```
 
-There's no authentication on these routes, so the server binds to `127.0.0.1` by default — pass `--rest-host` if you deliberately want it reachable from elsewhere.
+**Access.** The routes serve transcripts, including any secret someone pasted into a session, so every request is checked before anything is read:
+
+- **Host** must be `localhost`, `127.0.0.1`, `[::1]`, the `--rest-host`, or a `--rest-allow-host` name; anything else gets `421`. This stops DNS rebinding, where a web page points its own hostname at 127.0.0.1 and reads the API as its own origin.
+- **Origin**, when a browser sends one, must be on one of those hosts (`403` otherwise).
+- **`Authorization: Bearer <token>`** is required on every route (`401` otherwise). The token is `STENOGRAPHER_REST_TOKEN` when set (at least 16 characters); otherwise stenographer generates one on first run into `rest-token` next to the state database, with mode 0600, prints that path on startup, and reuses it. `--rest-insecure` drops the token requirement (the Host and Origin checks stay). If the state database lives inside a repository, add `rest-token` to its `.gitignore`.
+
+The notary routes need the bearer token and `X-Notary-Secret`. The token keeps out web pages, other users and other machines. It doesn't keep out processes running as you, which can read the token file, so treat it like the notary secret.
+
+The server binds to `127.0.0.1` by default. Pass `--rest-host` if you deliberately want it reachable from elsewhere, plus `--rest-allow-host` for the name clients use.
+
+Query parameters are validated: a malformed one (`k=abc`, `n=0`, an unknown `status`) gets `400`, and oversized counts are clamped (`k` ≤ 200, `n` ≤ 1,000, `depth` ≤ 5, `limit` ≤ 1,000, `budget` ≤ 100,000).
+
+### OpenAPPA context provider
+
+[OpenAPPA](https://github.com/archestra-ai/openappa) asks configured context providers about each proposed tool call before its annotator labels the call. `POST /appa/context` implements consult protocol v1 for `kind: "context"`. It takes `{version: 1, kind: "context", name, declaration: {}, artifact: {tool, arguments, cwd?}}` and answers `{version: 1, answer}`. The answer is `null` when the ledger has nothing to say. Otherwise it is `{about, hits}`, with one hit per tombstoned literal found in the arguments:
+
+```json
+{ "tb_id": "01J…", "subject": "LOG_BUDGET", "dead": "30", "current": "100",
+  "claim": "LOG_BUDGET 30 is dead; the budget is 100", "signer": "johnnyclem", "author": "johnnyclem",
+  "status": "active", "argument": "command", "line": "printf 'LOG_BUDGET=30\\n' >> .env",
+  "contested_by": [] }
+```
+
+Matching is the objection detector's: exact tokens, a subject next to its value, lines that also name the current value skipped, and the old side of an edit (`old_string`, …) ignored. A contested TB lists the open UVs that dispute it, with their authors. The answer is facts for the annotator, not a label. Whether a hit matters is the policy's call. The route is read-only and uses the same bearer token:
+
+```toml
+[externals.context.stenographer]
+url = "http://127.0.0.1:8787/appa/context"
+token_env = "APPA_STENOGRAPHER_TOKEN"   # the contents of <state dir>/rest-token
+```
+
+OpenAPPA asks context providers only for calls that need a new annotation, and only annotators read the answer, so this informs labeling. It doesn't block a call by itself.
 
 ## Importance Scoring
 
@@ -205,7 +239,7 @@ Downstream consumers get the confidence type in every result, with the consumpti
 
 Agents often find the dead value first — the config that was bumped, the class that was deleted. `propose_tombstone` lets them draft the TB: claim, evidence, the literals to object to, and why. They can't sign it. The draft is a `PROPOSAL` marked `requiresNotary`, and only a person turns it into truth:
 
-1. **Raised.** The draft goes to the same receivers as objections — smallchat's channel bridge (`meta.kind: "proposal"`, with a `notarize_url`) and operator webhooks (`type: "stenographer.proposal"`) — never to the attached MCP client, which is the drafter. It's also printed to stderr and stays in `GET /proposals?status=open`.
+1. **Raised.** The draft goes to the same receivers as objections — smallchat's channel bridge (`meta.kind: "proposal"`, with a `notarize_url`) and operator webhooks (`type: "stenographer.proposal"`) — never to the attached MCP client, which is the drafter. It's also printed to stderr and stays in `GET /proposals?status=open`. Notices escape control characters and bidi overrides in whatever the agent wrote (as `\u001b`, `\r`, …), so a claim can't conceal or overwrite itself in a terminal or chat.
 2. **Notarized.** A person approves or declines it through a path agents' tools don't reach:
    - REST `POST /proposals/:id/notarize` / `dismiss` with `X-Notary-Secret` — the secret in `STENOGRAPHER_NOTARY_SECRET`, shared with your approval UI (smallchat) and not with agents. Unset, the routes answer 403.
    - `stenographer notarize <id> --as <name> [--state <path>]` (or `--decline "<reason>"`), which needs an interactive terminal and a typed confirmation.
@@ -239,9 +273,15 @@ Every objection ships the objection, the exhibit (the full TB, plus any contesti
 |---|---|---|
 | Claude Code (built-in channel) | The attached MCP client gets `notifications/claude/channel`; stenographer declares the `claude/channel` capability | As discovered |
 | smallchat agent-to-agent messaging | `--objection-channel <url>` → `POST <url>/event` on smallchat's channel bridge (`X-Channel-Secret`), relayed into the agent's session | As discovered |
-| Harnesses without interrupts | `--objection-webhook <url>` → `POST {type: "stenographer.objections", objections: [...]}`, signed `X-Stenographer-Signature: sha256=<hmac>` | Once a batch of 3 is pending |
+| Harnesses without interrupts | `--objection-webhook <url>` → `POST {type: "stenographer.objections", objections: [...]}`, signed per [Standard Webhooks](https://www.standardwebhooks.com/) | Once a batch of 3 is pending, or after the oldest has waited 5 minutes |
 
-Delivery state is durable: a partial batch survives a restart, failed deliveries retry, and an objection the judge already ruled on is dropped from the queue. Webhook URLs must be loopback unless a sink sets `allowRemote`, since objections carry transcript lines. Watch mode skips the MCP channel because one connection can't be mapped to the many sessions it watches, so use a smallchat channel or a webhook there. In watch mode each session is named after its log file (`<session-id>.jsonl` → `<session-id>`), which for Claude Code is the session id, so `meta.session_ids` on a channel event is what smallchat's messenger routes by. Stenographer itself still never writes into a conversation: it emits to receivers the operator configured, and they decide what to do.
+**Signatures.** Webhooks (objections and proposals) carry `webhook-id`, `webhook-timestamp` (Unix seconds) and `webhook-signature: v1,<base64 HMAC-SHA256 of "<id>.<timestamp>.<body>">`, keyed by `STENOGRAPHER_WEBHOOK_SECRET`. Any Standard Webhooks verifier can check them. A `whsec_<base64>` secret is used decoded; any other secret is used as its UTF-8 bytes (`new Webhook(secret, { format: "raw" })` in the reference library), and it must be at least 24 bytes. The id is stable across retries of the same delivery, so receivers can deduplicate, and the signed timestamp lets them refuse replays.
+
+**Retries.** Delivery state is durable: a partial batch survives a restart, and an objection the judge already ruled on is dropped from the queue. Retries are per objection and per receiver. A network error, a 5xx, 408 or 429 backs off (15 s, doubling, at most an hour). A redirect or any other 4xx dead-letters the objection for that receiver at once, and so does an 8th failed attempt. Either way, the objections behind it keep flowing. A batch refused as a whole is retried one objection at a time. `get_status` counts dead letters under `objections.deadLettered`. Channel notices cap each line at 2,000 characters; the full record is one `list_objections` call away. Redirects are never followed, so a receiver can't forward the body and its secret elsewhere. Logs and tool results name a receiver by scheme, host and port only, because chat webhooks keep their token in the path or query.
+
+Webhook URLs must be loopback unless a sink sets `allowRemote`, since objections carry transcript lines. Watch mode skips the MCP channel because one connection can't be mapped to the many sessions it watches, so use a smallchat channel or a webhook there.
+
+**Session ids.** An objection's `sessionId`, and `meta.session_ids` on a channel event (what smallchat's messenger routes by), is the harness's own session id when the log records one (Claude Code's `sessionId`). Otherwise it is the log file's basename (`<name>.jsonl` → `<name>`), which for Claude Code is also the session id. The same rule holds in every mode, and the id is never minted from the clock, so it survives restarts. Stenographer itself still never writes into a conversation: it emits to receivers the operator configured, and they decide what to do.
 
 ## GraphRAG Search
 

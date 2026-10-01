@@ -8,7 +8,7 @@
 - **Startup replay never delivers objections, in any mode.** Before, only `catchup` forced shadow. Now, in `live`, `daemon` and `watch` too, whatever a log held when stenographer started is recorded as shadow, and only lines appended afterwards (or logs that appear afterwards) are delivered. (STENO-IDX-02, STENO-T-11)
 - **Message ids for id-less formats changed.** `openai`, `anthropic` and `generic` lines without an id used `msg_<32-bit FNV of the line>`. They now use `msg_<128-bit hash of log path, byte offset, line>`. (STENO-IDX-26)
 - **Decision and tombstone ids are deterministic.** They were `decision_<ms>_<random>` and `tombstone_<ms>_<random>`. They are now `decision_<hash>` and `tombstone_<hash>`, derived from the source message, the extractor and the captured text.
-- **`live`, `daemon` and `catchup` keep a log's session id across restarts.** It is stored with the checkpoint. Before, each run minted a new `session_<ms>` and re-tagged every message with it.
+- **Session ids come from the harness or the log name, never the clock.** In every mode, a message's session is the id its log line records (Claude Code's `sessionId`) or else the log's basename (`<name>.jsonl` → `<name>`). Objections carry it, and so does `meta.session_ids`, which smallchat's messenger routes by. Before, `live`, `daemon` and `catchup` minted `session_<ms>` on each start and overwrote the adapter's id with it, so no objection could be routed. In file modes the latest such id is the query scope (`getSessionId()`, session-scoped tools), and it is stored with the checkpoint. `Tailer` defaults its session id to the log basename and keeps an adapter-parsed one. (STENO-IDX-10)
 - **State databases run in WAL mode and carry a schema version** (`PRAGMA user_version`, migrated in place on start). A database written by a newer stenographer is refused instead of opened.
 - **Format auto-detection matches on any sampled line**, not only the first, and waits for the first complete line of an empty log. `detectAdapterFromLines` keeps its JSONL fallback. The new `matchAdapterFromLines` returns `null` when nothing matches. (STENO-IDX-05)
 - **`Tailer` follows the path like `tail -F`.** In follow mode it no longer throws on a missing file: it waits for the file. It emits only newline-terminated lines, holding back a partial last line. The `message` event gets a second argument (`IngestPosition`), and there are new `progress`, `adapter`, `reset` and `removed` events. `LogAdapter.parseLine` takes an optional `LineContext`.
@@ -24,15 +24,32 @@
 - **REST and MCP clamp `k` to 200**, `n` to 1,000 and graph depth to 5. `StateStore.searchSimilar` clamps `k` to 4,096. (STENO-IDX-13)
 - **Supersession proposals dedupe per (superseded, successor) pair**: `targetRef` is `<superseded>-><successor>`, no longer the superseded decision's id. In `watch` mode supersession matches across sessions. (STENO-IDX-12, -22)
 - **Schema v3**: `messages` gains `seq`, `tags`, `tool_calls` and `importance_total`; `index_meta` is new. The vector table is rebuilt (one row per message window, cosine distance, partitioned by session) from the stored embeddings on first open.
+- **REST requires a bearer token and an allowed Host on every route.** `Authorization: Bearer <token>` with `STENOGRAPHER_REST_TOKEN`, or the token generated on first run into `<state dir>/rest-token` (mode 0600; its path is printed on startup). `--rest-insecure` drops the token requirement. A `Host` other than `localhost`, `127.0.0.1`, `[::1]`, `--rest-host` or a `--rest-allow-host` name gets 421, and a cross-site `Origin` gets 403. Notary routes need the token as well as `X-Notary-Secret`. `new RestServer(engine)` now takes `{token}` or `{insecure: true}`. (STENO-IDX-11)
+- **REST query parameters are validated.** A malformed parameter is a 400 instead of a silent default (`k=abc`, `n=0`, `depth=-1`, `include=` anything but `shadow`), as is malformed percent-encoding in a path (was a 500). Counts are still clamped. `limit` is now clamped to 1,000 and `budget` to 100,000.
+- **Webhooks are signed per Standard Webhooks.** `webhook-id`, `webhook-timestamp` and `webhook-signature: v1,<base64 HMAC-SHA256 of "id.timestamp.body">` replace `X-Stenographer-Signature: sha256=<hex HMAC of the body>`, on objection and proposal webhooks alike. `STENOGRAPHER_WEBHOOK_SECRET` must be at least 24 bytes (a `whsec_` secret once decoded). (STENO-T-17)
+- **Delivery never follows a redirect.** A 3xx is a permanent failure. Before, fetch followed it with the body and `X-Channel-Secret`, past the loopback check. (STENO-T-16)
+- **Delivery retries per objection, with backoff and dead-lettering.** Transient failures (network, 5xx, 408, 429) back off from 15 s, doubling up to an hour. A permanent refusal (other 4xx, 3xx) or the 8th failure dead-letters that objection for that receiver, and later objections are delivered anyway. Before, retries were every 15 s forever, in order, so one refused objection blocked every later one. A batch refused as a whole is retried one objection at a time, and a partial webhook batch is sent once its oldest objection has waited 5 minutes. New per-sink settings: `maxAttempts`, `retryBaseMs` and `maxBatchDelayMs`. (STENO-T-15)
+- **Sink URLs are redacted** in logs, in `createSinkTransport` errors and in `propose_tombstone`'s `raisedTo`/`undelivered`: they show the scheme, host and port, plus `/…` when the URL has a path or query. (STENO-T-17)
+- **Notices escape control characters.** `formatObjection` and `formatProposalNotice` render C0/C1 controls, line separators and bidi overrides in agent-written text as visible escapes (`\u001b`, `\r`, …), and cap each objection line at 2,000 characters. (STENO-T-22)
 
 ### Added
 
+- `POST /appa/context`: an [OpenAPPA](https://github.com/archestra-ai/openappa) context provider (consult protocol v1, `kind: "context"`). Given a proposed call's `{tool, arguments}`, it answers with the TB literal hits in the arguments (TB id, subject, dead and current values, claim, signer, author, status) and the UVs contesting them. It is read-only and uses the REST bearer token. Exports: `answerContextConsult` and `ContextConsultSchema`.
+- `--rest-allow-host`, `--rest-insecure`, `STENOGRAPHER_REST_TOKEN`; `StenographerConfig.restToken`, `restInsecure`, `restAllowedHosts`; `Stenographer.restToken` and `restTokenPath`.
+- `ObjectionDispatcher.deadLetters()`, `deadLetterCount()` and `retryNow()`; `objections.deadLettered` in `get_status`.
+- Exports: `logSessionId`, `resolveRestToken`, `restTokenPath`, `redactUrl`, `webhookHeaders`, `webhookId`, `assertWebhookSecret`, `DeliveryError`, `displayText`.
 - `--embeddings auto`, `--reembed` and `--supersede-threshold`. `StenographerConfig.embedder` accepts an `Embedder` instance.
 - `get_status` and `GET /status` report the embedder (`embedder`).
 - Exports: `assertableProse`, `EmbedderMismatchError`, `EmbedderIdentity`, `sameEmbedder`, `describeEmbedder`, `DEFAULT_EMBEDDING_MODEL`, `MessageTagSchema`.
 
 ### Fixed
 
+- A web page can no longer read transcripts from the local REST API by DNS rebinding, and other local users can't read them without the token. (STENO-IDX-11)
+- Objections from `live` and `daemon` mode reach the Claude Code session that raised them through smallchat's messenger. (STENO-IDX-10)
+- One objection a receiver refuses no longer stops delivery of every later objection to that receiver. (STENO-T-15)
+- A redirecting receiver can no longer send objections, proposal drafts and the channel secret to another host. (STENO-T-16)
+- A captured webhook can't be replayed as a fresh one to a receiver that checks the signed timestamp, and webhook tokens in URLs no longer reach the agent or the logs. (STENO-T-17)
+- A drafted claim can no longer hide itself in the notary's terminal behind ANSI conceal codes, carriage returns or bidi overrides. (STENO-T-22)
 - A restart no longer inverts supersession chains, duplicates decisions, tombstones, proposals or migration TBs, or re-counts entity references. (STENO-IDX-01)
 - A line written in more than one chunk is no longer dropped. (STENO-IDX-03)
 - Deleting a tailed log no longer crashes the process with an unhandled rejection. `watch` mode drops that session, and `live` mode waits for the log to reappear. (STENO-IDX-04)

@@ -16,7 +16,7 @@ stenographer start ./log.jsonl ./new.db --mode catchup   # then call import_wiki
 
 **Objections in `deliver` mode.** Lines a log already held when stenographer started are now scanned in shadow in every mode, not only `catchup`. If you relied on a restart to push objections for old lines, rule on them from `list_objections` with `includeShadow`.
 
-**Session ids in `live`, `daemon` and `catchup`.** The first run on a log mints `session_<ms>` as before. Later runs on the same log and state database reuse it. Nothing needs changing unless you parsed the session id to learn when the process started.
+**Session ids in `live`, `daemon` and `catchup`.** See [Session identity](#session-identity) below: a log's session is now its harness session id or its basename, never `session_<ms>`.
 
 **Library users.**
 
@@ -50,3 +50,21 @@ stenographer start ./log.jsonl ./new.db --mode catchup   # then call import_wiki
 - `extractStructure(msg).corrections[].to` is the current statement (read `to`, not `from`).
 - `ConversationMessage` and `IndexedMessage` have optional `tags`; `IndexedMessage` has `seq`, `toolCalls` and `chunkEmbeddings`.
 - `GraphRAGRetriever.indexMessage(msg, embedding?, info?)` takes `{entityIds, importance, seq}` so entity evidence, recency and importance can be ranked. The retriever accepts a `vectorSearch` option to delegate its vector step.
+
+## REST, delivery and session identity
+
+**REST needs a bearer token.** Every route, including the notary routes and `GET /proposals`, now needs `Authorization: Bearer <token>`. On first start with REST on, stenographer writes a token to `rest-token` next to the state database (mode 0600) and prints the path. Give its contents to each client: dashboards, scripts (`curl -H "Authorization: Bearer $(cat rest-token)"`), smallchat's notary client (it also still sends `X-Notary-Secret`), and OpenAPPA (`token_env`). To choose the token yourself, set `STENOGRAPHER_REST_TOKEN` (at least 16 characters). To keep 0.x behavior on a trusted machine, pass `--rest-insecure`. Requests must also name an allowed `Host`. Clients that connect to `localhost`, `127.0.0.1` or `[::1]` need nothing extra. If you bind `--rest-host 0.0.0.0` and clients use another name (a container hostname), add `--rest-allow-host <name>`. Library users construct `new RestServer(engine, { token })` (or `{ insecure: true }`).
+
+**Stricter query parameters.** Values that 0.x replaced with defaults (`k=abc`, `n=0`, `depth=-1`, `include=all`) now get 400. Send integers, or leave the parameter out.
+
+**Webhook signatures.** Receivers that checked `X-Stenographer-Signature: sha256=<hex HMAC-SHA256(secret, body)>` must switch to Standard Webhooks verification: compute `base64(HMAC-SHA256(key, "<webhook-id>.<webhook-timestamp>.<raw body>"))` and compare it with the value after `v1,` in `webhook-signature`, and reject timestamps more than a few minutes old. The key is the secret's UTF-8 bytes, or for a `whsec_` secret its base64-decoded bytes. In the reference libraries, `new Webhook(secret, { format: "raw" })` (or a `whsec_` secret as-is) verifies it. `STENOGRAPHER_WEBHOOK_SECRET` must be at least 24 bytes, so generate a new one if yours is shorter (`openssl rand -base64 32`). `X-Stenographer-Event` is unchanged.
+
+**Redirecting receivers.** A receiver URL that answers with a redirect now fails delivery permanently. Configure the final URL.
+
+**Delivery retries and dead letters.** An objection a receiver refuses with a 4xx (other than 408/429) is no longer retried, and one that fails 8 times is dead-lettered. Read `get_status` → `objections.deadLettered`, or `engine.store.objectionDelivery.deadLetters()` for the details. After fixing a receiver, `retryNow()` makes backed-off deliveries due at once. Dead letters stay dead, because by then the agent has moved on. Non-interrupting webhooks now get a partial batch after 5 minutes. Set `maxBatchDelayMs` on the sink to change that.
+
+**Redacted URLs.** `propose_tombstone`'s `raisedTo` and `undelivered[].url` now show `scheme://host:port` (plus `/…` when the URL has a path or query) instead of the full URL. Match receivers by origin if you compared these.
+
+### Session identity
+
+Objections, `meta.session_ids` and session-scoped queries use the harness's session id when a log line records one (Claude Code's `sessionId`), and otherwise the log's basename (`agent-7.jsonl` → `agent-7`). This is the same in every mode. In 0.x, `live`, `daemon` and `catchup` used `session_<start time>`. That changed on every restart and never matched what smallchat's messenger routes by. A pre-1.0 database has no checkpoints, so the first 1.0 start reads each log from the top (see [Ingestion](#ingestion-checkpoints-deterministic-ids)). Messages it recognizes move to the new session id along with their decisions and tombstones. Entity counts stay under the old id, so re-index into a fresh state path if you need them in scope. Watch mode already named sessions after their files, so it changes only for logs whose lines name another session. Library code that relied on `new Tailer(path)` producing `session_<ms>` gets the basename now, and a message whose adapter parsed a `sessionId` keeps it rather than being overwritten.
