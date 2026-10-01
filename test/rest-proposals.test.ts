@@ -10,6 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { StenographerServer } from '../src/mcp/server.js';
 import { NotarizationRequiredError } from '../src/truth/ledger.js';
+import { importProposalDrafts } from '../src/truth/intake.js';
 import { wikiLineHash } from '../src/truth/wiki.js';
 import type { StenographerConfig } from '../src/types.js';
 import type { ProposalEntry } from '../src/truth/types.js';
@@ -168,6 +169,61 @@ describe('POST /proposals', () => {
       expect(body.error).toMatch(/already filed/);
     }
     expect(proposals()).toHaveLength(1);
+  });
+
+  // The proposals stream and REST file under one id namespace. A stream that
+  // filed this envelope first filed it as detector:short-hand without the
+  // notary requirement; REST answered 200 for that proposal, and the
+  // envelope's author could then sign it through the plain operator path.
+  it('answers 409 when a proposals stream filed this envelope without what a submission guarantees', async () => {
+    const base = await start();
+    const bySam = { ...ENVELOPE, author: 'sam' };
+    const streamed = importProposalDrafts(server!.engine.store.truth, { lines: [JSON.stringify(chained(bySam))] });
+    expect(streamed.filed).toHaveLength(1);
+    const [prior] = streamed.filed;
+
+    const res = await post(`${base}/proposals`, bySam);
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.proposalId).toBe(prior.id);
+    expect(body.error).toMatch(/detector:short-hand/);
+    expect(body.error).toMatch(/notary/);
+    expect(proposals()).toHaveLength(1);
+
+    // The other way round is a duplicate: the stream's line is already filed, as a submission
+    const other = { ...ENVELOPE, id: '01J9MSGRTB0000000000000003' };
+    const { proposalId } = await (await post(`${base}/proposals`, other)).json();
+    const again = importProposalDrafts(server!.engine.store.truth, { lines: [JSON.stringify(chained(other))] });
+    expect(again).toMatchObject({ filed: [], deduped: 1, errors: [] });
+    expect(server!.engine.store.truth.getEntry(proposalId)).toMatchObject({ author: 'agent:messenger', body: { requiresNotary: true } });
+  });
+
+  // A submission under the agent's own identity has the same author, kind,
+  // target and notary requirement as that agent's draft. propose_tombstone
+  // then folded the agent's different claim into it, answered "deduped into
+  // your open draft", and paged nobody.
+  it("never folds the agent's own draft into a submission filed under the agent's name", async () => {
+    const base = await start();
+    const res = await post(`${base}/proposals`, { ...ENVELOPE, author: 'agent:claude-code' });
+    expect(res.status).toBe(201);
+    const { proposalId } = await res.json();
+
+    const draft = {
+      claim: 'LOG_BUDGET 100 is dead; the budget is 500',
+      evidence: [{ kind: 'message' as const, ref: 'm9' }],
+      targetRef: ENVELOPE.targetRef,
+      proposedBy: 'agent:claude-code',
+    };
+    const out = await server!.engine.draftTombstone(draft);
+    expect(out.dedupedInto).toBeUndefined();
+    expect(out.proposal.id).not.toBe(proposalId);
+    expect(out.proposal.body.draft).toMatchObject({ claim: draft.claim });
+    expect(server!.engine.store.truth.getEntry(proposalId)?.body).toMatchObject({ draft: { claim: ENVELOPE.draft.claim } });
+
+    // The agent's next draft for that target still folds into its own
+    const again = await server!.engine.draftTombstone({ ...draft, claim: 'restated' });
+    expect(again.dedupedInto).toBe(out.proposal.id);
+    expect(proposals()).toHaveLength(2);
   });
 
   it('answers 400 with the validation errors, and files nothing', async () => {

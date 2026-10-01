@@ -86,6 +86,14 @@ const CHAIN_COLUMNS: Array<[string, string]> = [
   ['appended_links', 'TEXT'],
 ];
 
+/**
+ * The envelope id a proposal was filed from (`meta.intake.id`), as SQL. The
+ * index on it and the lookup must spell it the same way for SQLite to use
+ * the index. A body that isn't JSON reads as no id, so it can't fail the
+ * index and with it every open of the ledger (verify reports such a row).
+ */
+const INTAKE_ID_SQL = `CASE WHEN json_valid(body) THEN json_extract(body, '$.meta.intake.id') END`;
+
 /** An entry as it is stored: the body as written, without the derived status. */
 export type NewEntry = Omit<TruthEntry, 'links' | 'body'> & { body: object };
 
@@ -277,6 +285,12 @@ export class TruthLedger {
       CREATE INDEX IF NOT EXISTS idx_truth_links_from ON truth_links(from_id);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_truth_seq ON truth_entries(seq);
     `);
+    // intakeProposal runs on every intake line and REST submission. Created
+    // by any writable open, so a ledger written without it gains it; the
+    // gate opens the file read-only and never looks proposals up by id.
+    if (!this.db.readonly) {
+      this.db.exec(`CREATE INDEX IF NOT EXISTS idx_truth_intake_id ON truth_entries(${INTAKE_ID_SQL}) WHERE type = 'PROPOSAL'`);
+    }
 
     this.chainExistingEntries();
   }
@@ -701,10 +715,12 @@ export class TruthLedger {
 
   /**
    * Writes a machine-drafted proposal. Dedupes by target: an open proposal
-   * of the same kind against the same target, from the same author and with
-   * the same notary requirement, is returned instead of duplicated
-   * (batching by target entity, §10). Dedupe never crosses authors: one
-   * author's draft is never folded into another's.
+   * of the same kind against the same target, from the same author and
+   * source (`signal.source`) and with the same notary requirement, is
+   * returned instead of duplicated (batching by target entity, §10). Dedupe
+   * never crosses authors or sources: one author's draft is never folded
+   * into another's, nor into a proposal filed under that author from
+   * elsewhere (a REST submission, an intake line).
    */
   addProposal(
     body: Omit<ProposalBody, 'status' | 'dismissedBy' | 'dismissReason'>,
@@ -720,6 +736,7 @@ export class TruthLedger {
         targetRef: body.targetRef,
         author,
         requiresNotary: Boolean(body.requiresNotary),
+        source: body.signal.source,
       });
       if (existing) return existing;
     }
@@ -751,6 +768,8 @@ export class TruthLedger {
     targetRef: string;
     author: string;
     requiresNotary: boolean;
+    /** The `signal.source` it was filed with (`agent-draft` for draftTombstone). */
+    source: ProposalBody['signal']['source'];
   }): ProposalEntry | null {
     const rows = this.db
       .prepare(`
@@ -765,7 +784,8 @@ export class TruthLedger {
       if (
         entry.body.kind === match.kind &&
         identityKey(entry.author) === author &&
-        Boolean(entry.body.requiresNotary) === match.requiresNotary
+        Boolean(entry.body.requiresNotary) === match.requiresNotary &&
+        entry.body.signal?.source === match.source
       ) {
         return entry;
       }
@@ -1426,7 +1446,7 @@ export class TruthLedger {
   /** The proposal the intake filed from the envelope with this id (`meta.intake.id`), whatever became of it. */
   intakeProposal(envelopeId: string): ProposalEntry | null {
     const row = this.db
-      .prepare(`SELECT * FROM truth_entries WHERE type = 'PROPOSAL' AND json_extract(body, '$.meta.intake.id') = ? ORDER BY seq LIMIT 1`)
+      .prepare(`SELECT * FROM truth_entries WHERE type = 'PROPOSAL' AND ${INTAKE_ID_SQL} = ? ORDER BY seq LIMIT 1`)
       .get(envelopeId);
     return row ? (this.rowToEntry(row) as ProposalEntry) : null;
   }

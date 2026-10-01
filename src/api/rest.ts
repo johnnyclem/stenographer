@@ -36,8 +36,8 @@
  * format v2 PROPOSAL envelope, filed by the proposals-stream intake as an
  * open proposal that needs a notary. Its author must be a person or an agent
  * (registered as one, with a signer registry). 201 {proposalId} when filed,
- * 200 {proposalId} when this envelope id was filed before, 409 for a
- * different envelope under a filed id:
+ * 200 {proposalId} when this envelope was submitted before, 409 for a
+ * different envelope under a filed id or one a proposals stream filed:
  *   POST /proposals               {schemaVersion: 2, type: "PROPOSAL", id, ts, author, kind, draft, …}
  */
 

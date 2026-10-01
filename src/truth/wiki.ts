@@ -983,7 +983,13 @@ function reconcile(
 
   const same = canonicalize(draft);
   const already = ledger.proposalsFor(id).some((p) => p.author === WIKI_SYNC_DETECTOR && canonicalize(p.body.draft) === same);
-  const open = ledger.findOpenProposal({ kind, targetRef: id, author: WIKI_SYNC_DETECTOR, requiresNotary: true });
+  const open = ledger.findOpenProposal({
+    kind,
+    targetRef: id,
+    author: WIKI_SYNC_DETECTOR,
+    requiresNotary: true,
+    source: 'wiki-reconciliation',
+  });
   if (already || open) {
     result.unchanged++;
     return;

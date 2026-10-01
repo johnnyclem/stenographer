@@ -2,7 +2,9 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import Database from 'better-sqlite3';
 import { StateStore } from '../src/store/index.js';
+import { TruthLedger } from '../src/truth/ledger.js';
 import { importProposalDrafts, COMPACTION_DETECTOR } from '../src/truth/intake.js';
 import { wikiLineHash } from '../src/truth/wiki.js';
 
@@ -339,5 +341,81 @@ describe('intake line numbers', () => {
     const result = importProposalDrafts(store.truth, { lines: ['', uvDraftLine(), '  ', '{"not":"valid"}'] });
     expect(result.filed).toHaveLength(1);
     expect(result.errors.map((e) => e.line)).toEqual([4]);
+  });
+});
+
+// TruthLedger.intakeProposal replaced an indexed targetRef lookup with
+// json_extract over every PROPOSAL row, unindexed: each stream line and each
+// POST /proposals cost time linear in the ledger's proposals (500 lines into
+// 10k proposals took 5 s). The lookup must use an index on the same expression.
+describe('the intake id lookup', () => {
+  const ENVELOPE = {
+    schemaVersion: 2,
+    type: 'PROPOSAL',
+    id: '01J9PROPTB0000000000000000',
+    ts: '2026-09-30T12:00:00.000Z',
+    author: 'detector:short-hand',
+    kind: 'tb',
+    draft: { claim: 'LOG_BUDGET 30 is dead; it is 100.', evidence: [{ kind: 'message', ref: 'm5' }] },
+    targetRef: 'shorthand:tombstone:m5',
+    signal: { source: 'compaction-candidate' },
+  };
+
+  /** The query plan of the SQL intakeProposal runs. */
+  function intakePlan(db: Database.Database, ledger: TruthLedger): string {
+    const seen: string[] = [];
+    const prepare = db.prepare;
+    db.prepare = function (this: Database.Database, sql: string) {
+      seen.push(sql);
+      return prepare.call(this, sql);
+    } as typeof db.prepare;
+    try {
+      ledger.intakeProposal('no-such-envelope');
+    } finally {
+      db.prepare = prepare;
+    }
+    expect(seen).toHaveLength(1);
+    return (db.prepare(`EXPLAIN QUERY PLAN ${seen[0]}`).all('x') as Array<{ detail: string }>).map((r) => r.detail).join('\n');
+  }
+
+  it('searches an index, not every proposal', () => {
+    const db = new Database(':memory:');
+    const ledger = new TruthLedger(db);
+    expect(intakePlan(db, ledger)).toMatch(/SEARCH truth_entries USING INDEX idx_truth_intake_id/);
+    db.close();
+  });
+
+  it('a ledger written before the index gains it on open, and an unreadable proposal body does not stop that', () => {
+    const db = new Database(':memory:');
+    const ledger = new TruthLedger(db);
+    const line = { ...ENVELOPE, seq: 1, prevHash: null };
+    const filed = importProposalDrafts(ledger, { lines: [JSON.stringify({ ...line, hash: wikiLineHash(line) })] });
+    expect(filed.filed).toHaveLength(1);
+    db.exec('DROP INDEX idx_truth_intake_id');
+    db.prepare(
+      `INSERT INTO truth_entries (id, type, created_at, author, provenance, body) VALUES ('broken', 'PROPOSAL', '2026-09-30T12:00:00.000Z', 'detector:x', '{}', '{not json')`
+    ).run();
+
+    const reopened = new TruthLedger(db);
+    expect(intakePlan(db, reopened)).toMatch(/USING INDEX idx_truth_intake_id/);
+    expect(reopened.intakeProposal(ENVELOPE.id)?.id).toBe(filed.filed[0].id);
+    expect(reopened.intakeProposal('broken')).toBeNull();
+    db.close();
+  });
+
+  it('a read-only opener (the gate) still opens a ledger written without the index', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'steno-intake-ro-'));
+    try {
+      const path = join(dir, 'state.db');
+      const rw = new Database(path);
+      new TruthLedger(rw);
+      rw.exec('DROP INDEX idx_truth_intake_id');
+      rw.close();
+      const ro = new Database(path, { readonly: true, fileMustExist: true });
+      expect(() => new TruthLedger(ro)).not.toThrow();
+      ro.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

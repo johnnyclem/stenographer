@@ -604,7 +604,32 @@ describe('TruthLedger authority invariants', () => {
       { author: 'Agent:A' }
     );
     expect(again.id).toBe(draft.id);
-    expect(ledger.findOpenProposal({ kind: 'tombstone', targetRef: 'decision_42', author: 'agent:a', requiresNotary: true })!.id).toBe(draft.id);
+    expect(
+      ledger.findOpenProposal({ kind: 'tombstone', targetRef: 'decision_42', author: 'agent:a', requiresNotary: true, source: 'agent-draft' })!.id
+    ).toBe(draft.id);
+  });
+
+  // A proposal filed under the drafter's name from elsewhere (a REST
+  // submission, an intake) matched on author, kind, target and notary
+  // requirement, so the drafter's next draft was folded into it.
+  it("dedupes a draft only into the same source's proposal, not one filed under the drafter's name from elsewhere", () => {
+    const submitted = ledger.addProposal(
+      {
+        kind: 'tombstone',
+        draft: { claim: 'submitted claim', evidence: commitEvidence },
+        signal: { source: 'compaction-candidate' },
+        targetRef: 'config:LOG_BUDGET',
+        requiresNotary: true,
+      },
+      { author: 'agent:a' }
+    );
+    const draft = ledger.draftTombstone({ claim: 'drafted claim', evidence: commitEvidence, targetRef: 'config:LOG_BUDGET' }, { author: 'agent:a' });
+    expect(draft.id).not.toBe(submitted.id);
+    expect(draft.body.draft).toMatchObject({ claim: 'drafted claim' });
+    expect(ledger.draftTombstone({ claim: 'restated', evidence: commitEvidence, targetRef: 'config:LOG_BUDGET' }, { author: 'agent:a' }).id).toBe(draft.id);
+    expect(
+      ledger.findOpenProposal({ kind: 'tombstone', targetRef: 'config:LOG_BUDGET', author: 'agent:a', requiresNotary: true, source: 'compaction-candidate' })!.id
+    ).toBe(submitted.id);
   });
 
   // ── Rulings and filters reject unknown values (STENO-T-23) ──

@@ -1119,6 +1119,7 @@ export class Stenographer implements StenographerAPI {
           targetRef: input.targetRef,
           author: proposedBy,
           requiresNotary: true,
+          source: 'agent-draft',
         })
       : null;
     const embedding = await (await this.ensureEmbedder()).embed(input.claim);
@@ -1165,7 +1166,8 @@ export class Stenographer implements StenographerAPI {
    * turn into truth, by notarizing it. It is filed under the envelope's
    * author, who must be a person or an agent (listed as one when a signer
    * registry is configured), so that author can't notarize it. `duplicate`
-   * means this envelope was filed before.
+   * means this envelope was submitted before; one a proposals stream filed
+   * first is a ProposalConflictError.
    */
   async submitProposal(envelope: Record<string, unknown>): Promise<{ outcome: 'filed' | 'duplicate'; proposal: ProposalEntry }> {
     return submitProposalEnvelope(this.store.truth, envelope, (author) => this.resolveIdentity(author, ['agent', 'human'], 'author'));

@@ -30,7 +30,7 @@ import { readFileSync } from 'node:fs';
 import { z } from 'zod';
 import { canonicalize, sha256Hex } from './jcs.js';
 import { TruthLedger, type WriteContext } from './ledger.js';
-import { EVIDENCE_KINDS, EvidenceSchema, TombstonedLiteralSchema, VerifyBySchema, type ProposalEntry } from './types.js';
+import { EVIDENCE_KINDS, EvidenceSchema, TombstonedLiteralSchema, VerifyBySchema, identityKey, type ProposalEntry } from './types.js';
 import { checkWikiChain, decodeWikiLine, wikiLineHash, type DecodedWikiLine } from './wiki.js';
 
 /** Default author for drafts arriving from a short-hand compactor. */
@@ -226,7 +226,13 @@ function fileProposalLine(
     }
   } else if (targetRef) {
     // The older dialects batch by target while the proposal is open
-    const open = ledger.findOpenProposal({ kind: draft.kind, targetRef, author, requiresNotary: Boolean(opts.requiresNotary) });
+    const open = ledger.findOpenProposal({
+      kind: draft.kind,
+      targetRef,
+      author,
+      requiresNotary: Boolean(opts.requiresNotary),
+      source: 'compaction-candidate',
+    });
     if (open) return { outcome: 'duplicate', proposal: open };
   }
 
@@ -315,13 +321,14 @@ function conflictMessage(envelopeId: string, prior: ProposalEntry): string {
 /** An envelope submitted on its own that can't be filed: the caller's to fix. */
 export class ProposalEnvelopeError extends Error {}
 
-/** A filed id came back with different content. */
+/** A filed id came back with different content, or was filed without what a submission guarantees. */
 export class ProposalConflictError extends Error {
   constructor(
     readonly proposal: ProposalEntry,
-    envelopeId: string
+    envelopeId: string,
+    message: string = conflictMessage(envelopeId, proposal)
   ) {
-    super(conflictMessage(envelopeId, proposal));
+    super(message);
   }
 }
 
@@ -334,9 +341,11 @@ export class ProposalConflictError extends Error {
  * author (which throws to refuse it).
  *
  * Returns `filed` the first time and `duplicate` when this envelope was
- * filed before. Throws ProposalEnvelopeError for an envelope that doesn't
- * validate, and ProposalConflictError for a different envelope under an id
- * already filed.
+ * submitted before. Throws ProposalEnvelopeError for an envelope that
+ * doesn't validate, and ProposalConflictError for a different envelope
+ * under an id already filed, or for this envelope filed by a proposals
+ * stream (under the stream's author, without the notary requirement): a
+ * submission's answer only ever names a proposal its author can't sign.
  */
 export function submitProposalEnvelope(
   ledger: TruthLedger,
@@ -357,6 +366,18 @@ export function submitProposalEnvelope(
   const author = fileAs(read.draft.author!);
   const { outcome, proposal } = fileProposalLine(ledger, read, { author }, { requiresNotary: true });
   if (outcome === 'conflict') throw new ProposalConflictError(proposal, read.draft.id!);
+  if (outcome === 'duplicate' && !(proposal.body.requiresNotary && identityKey(proposal.author) === identityKey(author))) {
+    // One id namespace for streams and submissions: a stream filed this one
+    // first, as something the envelope's author could sign
+    const how = proposal.body.requiresNotary
+      ? `under ${proposal.author}`
+      : `by a proposals stream, under ${proposal.author} and without needing a notary`;
+    throw new ProposalConflictError(
+      proposal,
+      read.draft.id!,
+      `envelope ${read.draft.id} was already filed (proposal ${proposal.id}) ${how}, not as a submission by ${author} — submit it under a new id`
+    );
+  }
   return { outcome, proposal };
 }
 
