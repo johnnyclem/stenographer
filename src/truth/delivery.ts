@@ -365,6 +365,36 @@ interface DueObjection {
   solo: boolean;
 }
 
+/**
+ * Creates the delivery state tables: registered receivers, what each has
+ * been delivered, and per-objection retry and dead-letter state. A step of
+ * StateStore's versioned migrations; the dispatcher runs it too.
+ */
+export function ensureDeliverySchema(db: Database.Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS objection_sinks (
+      id TEXT PRIMARY KEY,
+      registered_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS objection_deliveries (
+      objection_id TEXT NOT NULL,
+      sink_id TEXT NOT NULL,
+      delivered_at TEXT NOT NULL,
+      PRIMARY KEY (objection_id, sink_id)
+    );
+    CREATE TABLE IF NOT EXISTS objection_delivery_attempts (
+      objection_id TEXT NOT NULL,
+      sink_id TEXT NOT NULL,
+      attempts INTEGER NOT NULL,
+      next_attempt_at INTEGER NOT NULL,
+      solo INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT,
+      dead_at TEXT,
+      PRIMARY KEY (objection_id, sink_id)
+    );
+  `);
+}
+
 export class ObjectionDispatcher {
   private db: Database.Database;
   private log: ObjectionLog;
@@ -377,28 +407,7 @@ export class ObjectionDispatcher {
   constructor(db: Database.Database, log: ObjectionLog) {
     this.db = db;
     this.log = log;
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS objection_sinks (
-        id TEXT PRIMARY KEY,
-        registered_at TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS objection_deliveries (
-        objection_id TEXT NOT NULL,
-        sink_id TEXT NOT NULL,
-        delivered_at TEXT NOT NULL,
-        PRIMARY KEY (objection_id, sink_id)
-      );
-      CREATE TABLE IF NOT EXISTS objection_delivery_attempts (
-        objection_id TEXT NOT NULL,
-        sink_id TEXT NOT NULL,
-        attempts INTEGER NOT NULL,
-        next_attempt_at INTEGER NOT NULL,
-        solo INTEGER NOT NULL DEFAULT 0,
-        last_error TEXT,
-        dead_at TEXT,
-        PRIMARY KEY (objection_id, sink_id)
-      );
-    `);
+    ensureDeliverySchema(db);
   }
 
   get size(): number {

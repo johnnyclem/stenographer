@@ -63,7 +63,7 @@ Pass it with `--signer-registry signers.json` to `stenographer start`, and to `s
 
 ### Existing state files
 
-Nothing to run. The first time a 1.0 stenographer opens a pre-1.0 state file (`start`, `verify`, `notarize`, `proposals`), it adds the chain columns and chains the existing truth entries as they are, in insertion order. A `MARKER` entry (`chained-at-migration`, author `migration`) closes the run. For those entries the chain shows that they have not changed since the migration, not since they were written. Statuses are re-derived from links, and the marker lists any that change: typically a TB the 0.x contest bookkeeping had set back to active after it was overridden (STENO-T-06), which is now overridden again and stops objecting.
+Nothing to run. The first time a 1.0 stenographer opens a pre-1.0 state file (`start`, `verify`, `notarize`, `proposals`), it adds the chain columns and chains the existing truth entries as they are, in insertion order. Under `start`, `notarize` and `proposals` this is schema migration 4 (see [Ingestion](#ingestion-checkpoints-deterministic-ids)), in the same versioned runner as the index tables. A `MARKER` entry (`chained-at-migration`, author `migration`) closes the run. For those entries the chain shows that they have not changed since the migration, not since they were written. Statuses are re-derived from links, and the marker lists any that change: typically a TB the 0.x contest bookkeeping had set back to active after it was overridden (STENO-T-06), which is now overridden again and stops objecting.
 
 Run `stenographer verify <state-path>` after upgrading. Keep the head hash it prints somewhere other than the state file, for example in a commit. Then a truncated or rewritten ledger shows up as a different head.
 
@@ -128,7 +128,7 @@ If you use a signer registry, list your teammates in it: with one, a TB from the
 
 ### Existing state files
 
-The `objections` table is rebuilt the first time 1.0 opens it, with `(session_id, message_id, tb_id, dead)` as its unique key instead of `(message_id, tb_id, dead)`. Rows are kept. Nothing to do. If you query the table directly: the same message id can now appear once per session, and objections the gate filed have message id `gate:<call digest>`.
+The `objections` table is rebuilt the first time 1.0 opens it (schema migration 4), with `(session_id, message_id, tb_id, dead)` as its unique key instead of `(message_id, tb_id, dead)`. Rows are kept. Nothing to do. If you query the table directly: the same message id can now appear once per session, and objections the gate filed have message id `gate:<call digest>`.
 
 ### What raises an objection
 
@@ -148,7 +148,7 @@ The gate is opt-in. To use it, add the `PreToolUse` hook from the README's "Pre-
 
 ## Ingestion (checkpoints, deterministic ids)
 
-**State database.** Opening a pre-1.0 database migrates it in place (`PRAGMA user_version` 0 → 3). Existing rows are kept, and an `ingest_checkpoints` table is added. The database switches to WAL mode, so `-wal` and `-shm` files appear next to it. Copy all three when you move a live database, or stop stenographer first. A 0.x build can't open the database after 1.0 has migrated it.
+**State database.** Opening a pre-1.0 database migrates it in place (`PRAGMA user_version` 0 → 4). Existing rows are kept, an `ingest_checkpoints` table is added, and step 4 brings the truth layer along: the ledger is hash-chained (see [Existing state files](#existing-state-files)) and the objections table rekeyed. The database switches to WAL mode, so `-wal` and `-shm` files appear next to it. Copy all three when you move a live database, or stop stenographer first. A 0.x build can't open the database after 1.0 has migrated it. Every 1.0 opener (`start`, `notarize`, `proposals`, `verify`, `stenographer gate`) refuses a database a newer stenographer wrote, rather than touching it.
 
 **First start on an existing database.** Pre-1.0 databases have no checkpoints, so 1.0 reads each log once from the top. For formats whose lines carry an id (`claude-code` uuids, `jsonl` ids), messages that are already indexed are recognized and skipped, and nothing is derived from them a second time. For id-less formats (`openai`, `anthropic`, `generic` lines without `id`), the message id scheme changed (32-bit FNV → 128-bit hash of path, offset and line). That first pass therefore adds each message again under its new id, next to the old row. To avoid the duplicates, index into a fresh state path and carry the signed truth over. The wiki tools are operator tools, so run these servers with `--profile operator` (from a notary UI or CLI, not an agent), and name the file inside one shared wiki directory:
 

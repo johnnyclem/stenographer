@@ -18,6 +18,7 @@ import { parseArgs } from 'node:util';
 import Database from 'better-sqlite3';
 import { TruthLedger } from './ledger.js';
 import type { IntegrityReport } from './chain.js';
+import { assertSchemaSupported } from '../store/migrations.js';
 
 const DEFAULT_STATE = './stenographer.db';
 
@@ -28,13 +29,15 @@ export type LedgerCheck =
 
 /**
  * Opens the state file at `path` (never creating it) and verifies its truth
- * ledger. A file without a ledger has nothing to verify.
+ * ledger. A file without a ledger has nothing to verify; one written by a
+ * newer stenographer is refused before anything in it is touched.
  */
 export function verifyStateFile(path: string): LedgerCheck {
   if (!existsSync(path)) return { outcome: 'error', error: `no state file at ${path}` };
   let db: Database.Database | null = null;
   try {
     db = new Database(path, { fileMustExist: true });
+    assertSchemaSupported(db);
     const hasLedger = db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'truth_entries'`).get();
     if (!hasLedger) return { outcome: 'no-ledger' };
     const hasMeta = db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'truth_meta'`).get();

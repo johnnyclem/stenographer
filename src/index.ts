@@ -165,6 +165,7 @@ export {
   ObjectionDispatcher,
   createSinkTransport,
   createMcpChannelTransport,
+  ensureDeliverySchema,
   formatObjection,
   formatObjectionBatch,
   redactUrl,

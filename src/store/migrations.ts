@@ -1,11 +1,16 @@
 /**
- * Stenographer — Index schema migrations
+ * Stenographer — State database schema migrations
  * An ordered list of steps; PRAGMA user_version records how many have run.
  * Each step runs in one transaction with its version bump, so a database is
  * never left half-migrated. Steps are append-only: never edit a released one.
+ * One runner covers the whole file: the index tables and the truth layer
+ * (ledger, objections, delivery state) that shares it.
  */
 
 import type Database from 'better-sqlite3';
+import { TruthLedger } from '../truth/ledger.js';
+import { ensureObjectionSchema } from '../truth/objections.js';
+import { ensureDeliverySchema } from '../truth/delivery.js';
 
 export type Migration = (db: Database.Database) => void;
 
@@ -162,22 +167,45 @@ export const MIGRATIONS: Migration[] = [
       );
     `);
   },
+
+  // 4 — the truth layer. The asserted-truth ledger, hash-chained: a pre-1.0
+  // ledger gains the chain columns and is chained once, as it is, behind a
+  // chained-at-migration MARKER. Objections are keyed per session (a 0.x
+  // table is rebuilt, rows kept), and delivery keeps per-objection retry
+  // and dead-letter state. The same setup is idempotent, so the ledger and
+  // the objection log run it too when opened without a StateStore
+  // (`stenographer verify`, the gate) — on a version this build knows.
+  (db) => {
+    TruthLedger.ensureSchema(db);
+    ensureObjectionSchema(db);
+    ensureDeliverySchema(db);
+  },
 ];
 
 /** The schema version this build writes. */
 export const SCHEMA_VERSION = MIGRATIONS.length;
 
 /**
+ * Throws when the database was written by a newer build. Every opener checks
+ * this before touching the schema: StateStore (through migrate), and the
+ * ledger's own openers, `stenographer verify` and the gate.
+ */
+export function assertSchemaSupported(db: Database.Database, supported: number = SCHEMA_VERSION): number {
+  const current = db.pragma('user_version', { simple: true }) as number;
+  if (current > supported) {
+    throw new Error(
+      `state database schema v${current} is newer than this stenographer supports (v${supported}); upgrade stenographer`
+    );
+  }
+  return current;
+}
+
+/**
  * Brings the database up to SCHEMA_VERSION. Refuses a database written by a
  * newer build rather than guessing at a schema it doesn't know.
  */
 export function migrate(db: Database.Database, migrations: Migration[] = MIGRATIONS): void {
-  const current = db.pragma('user_version', { simple: true }) as number;
-  if (current > migrations.length) {
-    throw new Error(
-      `state database schema v${current} is newer than this stenographer supports (v${migrations.length}); upgrade stenographer`
-    );
-  }
+  const current = assertSchemaSupported(db, migrations.length);
   for (let version = current; version < migrations.length; version++) {
     db.transaction(() => {
       migrations[version](db);

@@ -203,6 +203,17 @@ export class TruthLedger {
     this.init();
   }
 
+  /**
+   * Creates the ledger's tables, or brings a pre-1.0 ledger up to the
+   * hash-chained schema (chained once, behind a MARKER). StateStore runs
+   * this as one step of its versioned migrations (store/migrations.ts);
+   * opening a TruthLedger runs the same idempotent setup, for databases
+   * used without a StateStore (verify, the gate).
+   */
+  static ensureSchema(db: Database.Database): void {
+    new TruthLedger(db);
+  }
+
   private init(): void {
     // status and struck are caches of the derivation from links; seq,
     // prev_hash and hash are the chain; appended_links are the links each

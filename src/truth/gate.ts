@@ -55,6 +55,7 @@ import { compileTombstones, findGateRuling, ObjectionLog, type GateCall, type Ob
 import { decodeWikiLine } from './wiki.js';
 import { MAX_WIKI_FILE_BYTES } from './wiki-file.js';
 import { TombstonedLiteralSchema, type TbEntry, type TombstonedLiteral } from './types.js';
+import { assertSchemaSupported } from '../store/migrations.js';
 
 export type GateMode = 'shadow' | 'enforce';
 export type GateOnError = 'allow' | 'deny';
@@ -145,6 +146,7 @@ function openState(path: string, timeoutMs: number): TombstoneSource {
   if (!existsSync(path)) throw new Error(`no state file at ${path}`);
   const db = new Database(path, { readonly: true, fileMustExist: true, timeout: Math.max(0, timeoutMs) });
   try {
+    assertSchemaSupported(db);
     const has = (table: string) =>
       Boolean(db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`).get(table));
     if (!has('truth_entries')) {
