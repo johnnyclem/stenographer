@@ -3,6 +3,7 @@ import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Stenographer } from '../src/core/stenographer.js';
+import { answerContextConsult } from '../src/api/appa-context.js';
 import type { TbEntry, UvEntry } from '../src/truth/types.js';
 
 interface RecordedRequest {
@@ -208,5 +209,23 @@ describe('OpenAPPA context provider (POST /appa/context)', () => {
     const before = await engine.getTruthStats();
     await replay(recorded('bash-asserts-dead-literal'));
     expect(await engine.getTruthStats()).toEqual(before);
+  });
+
+  // STENO-REV-02: matching runs on the server's only thread, so a consult
+  // has a budget; past it, the answer is what was found, with a note.
+  it('answers within its budget, with what it found and a note, on a huge argument', async () => {
+    const { truth, objections } = engine.store;
+    const artifact = { tool: 'Write', arguments: { file_path: 'big.txt', content: '30 '.repeat(20_000) } };
+    // The clock passes the deadline partway through the content
+    let reads = 0;
+    const now = () => (reads++ < 2 ? 0 : 10_000);
+    const answer = answerContextConsult(truth, artifact, objections.compiled(), { budgetMs: 1_000, now });
+    expect(answer).toMatchObject({ hits: [], note: expect.stringMatching(/^stopped at content after its 1000 ms budget/) });
+
+    // The real clock: a megabyte of near-misses still answers in time
+    const huge = { tool: 'Write', arguments: { file_path: 'big.json', content: `[${'30,'.repeat(349_000)}30]` } };
+    const started = performance.now();
+    expect(answerContextConsult(truth, huge, objections.compiled())).toBeNull();
+    expect(performance.now() - started).toBeLessThan(3_000);
   });
 });

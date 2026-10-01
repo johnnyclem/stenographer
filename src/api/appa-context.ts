@@ -29,6 +29,7 @@
 import { z } from 'zod';
 import { compileTombstones, type CompiledTombstones } from '../truth/objections.js';
 import { assertingFields } from '../truth/asserting.js';
+import { MatchDeadlineError } from '../truth/literal-matcher.js';
 import type { TruthLedger } from '../truth/ledger.js';
 import type { TbEntry, TombstonedLiteral, UvEntry } from '../truth/types.js';
 
@@ -77,6 +78,20 @@ export interface ContextHit {
 export interface ContextAnswer {
   about: string;
   hits: ContextHit[];
+  /**
+   * Set when the consult ran out of its budget before reading every
+   * argument: the hits are what was found until then (fail open).
+   */
+  note?: string;
+}
+
+/** How long one consult may spend matching before it answers with what it has. */
+export const CONSULT_BUDGET_MS = 1_000;
+
+export interface ConsultBudget {
+  /** Milliseconds for matching the whole call (default CONSULT_BUDGET_MS). */
+  budgetMs?: number;
+  now?: () => number;
 }
 
 const ABOUT =
@@ -101,26 +116,39 @@ export function harnessToolName(tool: string): string {
  * The ledger's facts about one proposed call; null when it has none.
  * `compiled` is the active-TB matcher; pass a cached one (the objection
  * log's, recompiled only when the ledger changes) to skip compiling it
- * per consult.
+ * per consult. Matching runs on the server's thread, so it has a budget
+ * (CONSULT_BUDGET_MS): past it, the answer holds what was found so far and
+ * a `note` saying the rest went unread.
  */
 export function answerContextConsult(
   ledger: TruthLedger,
   artifact: ContextConsult['artifact'],
-  compiled?: CompiledTombstones
+  compiled?: CompiledTombstones,
+  budget: ConsultBudget = {}
 ): ContextAnswer | null {
   const fields = assertingFields(harnessToolName(artifact.tool), artifact.arguments);
   if (fields.length === 0) return null;
   const { tombstones, matcher } = compiled ?? compileTombstones(ledger.getMatchableTombstones());
   if (tombstones.length === 0) return null;
 
+  const now = budget.now ?? Date.now;
+  const budgetMs = budget.budgetMs ?? CONSULT_BUDGET_MS;
+  const deadline = now() + budgetMs;
+  let note: string | undefined;
   // The first asserting field per literal, in ledger order
   const found = new Map<number, { tb: TbEntry; literal: TombstonedLiteral; path: string; line: string }>();
   for (const { field, text } of fields) {
-    for (const hit of matcher.match(text, { skip: (key) => found.has(key.order) })) {
-      found.set(hit.key.order, { tb: hit.key.tb, literal: hit.key.literal, path: field, line: hit.line });
+    try {
+      for (const hit of matcher.match(text, { deadline, now, skip: (key) => found.has(key.order) })) {
+        found.set(hit.key.order, { tb: hit.key.tb, literal: hit.key.literal, path: field, line: hit.line });
+      }
+    } catch (err) {
+      if (!(err instanceof MatchDeadlineError)) throw err;
+      note = `stopped at ${field} after its ${budgetMs} ms budget: that argument and the ones after it were not read`;
+      break;
     }
   }
-  if (found.size === 0) return null;
+  if (found.size === 0 && !note) return null;
 
   let contests: Map<string, UvEntry[]> | null = null;
   const contestsOf = (tbId: string): UvEntry[] => {
@@ -151,5 +179,5 @@ export function answerContextConsult(
             }))
           : [],
     }));
-  return { about: ABOUT, hits };
+  return { about: ABOUT, hits, ...(note ? { note } : {}) };
 }

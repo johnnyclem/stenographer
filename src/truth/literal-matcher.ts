@@ -8,8 +8,10 @@
  * All active literals compile into one Aho-Corasick automaton over their
  * dead values: a text is read once, however many literals there are, and
  * only the places a dead value actually occurs are examined further (token
- * boundaries, the subject next to it, the clause around it). Cost is linear
- * in the text plus the number of dead-value occurrences.
+ * boundaries, the subject next to it, the clause around it), each in a
+ * bounded window around it; the line an occurrence sits on is found once
+ * per line, not once per occurrence. Cost is linear in the text plus the
+ * number of dead-value occurrences.
  *
  * Precision over recall, as before: an occurrence asserts the literal only
  * when
@@ -289,6 +291,16 @@ export class LiteralMatcher<K = number> {
     const found = new Set<number>();
     const hits: Array<LiteralHit<K>> = [];
     const seenLines = new Map<number, Set<number>>();
+    // The line of the last occurrence looked at: occurrences arrive in
+    // order, so each line is found once, not once per occurrence on it.
+    // (A dead value spanning lines gets lines of its own.)
+    let current: Span | null = null;
+    const lineOf = (start: number, end: number): Span => {
+      if (current && start >= current.start && end <= current.end) return current;
+      const line = lineAround(text, start, end);
+      if (!text.slice(start, end).includes('\n')) current = line;
+      return line;
+    };
 
     this.automaton.scan(
       text,
@@ -299,7 +311,7 @@ export class LiteralMatcher<K = number> {
         let line: Span | null = null;
         for (const i of this.byDead[deadId]) {
           if (skipped[i] || (!options.allLines && found.has(i))) continue;
-          line ??= lineAround(text, start, end);
+          line ??= lineOf(start, end);
           if (!this.asserts(this.entries[i], text, { start, end }, line)) continue;
           if (options.allLines) {
             const lines = seenLines.get(i) ?? new Set<number>();
@@ -387,8 +399,12 @@ function lineAround(text: string, start: number, end: number): Span {
 
 /** The line, trimmed; for a long line, an excerpt around the value. */
 function quoteLine(text: string, line: Span, at: number): string {
-  const whole = text.slice(line.start, line.end).trim();
-  if (whole.length <= MAX_LINE_LENGTH) return whole;
+  // Trimmed in place: a long line isn't copied whole for every hit on it
+  let start = line.start;
+  let end = line.end;
+  while (start < end && /\s/.test(text[start])) start++;
+  while (end > start && /\s/.test(text[end - 1])) end--;
+  if (end - start <= MAX_LINE_LENGTH) return text.slice(start, end);
   const half = Math.floor(MAX_LINE_LENGTH / 2);
   const from = Math.max(line.start, at - half);
   const to = Math.min(line.end, from + MAX_LINE_LENGTH);

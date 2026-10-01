@@ -26,7 +26,7 @@ import type Database from 'better-sqlite3';
 import { ulid, type TbEntry, type UvEntry, type TombstonedLiteral } from './types.js';
 import type { TruthLedger } from './ledger.js';
 import type { ConversationMessage } from '../types.js';
-import { LiteralMatcher } from './literal-matcher.js';
+import { LiteralMatcher, MatchDeadlineError } from './literal-matcher.js';
 import { assertingFields } from './asserting.js';
 
 export { findLiteralHits } from './literal-matcher.js';
@@ -177,6 +177,15 @@ export function compileTombstones(tombstones: TbEntry[]): CompiledTombstones {
   return { tombstones, matcher: new LiteralMatcher(literals.map((l, order) => ({ key: { ...l, order }, literal: l.literal }))) };
 }
 
+/** How long the live scan may spend on one message before it stops reading it. */
+export const SCAN_BUDGET_MS = 2_000;
+
+export interface ScanBudget {
+  /** Milliseconds for the whole message (default SCAN_BUDGET_MS). */
+  budgetMs?: number;
+  now?: () => number;
+}
+
 export class ObjectionLog {
   private db: Database.Database;
   private ledger: TruthLedger;
@@ -202,6 +211,10 @@ export class ObjectionLog {
    * finished log lines, so delivery is at message boundaries by
    * construction — never mid-generation.
    *
+   * The scan runs on the indexer's thread, so it has a budget
+   * (SCAN_BUDGET_MS): past it, what is left of the message is not read
+   * (fail open) and a note goes to stderr. Objections already found stand.
+   *
    * Counsel doesn't repeat itself: a literal already objected to in this
    * session and still pending, or already overruled, isn't raised again.
    * One the judge sustained is raised again if the mistake recurs. A
@@ -211,18 +224,31 @@ export class ObjectionLog {
    * Each source is read once by one matcher for all active literals; the
    * settled literals are fetched once per scan.
    */
-  scan(msg: ConversationMessage, sessionId: string, mode: ObjectionMode): Objection[] {
+  scan(msg: ConversationMessage, sessionId: string, mode: ObjectionMode, budget: ScanBudget = {}): Objection[] {
     if (mode === 'off' || msg.role !== 'assistant') return [];
     const { tombstones, matcher } = this.compiled();
     if (tombstones.length === 0) return [];
 
+    const now = budget.now ?? Date.now;
+    const budgetMs = budget.budgetMs ?? SCAN_BUDGET_MS;
+    const deadline = now() + budgetMs;
     const settled = this.settledInSession(sessionId, mode === 'deliver');
     const found = new Map<ActiveLiteral, { line: string; source: string }>();
     for (const { source, text } of assertedText(msg)) {
-      const hits = matcher.match(text, {
-        skip: (key) => found.has(key) || settled.has(settledKey(key.tb.id, key.literal.dead)),
-      });
-      for (const hit of hits) found.set(hit.key, { line: hit.line, source });
+      try {
+        const hits = matcher.match(text, {
+          deadline,
+          now,
+          skip: (key) => found.has(key) || settled.has(settledKey(key.tb.id, key.literal.dead)),
+        });
+        for (const hit of hits) found.set(hit.key, { line: hit.line, source });
+      } catch (err) {
+        if (!(err instanceof MatchDeadlineError)) throw err;
+        console.error(
+          `⚠️  Objection scan of message ${msg.id} ran past its ${budgetMs} ms budget at ${source}; the rest of it was not read`
+        );
+        break;
+      }
     }
 
     const raised: Objection[] = [];

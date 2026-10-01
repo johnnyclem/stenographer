@@ -18,6 +18,8 @@ export { resolveRestToken, restTokenPath, REST_TOKEN_FILE, type RestToken } from
 export {
   answerContextConsult,
   ContextConsultSchema,
+  CONSULT_BUDGET_MS,
+  type ConsultBudget,
   type ContextConsult,
   type ContextAnswer,
   type ContextHit,
@@ -128,6 +130,8 @@ export {
   ensureObjectionSchema,
   findGateRuling,
   gateMessageId,
+  SCAN_BUDGET_MS,
+  type ScanBudget,
   type CompiledTombstones,
   type GateCall,
   type Objection,

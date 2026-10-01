@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import Database from 'better-sqlite3';
 import { TruthLedger } from '../src/truth/ledger.js';
 import { ObjectionLog, findLiteralHits, assertedText } from '../src/truth/objections.js';
+import { LiteralMatcher } from '../src/truth/literal-matcher.js';
 import type { TombstonedLiteral } from '../src/truth/types.js';
 import type { ConversationMessage } from '../src/types.js';
 
@@ -84,5 +85,80 @@ describe('objection scan performance (STENO-T-13)', () => {
 
     expect(raised.map((o) => o.transcriptLine)).toEqual(['export const SETTING_499_VALUE = 1499;']);
     expect(elapsed).toBeLessThan(150);
+  });
+});
+
+// STENO-REV-02: every dead-value occurrence that didn't assert its literal
+// looked for its line again, back to the line's start and on to its end, so
+// a long single-line text cost occurrences × line length (1 MiB of '30 '
+// took over two minutes, synchronously on the server's only thread).
+describe('matching cost on long single-line texts (STENO-REV-02)', () => {
+  const time = (fn: () => unknown): number => {
+    const started = performance.now();
+    fn();
+    return performance.now() - started;
+  };
+
+  it('stays linear when the dead value is everywhere on one line, never next to its subject', () => {
+    const matcher = new LiteralMatcher([{ key: 0, literal: { subject: 'LOG_BUDGET', dead: '30', current: '100' } }]);
+    const text = '30 '.repeat(Math.floor((1 << 20) / 3));
+    matcher.match('30 '.repeat(1000));
+    let hits: unknown[] = [];
+    const elapsed = time(() => (hits = matcher.match(text)));
+    expect(hits).toEqual([]);
+    expect(elapsed).toBeLessThan(3000);
+  });
+
+  it('stays linear for negated mentions of a subject-less literal on one line', () => {
+    const matcher = new LiteralMatcher([{ key: 0, literal: { dead: 'legacyRateLimiter' } }]);
+    const text = 'do not use legacyRateLimiter, '.repeat(Math.floor((1 << 20) / 30));
+    let hits: unknown[] = [];
+    const elapsed = time(() => (hits = matcher.match(text)));
+    expect(hits).toEqual([]);
+    expect(elapsed).toBeLessThan(3000);
+  });
+
+  it('still quotes the right line when occurrences span many lines', () => {
+    const matcher = new LiteralMatcher([{ key: 0, literal: { subject: 'LOG_BUDGET', dead: '30', current: '100' } }]);
+    const text = ['30 30 30', 'x = 30', 'LOG_BUDGET = 30', 'y = 30 30'].join('\n');
+    expect(matcher.match(text, { allLines: true }).map((h) => h.line)).toEqual(['LOG_BUDGET = 30']);
+  });
+
+  it('lets the live scan stop at its budget (fail open), keeping what it already found', () => {
+    const db = new Database(':memory:');
+    const ledger = new TruthLedger(db);
+    ledger.assertTombstone(
+      {
+        claim: 'LOG_BUDGET 30 is dead',
+        evidence: [{ kind: 'commit', ref: 'c1' }],
+        signedBy: 'johnnyclem',
+        literals: [{ subject: 'LOG_BUDGET', dead: '30', current: '100' }],
+      },
+      { author: 'johnnyclem' }
+    );
+    ledger.assertTombstone(
+      {
+        claim: 'legacyRateLimiter is gone',
+        evidence: [{ kind: 'commit', ref: 'c2' }],
+        signedBy: 'johnnyclem',
+        literals: [{ dead: 'legacyRateLimiter' }],
+      },
+      { author: 'johnnyclem' }
+    );
+    const log = new ObjectionLog(db, ledger);
+    const msg: ConversationMessage = {
+      id: 'huge',
+      role: 'assistant',
+      content: 'Setting LOG_BUDGET = 30 now.',
+      timestamp: '2026-09-18T10:00:00Z',
+      toolCalls: [
+        { name: 'Write', input: { file_path: 'big.txt', content: `${'30 '.repeat(20_000)}\nuse(legacyRateLimiter);` } },
+      ],
+    };
+    // The clock passes the deadline once the prose has been read
+    let reads = 0;
+    const now = () => (reads++ < 2 ? 0 : 10_000);
+    const raised = log.scan(msg, 's1', 'shadow', { budgetMs: 1_000, now });
+    expect(raised.map((o) => o.transcriptLine)).toEqual(['Setting LOG_BUDGET = 30 now.']);
   });
 });
