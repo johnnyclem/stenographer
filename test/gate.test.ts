@@ -300,11 +300,41 @@ describe('gate: wiki source', () => {
     expect(objections()).toEqual([]);
   });
 
-  it('leaves out edited lines and unsigned TBs (fail closed)', () => {
+  // F10: the wiki source never checked the chain and took v1 lines as truth,
+  // so deleting or editing a TRANSITION brought an overridden TB back, and an
+  // unhashed v1 TB written by anyone was enforced.
+  it('refuses a file whose chain is broken or that holds an edited line: --on-error decides', () => {
     const lines = readFileSync(wiki, 'utf8').split('\n').filter(Boolean);
-    const last = JSON.parse(lines[lines.length - 1]);
-    const edited = JSON.stringify({ ...last, claim: 'edited after signing' });
-    expect(wikiMatchableTombstones([...lines.slice(0, -1), edited])).toMatchObject({ tombstones: [], skipped: 1 });
+    const override = lines.findIndex((l) => JSON.parse(l).type === 'TRANSITION' && JSON.parse(l).status === 'overridden');
+    expect(override).toBeGreaterThan(0);
+    const deleted = [...lines.slice(0, override), ...lines.slice(override + 1)];
+    expect(() => wikiMatchableTombstones(deleted)).toThrow(/line \d+: chain broken/);
+    const edited = [...lines];
+    edited[override] = JSON.stringify({ ...JSON.parse(lines[override]), status: 'active' });
+    expect(() => wikiMatchableTombstones(edited)).toThrow(/line \d+: .*hash/);
+
+    const broken = join(dir, 'broken.jsonl');
+    writeFileSync(broken, deleted.join('\n') + '\n');
+    const write = { ...fixture('write'), tool_input: { file_path: 'a.ts', content: 'export const LOG_BUDGET = 30;' } };
+    const result = evaluateGate(write, options({ wikiPath: broken }));
+    expect(result.decision).toBe('deny');
+    expect(result.error).toMatch(/chain broken/);
+    expect(evaluateGate(write, options({ wikiPath: broken, onError: 'allow' })).decision).toBe('allow');
+  });
+
+  it('leaves out v1 TBs (unhashed, so unverifiable) and unsigned TBs', () => {
+    const v1 = JSON.stringify({
+      id: '01V1TB0000000000000000000A',
+      type: 'TB',
+      ts: '2026-01-01T00:00:00Z',
+      author: 'mallory',
+      claim: 'fetchV2 is dead',
+      evidence: [{ kind: 'commit', ref: 'abc' }],
+      signedBy: 'mallory',
+      literals: [{ dead: 'fetchV2' }],
+      status: 'active',
+    });
+    expect(wikiMatchableTombstones([v1])).toMatchObject({ tombstones: [], skipped: 1 });
   });
 });
 

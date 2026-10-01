@@ -52,7 +52,7 @@ import { canonicalize, sha256Hex } from './jcs.js';
 import { assertingFields } from './asserting.js';
 import { MatchDeadlineError } from './literal-matcher.js';
 import { compileTombstones, findGateRuling, ObjectionLog, type GateCall, type Objection } from './objections.js';
-import { decodeWikiLine } from './wiki.js';
+import { checkWikiChain, decodeWikiLine, type DecodedWikiLine } from './wiki.js';
 import { MAX_WIKI_FILE_BYTES } from './wiki-file.js';
 import { TombstonedLiteralSchema, type TbEntry, type TombstonedLiteral } from './types.js';
 import { assertSchemaSupported } from '../store/migrations.js';
@@ -181,8 +181,12 @@ const ACTIVE = new Set(['active', 'contested']);
  * truth format v2: a line's current status is that of the highest-seq
  * TRANSITION targeting it, else its own; only active and contested TBs
  * count, and only signed ones (an unsigned line is a proposal, not truth).
- * Unreadable or edited lines, unknown statuses and unmatchable literals are
- * left out (fail closed).
+ * A file with an unreadable or edited line, or a broken chain, is refused
+ * (thrown, so the gate's --on-error decides): a missing or edited
+ * TRANSITION would otherwise bring an overridden TB back. A v1 TB carries
+ * no hash, so it is unverifiable and left out, as import files it as a
+ * proposal; so are unknown statuses and unmatchable literals (fail closed).
+ * Line numbers count `lines` as given, blank ones included.
  */
 export function wikiMatchableTombstones(
   lines: string[],
@@ -193,18 +197,24 @@ export function wikiMatchableTombstones(
   const uvs: Array<{ id: string; contests: unknown; status: unknown }> = [];
   const latest = new Map<string, { seq: number; status: unknown }>();
 
-  for (const text of lines) {
+  const read: Array<{ lineNo: number; decoded: DecodedWikiLine }> = [];
+  lines.forEach((text, i) => {
     checkDeadline();
-    if (!text.trim()) continue;
-    let decoded;
+    if (!text.trim()) return;
     try {
-      decoded = decodeWikiLine(text);
-    } catch {
-      skipped++;
-      continue;
+      read.push({ lineNo: i + 1, decoded: decodeWikiLine(text) });
+    } catch (err) {
+      throw new Error(`wiki line ${i + 1}: ${err instanceof Error ? err.message : String(err)}`);
     }
+  });
+  const [broken] = checkWikiChain(read.map((r) => r.decoded));
+  if (broken) throw new Error(`wiki line ${read[broken.index].lineNo}: ${broken.error}`);
+
+  for (const { decoded } of read) {
+    checkDeadline();
     const line = decoded.line;
-    if (decoded.type === 'TB') tbs.push({ line });
+    if (decoded.type === 'TB' && decoded.version !== 2) skipped++;
+    else if (decoded.type === 'TB') tbs.push({ line });
     else if (decoded.type === 'UV') uvs.push({ id: String(line.id), contests: line.contests, status: line.status });
     else if (decoded.type === 'TRANSITION' && decoded.seq !== null) {
       const target = String(line.target);
