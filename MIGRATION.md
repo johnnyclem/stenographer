@@ -87,3 +87,40 @@ Evidence of kind `command` is recorded as `claimed-command`. It no longer self-s
 - `body.status` on returned entries is derived. Stored bodies no longer contain it, so a raw `SELECT body` won't show it.
 - A dismissed proposal is closed by a `RULING` with `body.kind === 'dismissal'` and a `dismisses` link. Code that lists rulings may want to skip that kind. `dismissProposal` takes an optional fourth `ctx` argument (timestamp, provenance, session).
 - New union members: `TruthEntryType` includes `'MARKER'`, `LinkType` includes `'dismisses'`, `RulingKind` includes `'dismissal'`, and `EvidenceSchema`'s `kind` includes `'claimed-command'`. Exhaustive `switch`es over these need a new case.
+
+## Team wiki: truth format v2
+
+### Wiki tools
+
+`export_wiki_entries` and `import_wiki_entries` (operator profile) take `file`, a `.jsonl` name inside the wiki directory, instead of `path`:
+
+```json
+{ "name": "export_wiki_entries", "arguments": { "file": "johnny.jsonl" } }
+{ "name": "import_wiki_entries", "arguments": { "file": "sam.jsonl" } }
+```
+
+The wiki directory is `wiki/` next to the state file. Pass `--wiki-dir <dir>` to use another, such as a git-backed team wiki checkout. Files outside it can't be named, and a symlink that points outside it is refused, so put the files themselves there.
+
+### One writer per file
+
+Each person's stenographer exports to a file of its own (for example `wiki/<handle>.jsonl`) and imports the others'. Export appends only what its file lacks, and refuses a file holding lines it didn't write, so a shared `truth.jsonl` that several people exported into won't take a 1.0 export: start a file per person. Tools that author truth outside stenographer (the Swift messenger) go through stenographer's API or MCP tools, not the file.
+
+`since` exports still work but are deprecated: pass `sinceSeq` with the `lastSeq` of your previous export.
+
+### Upgrading a team from 0.x files
+
+1.0 still reads v1 lines, but they carry no hash, so a v1 TB is filed as a reconciliation proposal for a person to sign rather than landing as truth. v1 UVs land as before. To move to v2, each member upgrades and exports into a new file. Once everyone's v2 file is in the wiki, the v1 file can be retired.
+
+If you use a signer registry, list your teammates in it: with one, a TB from the wiki lands as truth only when its author and signer are listed, and an override or strike applies only when a listed person filed it. Without one, any accountable name is accepted, as on live operator paths, and the hash chain shows a file is unchanged, not who wrote it.
+
+### Reading the import result
+
+`import_wiki_entries` runs a file in one transaction. Check `committed`: when it's `false`, nothing was written and `errors` lists each bad line (`{line, id, error}`). `proposals` lists lines filed for a person to sign or dismiss (with a `reason`), `held` lists status changes not applied (with a reason; a later import retries them), and `derived` counts TRANSITION lines, which stenographer checks against their causes rather than applies. Re-importing a file is a no-op.
+
+### Library users
+
+- `exportWikiEntries(ledger, {sinceSeq?, since?})` returns `{lines, count, lastSeq, skipped}` and touches no file; write with `appendWikiFile({dir, file, statePath}, lines)`. `importWikiEntries(ledger, {lines}, {signers?, embeddings?})` takes lines; read them with `readWikiFile({dir, file})`. Neither accepts `path` any more.
+- `entryToWikiLine`, `wikiLineToEntry`, `WikiEntryLine` and `TruthLedger.getExportableEntries` are gone. To read lines, use `decodeWikiLine` and `checkWikiChain`. `TruthLedger.importEntry` takes `(entry, links, opts)`, and `importChange` imports addenda and rulings.
+- Consumers of the format (short-hand, smallchat, smallchat-swift): follow `spec/truth-format/README.md`, and run `spec/truth-format/fixtures/` in your tests. A line's current status is its latest TRANSITION's, else the entry line's own `status`; unknown statuses fail closed.
+- Proposal files: write the v2 PROPOSAL envelope (`kind: "tb"|"uv"`, `signal.source: "compaction-candidate"|"agent"|"detector:<name>"`, chained with `seq`, `prevHash`, `hash`). The bare short-hand dialect and `shorthand-compaction` are still read.
+

@@ -74,7 +74,8 @@ npx stenographer start ./conversation.jsonl --embeddings hashed
 | `--profile` | `agent` \| `operator` | `agent` | Which MCP tools are served. `agent`: read tools plus drafting (`propose_tombstone`, `assert_uv`, a `resolve_uv` that can't mint TBs). `operator`: the judicial and destructive tools, for a notary UI or CLI a person drives — never an agent. See [Notarization, identity and the threat model](#notarization-identity-and-the-threat-model) |
 | `--agent-identity` | identity | `agent:<MCP client name>` | Who agent-profile writes are attributed to. Tool arguments can't override it |
 | `--allow-agent-assert` | — | off | Single-user opt-out: the agent profile also serves `assert_tombstone`, signed by the agent identity (never a person's name). Off, every agent-authored TB is notarized by a person |
-| `--signer-registry` | path | — | JSON allowlist of signers and roles; operator paths (MCP operator profile, REST notary routes, `stenographer notarize`) accept only listed identities in a role that may act |
+| `--signer-registry` | path | — | JSON allowlist of signers and roles; operator paths (MCP operator profile, REST notary routes, `stenographer notarize`) accept only listed identities in a role that may act, and wiki import takes TBs and overrides only from listed signers |
+| `--wiki-dir` | directory | `wiki/` next to the state file | Where `export_wiki_entries` and `import_wiki_entries` read and write. Files are named relative to it; absolute paths, `..`, symlinks out of it, non-`.jsonl` names and the state file are refused (see [Team wiki](#team-wiki-the-truth-format)) |
 | `--rest-host` | hostname/IP | `127.0.0.1` | Interface for the REST API to bind to. The API has no authentication, so it stays loopback-only unless you explicitly opt into wider exposure (e.g. `0.0.0.0` behind a trusted network boundary) |
 | `--skip-verify` | — | off | Serve even if the truth ledger fails its integrity check. By default `start` runs the same check as `stenographer verify` and refuses to serve a ledger that fails it (see [Ledger integrity](#ledger-integrity)) |
 
@@ -120,10 +121,10 @@ Which tools a server serves depends on its `--profile`. Every tool's arguments a
 | `override_tombstone` | operator | The force path: override a TB with a proven addendum |
 | `file_ruling` | operator | Strike, promotion, or contempt ruling with a written opinion; any other `kind` is rejected |
 | `rule_on_objection` | operator | Sustain or overrule an objection with a written opinion — files a `RULING` |
-| `export_wiki_entries` / `import_wiki_entries` | operator | Lossless team llm-wiki JSONL interop |
+| `export_wiki_entries` / `import_wiki_entries` | operator | Team llm-wiki interop in [truth format v2](./spec/truth-format/README.md): export appends this ledger's hash-chained stream (state changes included) to its own file in `--wiki-dir`; import takes a teammate's file in one transaction |
 | `backfill_legacy_tombstones` | operator | Phase-1 migration of pre-assertion supersessions |
 
-Tools carry MCP annotations: read tools are `readOnlyHint`, and the ones that close, flip or strike records (`sign_proposal`, `dismiss_proposal`, `override_tombstone`, `file_ruling`, operator `resolve_uv`, `export_wiki_entries`) are `destructiveHint`.
+Tools carry MCP annotations: read tools are `readOnlyHint`, and the ones that close, flip or strike records (`sign_proposal`, `dismiss_proposal`, `override_tombstone`, `file_ruling`, operator `resolve_uv`) are `destructiveHint`. Wiki export and import are append-only and `idempotentHint`: repeating one changes nothing.
 
 ## REST API (daemon mode or `--rest-port`)
 
@@ -174,7 +175,7 @@ Matching uses embedding similarity (`supersedeThreshold`, default 0.45, calibrat
 
 The tombstone pipeline is split into **detection** (automatic, proposal-only) and **assertion** (accountable, signed). Machines detect; authors assert — no inferred write ever lands as truth.
 
-Five record types live in one append-only, hash-chained ledger (`truth_entries`, mirrored to wiki JSONL):
+Five record types live in one append-only, hash-chained ledger (`truth_entries`, exported to wiki JSONL):
 
 - **`TB`** — asserted tombstone: a prior statement is provably stale/wrong. Requires evidence and a signer.
 - **`UV`** — unverified assertion ("there be dragons"): believed true, stated before verification exists, with a machine-actionable `verifyBy` hint.
@@ -198,7 +199,7 @@ The ledger also writes `MARKER` entries about itself; today the only one is `cha
 
 Downstream consumers get the confidence type in every result, with the consumption rules embedded in the tool descriptions: active TB = ground truth; contested TB = truth with a visible asterisk; open UV = **flag, don't block**; refuted/overridden = history, never citable.
 
-**Proposal intake** (`importProposalDrafts`): external tools — today [short-hand](https://github.com/johnnyclem/short-hand)'s compactor, which exports its L4 candidate invariants and detected corrections as draft JSONL — can file candidates into the ledger. Every line lands as a `PROPOSAL` under a detector identity (`detector:short-hand`); there is no external write path to TB or UV, the detector cannot sign its own intake, and `targetRef` dedupe makes re-imports idempotent. This is the Option B seam from the TB/UV v2 handoff (§13 Q6): format-level interop, no code dependency in either direction. Both dialects of the line are accepted: short-hand's bare `{kind, draft, signal: {source: "compaction-candidate"}}` and the `PROPOSAL` envelope smallchat's vendored compactor (and smallchat-swift) writes — `{type: "PROPOSAL", id, ts, author, agentSessionId, …, signal: {source: "shorthand-compaction"}}`. The envelope's own id and author are kept under `meta.intake` for traceability; authorship stays with the detector identity.
+**Proposal intake** (`importProposalDrafts`): external tools — today [short-hand](https://github.com/johnnyclem/short-hand)'s compactor, which exports its L4 candidate invariants and detected corrections as draft JSONL — can file candidates into the ledger. Every line lands as a `PROPOSAL` under a detector identity (`detector:short-hand`); there is no external write path to TB or UV, the detector cannot sign its own intake, and `targetRef` dedupe makes re-imports idempotent. This is the Option B seam from the TB/UV v2 handoff (§13 Q6): format-level interop, no code dependency in either direction. Lines are the suite's PROPOSAL envelope from [truth format v2](./spec/truth-format/README.md#the-proposal-envelope) — `{schemaVersion: 2, seq, type: "PROPOSAL", id, ts, author, kind: "tb"|"uv", draft, targetRef, signal: {source: "compaction-candidate"|"agent"|"detector:<name>"}, prevHash, hash}`, hash-chained like a wiki file and filed once per id, whatever became of it. The older dialects are still read: short-hand's bare `{kind, draft, signal: {source: "compaction-candidate"}}`, and the unversioned envelope with `signal.source: "shorthand-compaction"`. The envelope's own id, author, source and hash are kept under `meta.intake` for traceability; authorship stays with the detector identity.
 
 ### Notarization, identity and the threat model
 
@@ -255,6 +256,17 @@ What the chain shows, and what it doesn't:
 - **Not signatures.** A hash chain shows *that* the ledger changed, not *who* wrote an entry. Key-based signing is planned for 1.x.
 
 A pre-1.0 ledger is chained the first time a 1.0 stenographer opens it. Its rows are chained as they are, in insertion order, and a `MARKER` entry (`chained-at-migration`, author `migration`) closes the run: for those entries the chain attests to "unchanged since the migration", not "since written". Statuses are then re-derived from links; the marker lists any the 0.x bookkeeping had wrong (such as a TB that refuting a second contest had set back to active after it was overridden, STENO-T-06).
+
+### Team wiki: the truth format
+
+Teams share truth through JSONL files in a wiki directory (`--wiki-dir`), in [truth format v2](./spec/truth-format/README.md). short-hand, smallchat and smallchat-swift read the same format and run its golden fixtures. The spec is normative; in short:
+
+- **One writer per file.** `export_wiki_entries({file: "<you>.jsonl"})` appends this ledger's line stream to a file of its own: the TBs and UVs, the addenda and rulings that change a status, and a `TRANSITION` line for every status change (contested, overridden, verified, refuted, struck). It appends only what the file lacks. It never truncates or rewrites a line, and it refuses a file that holds anyone else's lines. Teammates import each other's files.
+- **Hash-chained.** Every line has `seq`, `prevHash` and `hash` (SHA-256 over the line's JCS form). Import refuses an edited line, a gap, or two writers' lines in one file. That shows the lines are unchanged and complete up to the last line read. It doesn't show who wrote them; key signatures are planned for 1.x.
+- **Status is a fold.** A reader's current status for an entry is the status of the latest `TRANSITION` for it, else the entry line's own. An unknown or missing status is not current truth: readers fail closed.
+- **Import is all-or-nothing, and validated like a live write.** `import_wiki_entries({file})` runs a file in one transaction. Every line goes through the same admission check as a live write: anonymous identities, evidence-less TBs and malformed lines are errors, the import writes nothing, and the result lists each bad line. A TB lands as truth only when it's signed and verifiable: a hash-chained v2 line, signed by someone `--signer-registry` lists if you use one. Anything else (unsigned, a 0.x v1 line, an unlisted signer, an unknown status or value, a line that contradicts a local entry) becomes a reconciliation `PROPOSAL` a person must notarize. Overrides and strikes apply only from a person the registry lists. Imported entries are embedded, so `search_truth` ranks them. Re-importing a file changes nothing: no duplicate TBs, and no proposal raised twice.
+
+0.x wiki files (v1: a `status` field, no hash) are still read. See the spec's upgrade notes.
 
 ### Real-time objections
 

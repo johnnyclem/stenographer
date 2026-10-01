@@ -1,0 +1,642 @@
+/**
+ * The truth format v2 contract (spec/truth-format).
+ *
+ * The golden fixtures are built here, from a real ledger with the clock and
+ * the random source pinned, and must equal the committed files byte for
+ * byte: the fixtures are what this codec writes. To regenerate them after
+ * a deliberate format change:
+ *
+ *   UPDATE_TRUTH_FORMAT_FIXTURES=1 npx vitest run test/truth-format.test.ts
+ *
+ * Every fixture is then checked against the JSON Schema and the live codec,
+ * folded, and imported. short-hand, smallchat and smallchat-swift run the
+ * same files.
+ */
+import { describe, it, expect, vi } from 'vitest';
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { dirname, join, relative } from 'node:path';
+import Database from 'better-sqlite3';
+import { Ajv2020 } from 'ajv/dist/2020.js';
+import addFormatsModule from 'ajv-formats';
+import { TruthLedger } from '../src/truth/ledger.js';
+import { SignerRegistry } from '../src/truth/identity.js';
+import { importProposalDrafts } from '../src/truth/intake.js';
+import { canonicalize } from '../src/truth/jcs.js';
+import { decodeWikiLine, exportWikiEntries, importWikiEntries, wikiLineHash, WIKI_STATUSES } from '../src/truth/wiki.js';
+import type { ProposalEntry, TbEntry } from '../src/truth/types.js';
+
+const SPEC = join(import.meta.dirname, '..', 'spec', 'truth-format');
+const FIXTURES = join(SPEC, 'fixtures');
+const read = (path: string) => readFileSync(join(SPEC, path), 'utf8');
+const lines = (path: string) => read(path).split('\n').filter((l) => l.length > 0);
+const expected = <T>(path: string): T => JSON.parse(read(path));
+
+// ─────────────────────────────────────────────────────────────
+// Building the fixtures
+// ─────────────────────────────────────────────────────────────
+
+const T = (minute: number) => `2026-09-01T10:${String(minute).padStart(2, '0')}:00.000Z`;
+const json = (value: unknown) => JSON.stringify(value, null, 2) + '\n';
+const jsonl = (items: unknown[]) => items.map((l) => (typeof l === 'string' ? l : JSON.stringify(l)) + '\n').join('');
+const parse = (text: string) => JSON.parse(text) as Record<string, any>;
+const rehash = (line: Record<string, unknown>) => ({ ...line, hash: wikiLineHash(line) });
+
+const SIGNERS = {
+  signers: [
+    { id: 'johnnyclem', role: 'human' },
+    { id: 'sam', role: 'human' },
+    { id: 'alex', role: 'human' },
+    { id: 'kim', role: 'human' },
+    { id: 'lee', role: 'human' },
+    { id: 'agent:*', role: 'agent' },
+  ],
+};
+
+/** Runs `fn` with Date.now() and Math.random() pinned, so ULIDs come out the same every time. */
+function pinned<R>(fn: () => R): R {
+  let clock = Date.parse('2026-09-01T10:00:00.000Z');
+  let seed = 0x5eed;
+  const now = vi.spyOn(Date, 'now').mockImplementation(() => clock++);
+  const random = vi.spyOn(Math, 'random').mockImplementation(() => {
+    // mulberry32
+    seed = (seed + 0x6d2b79f5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  });
+  try {
+    return fn();
+  } finally {
+    now.mockRestore();
+    random.mockRestore();
+  }
+}
+
+/** Chains hand-written lines into one stream (seq from `from`), as a writer would. */
+function stream(bodies: Array<Record<string, unknown>>, from = 1, prev: string | null = null): string[] {
+  const out: string[] = [];
+  bodies.forEach((body, i) => {
+    const unhashed = { schemaVersion: 2, seq: from + i, ...body, prevHash: prev };
+    const hash = wikiLineHash(unhashed);
+    out.push(JSON.stringify({ ...unhashed, hash }));
+    prev = hash;
+  });
+  return out;
+}
+
+/** The fold every reader applies: the highest-seq TRANSITION's status, else the entry line's own. */
+function fold(stream: string[]): Record<string, { type: string; status: string | null; current: boolean }> {
+  const out: Record<string, { type: string; status: string | null; current: boolean }> = {};
+  const sorted = stream.map(parse).sort((a, b) => a.seq - b.seq);
+  for (const line of sorted) {
+    if (line.type === 'TB' || line.type === 'UV') out[line.id] = { type: line.type, status: line.status ?? null, current: false };
+  }
+  for (const line of sorted) {
+    if (line.type === 'TRANSITION' && out[line.target]) out[line.target].status = line.status;
+  }
+  for (const entry of Object.values(out)) {
+    entry.current = entry.type === 'TB' ? ['active', 'contested'].includes(entry.status!) : entry.status === 'open';
+  }
+  return out;
+}
+
+function buildFixtures(): Map<string, string> {
+  const files = new Map<string, string>();
+  files.set('signers.json', json(SIGNERS));
+
+  // valid/ledger.jsonl: one ledger's story, every kind of wiki line
+  const ledger = new TruthLedger(new Database(':memory:'));
+  const budget = ledger.assertTombstone(
+    {
+      claim: 'LOG_BUDGET is 100; the old value 30 is dead.',
+      evidence: [
+        { kind: 'commit', ref: '9f2c1ab' },
+        { kind: 'command', ref: 'grep LOG_BUDGET config.ts', detail: 'LOG_BUDGET = 100' },
+      ],
+      signedBy: 'johnnyclem',
+      literals: [{ subject: 'LOG_BUDGET', dead: '30', current: '100' }, { dead: 'legacyRateLimiter' }],
+    },
+    { author: 'johnnyclem', timestamp: T(0) }
+  );
+  ledger.assertUv(
+    {
+      assertion: 'Retries are idempotent across regions.',
+      basis: 'the design doc says so',
+      verifyBy: { kind: 'inspect', value: 'src/retry.ts', detail: 'a region-scoped idempotency key' },
+    },
+    { author: 'sam', timestamp: T(1) }
+  );
+  const hotfix = ledger.assertUv(
+    {
+      assertion: 'LOG_BUDGET went back to 30 in the hotfix.',
+      basis: 'the hotfix notes',
+      verifyBy: { kind: 'command', value: 'grep LOG_BUDGET config.ts' },
+      contests: budget.id,
+    },
+    { author: 'alex', timestamp: T(2) }
+  );
+  // One addendum verifies the contest and overrides the TB; the successor supersedes it
+  // (the promotion ruling stays in the ledger: it changes no status)
+  ledger.resolveUv(hotfix.id, 'verified', [{ kind: 'file', ref: 'config.ts:3', detail: 'LOG_BUDGET = 30' }], {
+    author: 'kim',
+    signedBy: 'kim',
+    opinion: 'config.ts says 30 again',
+    timestamp: T(3),
+  });
+  const cron = ledger.assertTombstone(
+    { claim: 'The cron box is decommissioned.', evidence: [{ kind: 'commit', ref: 'c0ffee1' }], signedBy: 'lee' },
+    { author: 'lee', timestamp: T(4) }
+  );
+  ledger.fileRuling(
+    { kind: 'strike', opinion: 'the cited commit is on an abandoned branch', target: cron.id },
+    { author: 'johnnyclem', timestamp: T(5) }
+  );
+  const region = ledger.assertUv(
+    { assertion: 'The staging cluster runs in us-east-1.', basis: 'an old runbook', verifyBy: { kind: 'ask', value: 'ops' } },
+    { author: 'agent:claude-code', agentSessionId: 'sess_7f3a', provenance: { kind: 'sourceMessageId', ref: 'msg_0042' }, timestamp: T(6) }
+  );
+  ledger.resolveUv(region.id, 'refuted', [{ kind: 'file', ref: 'infra/staging.tf:12', detail: 'region = "eu-west-1"' }], {
+    author: 'kim',
+    timestamp: T(7),
+  });
+  // An agent's draft a person notarized: its signs link names a proposal that doesn't travel
+  const draft = ledger.draftTombstone(
+    {
+      claim: 'fetchV1 is superseded by fetchV2.',
+      evidence: [{ kind: 'commit', ref: 'b4d1dea' }],
+      literals: [{ dead: 'fetchV1', current: 'fetchV2' }],
+      targetRef: 'api:fetch',
+    },
+    { author: 'agent:claude-code', agentSessionId: 'sess_7f3a', provenance: { kind: 'sourceMessageId', ref: 'msg_0057' }, timestamp: T(8) }
+  );
+  ledger.signProposal(draft.id, 'johnnyclem', undefined, { notarized: true, timestamp: T(9) });
+
+  const story = exportWikiEntries(ledger);
+  expect(story.skipped).toEqual([]);
+  files.set('valid/ledger.jsonl', jsonl(story.lines));
+  files.set('valid/ledger.expected.json', json(fold(story.lines)));
+  const at = (type: string, n = 0) => story.lines.map(parse).filter((l) => l.type === type)[n];
+  const tbLine = at('TB');
+  const contestLine = story.lines.map(parse).find((l) => l.type === 'UV' && l.contests)!;
+  const strikeLine = at('RULING');
+  const transitionLine = at('TRANSITION');
+
+  // valid/proposals.jsonl: the suite PROPOSAL envelope
+  const proposals = stream([
+    {
+      id: '01J9PROPTB0000000000000000',
+      type: 'PROPOSAL',
+      ts: T(20),
+      author: 'detector:short-hand',
+      kind: 'tb',
+      draft: {
+        claim: 'MAX_RETRIES 3 is dead; it is 5.',
+        evidence: [{ kind: 'message', ref: 'msg_0101', detail: 'user correction' }],
+        literals: [{ subject: 'MAX_RETRIES', dead: '3', current: '5' }],
+      },
+      targetRef: 'shorthand:tombstone:msg_0101',
+      signal: { source: 'compaction-candidate', detail: 'short-hand correction' },
+    },
+    {
+      id: '01J9PROPUV0000000000000000',
+      type: 'PROPOSAL',
+      ts: T(21),
+      author: 'agent:claude-code',
+      kind: 'uv',
+      draft: { assertion: 'The cache is shared across tenants.', basis: 'a trace', verifyBy: { kind: 'inspect', value: 'src/cache.ts' }, contests: null },
+      targetRef: null,
+      signal: { source: 'agent' },
+      agentSessionId: 'sess_7f3a',
+    },
+    {
+      id: '01J9PROPUV0000000000000001',
+      type: 'PROPOSAL',
+      ts: T(22),
+      author: 'detector:supersession',
+      kind: 'uv',
+      draft: { assertion: 'Deploys go through the canary.', basis: 'a decision in msg_0120', verifyBy: { kind: 'ask', value: 'ops' }, contests: null },
+      targetRef: 'decision_17',
+      signal: { source: 'detector:supersession', score: 0.71 },
+    },
+  ]);
+  files.set('valid/proposals.jsonl', jsonl(proposals));
+  files.set(
+    'valid/proposals.expected.json',
+    json(proposals.map((l, i) => ({ line: i + 1, outcome: 'filed', kind: parse(l).kind === 'tb' ? 'tombstone' : 'uv' })))
+  );
+
+  // valid/unknown.jsonl: what a newer writer may send; readers keep it and fail closed
+  const unknown = stream([
+    { ...pick(tbLine, ['type', 'ts', 'author', 'claim', 'evidence', 'signedBy']), id: '01J9UNKNOWNTB00000000000001', status: 'active', reviewers: ['sam'] },
+    { ...pick(tbLine, ['type', 'ts', 'author', 'claim', 'evidence', 'signedBy']), id: '01J9UNKNOWNTB00000000000002', status: 'retracted' },
+    { ...pick(tbLine, ['type', 'ts', 'author', 'claim', 'signedBy']), id: '01J9UNKNOWNTB00000000000003', evidence: [{ kind: 'url', ref: 'https://example.com/changelog' }], status: 'active' },
+    {
+      id: '01J9UNKNOWNUV00000000000001',
+      type: 'UV',
+      ts: T(30),
+      author: 'sam',
+      assertion: 'The p99 latency regressed last week.',
+      basis: 'a dashboard',
+      verifyBy: { kind: 'query', value: 'latency_p99[7d]' },
+      contests: null,
+      status: 'open',
+    },
+    {
+      id: '01J9UNKNOWNTR00000000000001',
+      type: 'TRANSITION',
+      ts: T(31),
+      author: 'johnnyclem',
+      target: '01J9UNKNOWNTB00000000000001',
+      status: 'archived',
+      cause: { kind: 'archive', ref: null },
+    },
+  ]);
+  files.set('valid/unknown.jsonl', jsonl(unknown));
+  files.set(
+    'valid/unknown.expected.json',
+    json({
+      fold: fold(unknown),
+      import: [
+        { line: 1, outcome: 'inserted', note: 'an unknown field is ignored (and preserved by readers that re-serialize)' },
+        { line: 2, outcome: 'proposal', reason: 'unknown-status' },
+        { line: 3, outcome: 'proposal', reason: 'unknown-value', note: "evidence kind 'url'" },
+        { line: 4, outcome: 'proposal', reason: 'unknown-value', note: "verifyBy kind 'query'" },
+        { line: 5, outcome: 'held', note: "status 'archived' is not one stenographer 1.0 knows; readers fold it and fail closed" },
+      ],
+    })
+  );
+
+  // valid/routing.jsonl: valid lines stenographer doesn't simply take as truth (each imported alone)
+  const other = new TruthLedger(new Database(':memory:'));
+  other.backfillLegacyTombstone({ id: 'tombstone_17', superseded: 'use redis', correctedTo: 'use memcached', reason: 'Superseded by newer decision', timestamp: T(40) });
+  const mallorys = other.assertTombstone({ claim: 'The batch box is gone.', evidence: [{ kind: 'commit', ref: 'deadbee' }], signedBy: 'mallory' }, { author: 'mallory', timestamp: T(41) });
+  other.overrideTombstone(mallorys.id, { evidence: [{ kind: 'commit', ref: 'f00d123' }] }, { author: 'mallory', timestamp: T(42) });
+  importWikiEntries(other, {
+    lines: [
+      JSON.stringify({
+        id: '01J9V1REFUTED0000000000000',
+        type: 'UV',
+        ts: T(43),
+        author: 'sam',
+        assertion: 'The batch jobs still call fetchV1.',
+        basis: 'an old trace',
+        verifyBy: { kind: 'observe', value: 'fetchV1 calls in the batch logs' },
+        contests: null,
+        status: 'refuted',
+      }),
+    ],
+  });
+  const otherStream = exportWikiEntries(other).lines.map(parse);
+  const kimRefutes = ledger.getChainedRecords().find((r) => r.type === 'ADDENDUM' && r.links.some((l) => l.type === 'refutes'))!;
+  const routing: Array<[unknown, Record<string, unknown>]> = [
+    [otherStream.find((l) => l.author === 'migration'), { outcome: 'proposal', reason: 'unsigned', note: "a backfilled TB: author 'migration', no signer" }],
+    [otherStream.find((l) => l.type === 'TB' && l.author === 'mallory'), { outcome: 'proposal', reason: 'unverifiable', note: 'a signer signers.json does not list' }],
+    [otherStream.find((l) => l.type === 'ADDENDUM'), { outcome: 'held', note: 'an override by someone signers.json does not list' }],
+    [otherStream.find((l) => l.type === 'UV'), { outcome: 'inserted', status: 'refuted', note: 'a terminal status on the entry line is kept' }],
+    [story.lines.map(parse).find((l) => l.id === kimRefutes.id), { outcome: 'held', note: 'a refutation of a UV this ledger does not hold' }],
+  ];
+  files.set('valid/routing.jsonl', jsonl(routing.map(([line]) => line)));
+  files.set('valid/routing.expected.json', json(routing.map(([, want], i) => ({ line: i + 1, ...want }))));
+
+  // v1/legacy.jsonl: 0.x lines, still read
+  const legacy: Array<[unknown, Record<string, unknown>]> = [
+    [
+      {
+        id: '01J9V1TB000000000000000000',
+        type: 'TB',
+        ts: '2026-03-01T09:01:00.000Z',
+        author: 'johnnyclem',
+        claim: 'The API is REST-only; the gRPC port was removed.',
+        evidence: [{ kind: 'commit', ref: '9f2c1ab' }],
+        signedBy: 'johnnyclem',
+        status: 'active',
+        'x-steno': { origin: 'local', provenance: { kind: 'manual' }, agentSessionId: null, links: [] },
+      },
+      { outcome: 'proposal', reason: 'unverifiable', note: 'a v1 TB carries no hash: it is filed for a person to sign' },
+    ],
+    [
+      {
+        id: '01J9V1TBCMD000000000000000',
+        type: 'TB',
+        ts: '2026-03-01T09:02:00.000Z',
+        author: 'kim',
+        claim: 'The retry budget is per tenant.',
+        evidence: [{ kind: 'command', ref: 'grep -n tenant src/retry.ts', detail: 'retry.ts:12 tenantKey' }],
+        signedBy: 'kim',
+        status: 'active',
+      },
+      { outcome: 'proposal', reason: 'unverifiable', draftEvidenceKinds: ['claimed-command'], note: "v1 'command' evidence is read as claimed-command" },
+    ],
+    [
+      { id: '01J9V1UV000000000000000000', type: 'UV', ts: '2026-03-01T09:03:00.000Z', author: 'sam', assertion: 'The cron box has a stale hosts file.', basis: 'deploys skip it', verifyBy: { kind: 'ask', value: 'ops' }, contests: null, status: 'open' },
+      { outcome: 'inserted', status: 'open' },
+    ],
+    [
+      { id: '01J9V1UVREF000000000000000', type: 'UV', ts: '2026-03-01T09:04:00.000Z', author: 'alex', assertion: 'Staging runs in us-east-1.', basis: 'an old runbook', verifyBy: { kind: 'ask', value: 'ops' }, contests: null, status: 'refuted' },
+      { outcome: 'inserted', status: 'refuted', note: 'a terminal v1 status is kept' },
+    ],
+  ];
+  files.set('v1/legacy.jsonl', jsonl(legacy.map(([line]) => line)));
+  files.set('v1/legacy.expected.json', json(legacy.map(([, want], i) => ({ line: i + 1, ...want }))));
+
+  // invalid/schema.jsonl: refused by the schema and the codec (each re-hashed, so only the defect fails)
+  const { evidence: _e, ...noEvidence } = tbLine;
+  const { cause: _c, ...noCause } = transitionLine;
+  const schemaInvalid: Array<[Record<string, unknown>, string]> = [
+    [rehash(noEvidence), 'a TB without evidence'],
+    [rehash({ ...tbLine, evidence: [] }), 'a TB with an empty evidence list'],
+    [rehash({ ...tbLine, literals: [{ dead: '30' }] }), 'a bare literal with no subject'],
+    [rehash({ ...tbLine, literals: [{ subject: 'LOG_BUDGET', dead: ' 30' }] }), 'a literal with surrounding whitespace'],
+    [rehash({ ...tbLine, seq: 0 }), 'seq below 1'],
+    [rehash({ ...tbLine, seq: '1' }), 'seq as a string'],
+    [rehash({ ...tbLine, prevHash: transitionLine.hash }), 'a first line (seq 1) with a prevHash'],
+    [rehash({ ...strikeLine, prevHash: null }), 'a later line without a prevHash'],
+    [(({ hash: _h, ...rest }) => rest)(tbLine), 'a line without a hash'],
+    [{ ...tbLine, hash: tbLine.hash.toUpperCase() }, 'a hash in uppercase hex'],
+    [rehash({ ...tbLine, schemaVersion: 3 }), 'an unknown schemaVersion'],
+    [rehash({ ...tbLine, ts: 'yesterday' }), 'a timestamp that is not RFC 3339'],
+    [rehash({ ...tbLine, type: 'MARKER' }), 'a line type the format does not define'],
+    [rehash({ ...strikeLine, opinion: '   ' }), 'a ruling with a blank opinion'],
+    [rehash(noCause), 'a TRANSITION without a cause'],
+    [rehash({ ...contestLine, 'x-steno': { ...contestLine['x-steno'], links: [...contestLine['x-steno'].links, ...contestLine['x-steno'].links] } }), 'a link listed twice'],
+  ];
+  files.set('invalid/schema.jsonl', jsonl(schemaInvalid.map(([line]) => line)));
+  files.set('invalid/schema.expected.json', json(schemaInvalid.map(([, reason], i) => ({ line: i + 1, reason }))));
+
+  // invalid/codec.jsonl: valid against the schema, refused by the codec
+  const codecInvalid: Array<[Record<string, unknown>, string, string]> = [
+    [{ ...tbLine, claim: 'LOG_BUDGET is 30.' }, 'a line edited after it was written', 'hash mismatch'],
+    [rehash({ ...contestLine, author: 'system' }), 'an anonymous author', 'anonymous'],
+    [rehash({ ...tbLine, signedBy: 'Assistant' }), 'an anonymous signer (identities compare case-folded)', 'anonymous'],
+    [rehash({ ...contestLine, author: 'detector:wiki-sync' }), 'a reserved author', 'reserved'],
+    [rehash({ ...tbLine, signedBy: 'kim', author: 'migration' }), "'migration' authoring a signed TB", 'reserved'],
+    [rehash({ ...contestLine, 'x-steno': { ...contestLine['x-steno'], links: [] } }), 'a contesting UV without its contests link', 'contests link'],
+    [
+      rehash({ ...tbLine, 'x-steno': { ...tbLine['x-steno'], links: [{ fromId: tbLine.id, toId: contestLine.id, type: 'overrides' }] } }),
+      'a TB carrying a link only an addendum writes',
+      'cannot carry the link',
+    ],
+    [
+      rehash({ ...strikeLine, 'x-steno': { ...strikeLine['x-steno'], links: [{ fromId: tbLine.id, toId: strikeLine.target, type: 'strikes' }] } }),
+      'a ruling listing a link it did not write',
+      'only the links it writes',
+    ],
+    [rehash({ ...parse(proposals[1]), author: 'system' }), 'a proposal with an anonymous author', 'anonymous'],
+  ];
+  files.set('invalid/codec.jsonl', jsonl(codecInvalid.map(([line]) => line)));
+  files.set('invalid/codec.expected.json', json(codecInvalid.map(([, reason, error], i) => ({ line: i + 1, reason, error }))));
+
+  // invalid/chain-*.jsonl: valid lines that don't form one stream
+  const third = parse(story.lines[2]);
+  files.set('invalid/chain-gap.jsonl', jsonl([story.lines[0], story.lines[1], story.lines[3]]));
+  files.set('invalid/chain-fork.jsonl', jsonl([story.lines[0], story.lines[1], rehash({ ...third, prevHash: transitionLine.hash })]));
+  files.set(
+    'invalid/chain.expected.json',
+    json({
+      'chain-gap.jsonl': [{ line: 3, reason: 'a line is missing', error: 'chain broken: seq' }],
+      'chain-fork.jsonl': [{ line: 3, reason: 'a line from another stream', error: 'chain broken: prevHash' }],
+    })
+  );
+  return files;
+}
+
+function pick(line: Record<string, unknown>, keys: string[]): Record<string, unknown> {
+  return Object.fromEntries(keys.map((k) => [k, line[k]]));
+}
+
+// ─────────────────────────────────────────────────────────────
+// Checking them
+// ─────────────────────────────────────────────────────────────
+
+// ajv-formats is CommonJS: its default export arrives wrapped under ESM interop
+const addFormats = ((addFormatsModule as unknown as { default?: unknown }).default ?? addFormatsModule) as (ajv: Ajv2020) => void;
+const ajv = new Ajv2020({ allErrors: true, strict: true, strictRequired: false });
+addFormats(ajv);
+const schema = JSON.parse(read('wiki-line.v2.schema.json'));
+const validate = ajv.compile(schema);
+const schemaValid = (line: string) => validate(JSON.parse(line)) as boolean;
+const signers = () => SignerRegistry.load(join(FIXTURES, 'signers.json'));
+const fresh = () => new TruthLedger(new Database(':memory:'));
+
+describe('golden fixtures', () => {
+  it('are what this codec writes, byte for byte', () => {
+    const built = pinned(buildFixtures);
+    const update = process.env.UPDATE_TRUTH_FORMAT_FIXTURES === '1';
+    for (const [path, content] of built) {
+      const file = join(FIXTURES, path);
+      if (update) {
+        mkdirSync(dirname(file), { recursive: true });
+        writeFileSync(file, content);
+      }
+      expect(existsSync(file) ? readFileSync(file, 'utf8') : null, `${path} (UPDATE_TRUTH_FORMAT_FIXTURES=1 rewrites it)`).toBe(content);
+    }
+    const walk = (dir: string): string[] =>
+      readdirSync(dir, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? walk(join(dir, e.name)) : [relative(FIXTURES, join(dir, e.name))]));
+    expect(walk(FIXTURES).sort(), 'no stale fixture files').toEqual([...built.keys()].sort());
+  });
+});
+
+describe('valid/ledger.jsonl: one ledger, every kind of wiki line', () => {
+  const fixture = () => lines('fixtures/valid/ledger.jsonl');
+
+  it('every line passes the schema and the codec, and the lines form one chain', () => {
+    const all = fixture();
+    for (const [i, line] of all.entries()) {
+      expect(schemaValid(line), `line ${i + 1}: ${ajv.errorsText(validate.errors)}`).toBe(true);
+      expect(decodeWikiLine(line)).toMatchObject({ version: 2, seq: i + 1 });
+      expect(parse(line).hash).toBe(wikiLineHash(line));
+      expect(parse(line).prevHash).toBe(i === 0 ? null : parse(all[i - 1]).hash);
+    }
+  });
+
+  it('covers every transition the wiki carries, contests, literals and the x-steno fields', () => {
+    const parsed = fixture().map(parse);
+    expect(new Set(parsed.map((l) => l.type))).toEqual(new Set(['TB', 'UV', 'ADDENDUM', 'RULING', 'TRANSITION']));
+    const causes = parsed.filter((l) => l.type === 'TRANSITION').map((l) => `${l.cause.kind}:${l.status}`);
+    expect(new Set(causes)).toEqual(new Set(['contest:contested', 'verify:verified', 'override:overridden', 'strike:struck', 'refute:refuted']));
+    expect(parsed.some((l) => l.literals?.some((x: { subject?: string }) => x.subject))).toBe(true);
+    expect(parsed.some((l) => l.evidence?.some((e: { kind: string }) => e.kind === 'claimed-command'))).toBe(true);
+    expect(parsed.some((l) => l['x-steno']?.agentSessionId)).toBe(true);
+    expect(parsed.some((l) => l['x-steno']?.links?.some((k: { type: string }) => k.type === 'supersedes'))).toBe(true);
+    expect(parsed.some((l) => l['x-steno']?.links?.some((k: { type: string }) => k.type === 'signs'))).toBe(true);
+  });
+
+  it('folds, by the readers\' rule, to the expected statuses', () => {
+    expect(fold(fixture())).toEqual(expected('fixtures/valid/ledger.expected.json'));
+  });
+
+  it('imports in one transaction, and stenographer derives the same statuses from the causes', () => {
+    const ledger = fresh();
+    const all = fixture();
+    const transitions = all.filter((l) => parse(l).type === 'TRANSITION').length;
+    const result = importWikiEntries(ledger, { lines: all }, { signers: signers() });
+    expect(result).toMatchObject({ committed: true, inserted: all.length - transitions, derived: transitions, proposals: [], held: [], errors: [] });
+    for (const [id, want] of Object.entries(expected<Record<string, { status: string; current: boolean }>>('fixtures/valid/ledger.expected.json'))) {
+      const entry = ledger.getEntry(id)!;
+      const current = ledger.getTruth('current').some((e) => e.id === id);
+      expect(current, id).toBe(want.current);
+      if (want.status !== 'struck') expect((entry.body as { status: string }).status, id).toBe(want.status);
+    }
+    expect(ledger.verify().ok).toBe(true);
+    // Exported again by the importer: the same lines but for what the writer adds
+    const strip = (l: string) => {
+      const { prevHash: _p, hash: _h, 'x-steno': x, ...rest } = parse(l);
+      return x ? { ...rest, 'x-steno': { ...x, origin: undefined, ledgerHash: undefined } } : rest;
+    };
+    expect(exportWikiEntries(ledger).lines.map(strip)).toEqual(all.map(strip));
+    expect(importWikiEntries(ledger, { lines: all }, { signers: signers() })).toMatchObject({ inserted: 0, unchanged: all.length - transitions });
+  });
+
+  it('literals travel: an imported TB objects to the same dead values', () => {
+    const ledger = fresh();
+    importWikiEntries(ledger, { lines: fixture() }, { signers: signers() });
+    const literals = ledger.getMatchableTombstones().flatMap((t: TbEntry) => t.body.literals ?? []);
+    expect(literals.map((l) => l.dead)).toContain('fetchV1');
+    // The overridden TB's literals no longer object
+    expect(literals.map((l) => l.dead)).not.toContain('legacyRateLimiter');
+  });
+});
+
+describe('valid/proposals.jsonl: the suite PROPOSAL envelope', () => {
+  it('passes the schema and the codec, and the intake files every line', () => {
+    const fixture = lines('fixtures/valid/proposals.jsonl');
+    for (const line of fixture) {
+      expect(schemaValid(line), ajv.errorsText(validate.errors)).toBe(true);
+      expect(decodeWikiLine(line)).toMatchObject({ version: 2, type: 'PROPOSAL' });
+    }
+    const ledger = fresh();
+    const result = importProposalDrafts(ledger, { lines: fixture });
+    expect(result.errors).toEqual([]);
+    const want = expected<Array<{ line: number; kind: string }>>('fixtures/valid/proposals.expected.json');
+    expect(result.filed.map((p: ProposalEntry) => p.body.kind)).toEqual(want.map((w) => w.kind));
+    expect(importProposalDrafts(ledger, { lines: fixture })).toMatchObject({ filed: [], deduped: fixture.length });
+    // A wiki import refuses them: proposals never travel in a wiki stream
+    expect(importWikiEntries(fresh(), { lines: fixture }).committed).toBe(false);
+  });
+});
+
+describe('valid/unknown.jsonl: what a newer writer may send', () => {
+  const fixture = () => lines('fixtures/valid/unknown.jsonl');
+  const want = () =>
+    expected<{ fold: Record<string, unknown>; import: Array<{ line: number; outcome: string; reason?: string }> }>('fixtures/valid/unknown.expected.json');
+
+  it('passes the schema and the codec, and folds with unknown statuses failing closed', () => {
+    for (const line of fixture()) {
+      expect(schemaValid(line), ajv.errorsText(validate.errors)).toBe(true);
+      expect(() => decodeWikiLine(line)).not.toThrow();
+    }
+    expect(fold(fixture())).toEqual(want().fold);
+  });
+
+  it('stenographer imports it without guessing: unknown values never become truth', () => {
+    const ledger = fresh();
+    const result = importWikiEntries(ledger, { lines: fixture() }, { signers: signers() });
+    expect(result.committed).toBe(true);
+    for (const w of want().import) {
+      const id = parse(fixture()[w.line - 1]).id;
+      if (w.outcome === 'inserted') expect(ledger.getEntry(id), `line ${w.line}`).not.toBeNull();
+      if (w.outcome === 'proposal') expect(result.proposals.find((p) => p.line === w.line), `line ${w.line}`).toMatchObject({ reason: w.reason });
+      if (w.outcome === 'held') expect(result.held.map((h) => h.line), `line ${w.line}`).toContain(w.line);
+    }
+  });
+});
+
+describe('valid/routing.jsonl: lines stenographer does not simply take as truth', () => {
+  it('pass the schema and the codec, and import (each on its own) as expected', () => {
+    const fixture = lines('fixtures/valid/routing.jsonl');
+    const want = expected<Array<{ line: number; outcome: string; reason?: string; status?: string }>>('fixtures/valid/routing.expected.json');
+    for (const w of want) {
+      const line = fixture[w.line - 1];
+      expect(schemaValid(line), `line ${w.line}: ${ajv.errorsText(validate.errors)}`).toBe(true);
+      const ledger = fresh();
+      const result = importWikiEntries(ledger, { lines: [line] }, { signers: signers() });
+      const id = parse(line).id;
+      expect(result.committed, `line ${w.line}`).toBe(true);
+      if (w.outcome === 'inserted') expect((ledger.getEntry(id)!.body as { status: string }).status).toBe(w.status);
+      if (w.outcome === 'proposal') expect(result.proposals, `line ${w.line}`).toMatchObject([{ reason: w.reason }]);
+      if (w.outcome === 'held') expect(result.held, `line ${w.line}`).toHaveLength(1);
+      if (w.outcome !== 'inserted') expect(ledger.getEntry(id)).toBeNull();
+    }
+  });
+});
+
+describe('v1/legacy.jsonl: 0.x lines are still read', () => {
+  it('decode as version 1 (the v2 schema does not take them) and import as expected', () => {
+    const fixture = lines('fixtures/v1/legacy.jsonl');
+    for (const line of fixture) {
+      expect(decodeWikiLine(line)).toMatchObject({ version: 1 });
+      expect(schemaValid(line)).toBe(false);
+    }
+    const ledger = fresh();
+    const result = importWikiEntries(ledger, { lines: fixture }, { signers: signers() });
+    expect(result.committed).toBe(true);
+    for (const w of expected<Array<{ line: number; outcome: string; reason?: string; status?: string; draftEvidenceKinds?: string[] }>>('fixtures/v1/legacy.expected.json')) {
+      const id = parse(fixture[w.line - 1]).id;
+      if (w.outcome === 'inserted') {
+        expect((ledger.getEntry(id)!.body as { status: string }).status).toBe(w.status);
+        continue;
+      }
+      const filed = result.proposals.find((p) => p.id === id)!;
+      expect(filed).toMatchObject({ reason: w.reason });
+      if (w.draftEvidenceKinds) {
+        const proposal = ledger.getEntry(filed.proposalId) as ProposalEntry;
+        expect((proposal.body.draft.evidence as Array<{ kind: string }>).map((e) => e.kind)).toEqual(w.draftEvidenceKinds);
+      }
+    }
+  });
+});
+
+describe('invalid fixtures', () => {
+  it('invalid/schema.jsonl: every line fails the schema and the codec', () => {
+    const fixture = lines('fixtures/invalid/schema.jsonl');
+    const want = expected<Array<{ line: number; reason: string }>>('fixtures/invalid/schema.expected.json');
+    expect(want).toHaveLength(fixture.length);
+    for (const [i, line] of fixture.entries()) {
+      expect(schemaValid(line), `line ${i + 1} (${want[i].reason})`).toBe(false);
+      expect(() => decodeWikiLine(line), `line ${i + 1} (${want[i].reason})`).toThrow();
+    }
+  });
+
+  it('invalid/codec.jsonl: every line passes the schema and fails the codec with the expected error', () => {
+    const fixture = lines('fixtures/invalid/codec.jsonl');
+    const want = expected<Array<{ line: number; reason: string; error: string }>>('fixtures/invalid/codec.expected.json');
+    expect(want).toHaveLength(fixture.length);
+    for (const [i, line] of fixture.entries()) {
+      expect(schemaValid(line), `line ${i + 1} (${want[i].reason}): ${ajv.errorsText(validate.errors)}`).toBe(true);
+      expect(() => decodeWikiLine(line), `line ${i + 1} (${want[i].reason})`).toThrow(new RegExp(want[i].error));
+    }
+  });
+
+  it('invalid/chain-*.jsonl: valid lines that are not one stream; the import writes nothing', () => {
+    for (const [file, want] of Object.entries(expected<Record<string, Array<{ line: number; error: string }>>>('fixtures/invalid/chain.expected.json'))) {
+      const fixture = lines(`fixtures/invalid/${file}`);
+      for (const line of fixture) expect(schemaValid(line), file).toBe(true);
+      const ledger = fresh();
+      const result = importWikiEntries(ledger, { lines: fixture });
+      expect(result.committed, file).toBe(false);
+      for (const w of want) {
+        expect(result.errors.some((e) => e.line === w.line && e.error.startsWith(w.error)), `${file} line ${w.line}`).toBe(true);
+      }
+      expect(ledger.getTruth('all')).toHaveLength(0);
+    }
+  });
+});
+
+describe('the spec document', () => {
+  it("states the worked example's canonical form and hash, which the codec recomputes", () => {
+    const readme = read('README.md');
+    const example = readme.match(/<!-- worked-example -->\s*```json\n([^\n]+)\n```/);
+    expect(example, 'README.md has a worked example').not.toBeNull();
+    const line = example![1];
+    expect(lines('fixtures/valid/ledger.jsonl')).toContain(line);
+    const { hash, ...rest } = parse(line);
+    expect(readme).toContain(canonicalize(rest));
+    expect(readme).toContain(hash);
+    expect(wikiLineHash(line)).toBe(hash);
+  });
+
+  it('lists the statuses the codec knows', () => {
+    const readme = read('README.md');
+    for (const status of [...WIKI_STATUSES.TB, ...WIKI_STATUSES.UV]) expect(readme).toContain(`\`${status}\``);
+  });
+});

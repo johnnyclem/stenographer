@@ -31,11 +31,11 @@ The verified > asserted ordering is the point of the ask, and it's computable to
 
 ## Computing the grade (client-side, ~20 lines)
 
-Pseudocode against the JSONL line shape (`WikiEntryLine` in `src/truth/wiki.ts`) or the exported types:
+Pseudocode against [truth format v2](../spec/truth-format/README.md) lines or the exported types. `status` is the entry's current status by the spec's fold: its latest `TRANSITION` line's status, else the entry line's own. An unknown status is excluded (fail closed):
 
 ```
 grade(entry):
-  if entry is struck, or status in {overridden, refuted}   -> excluded
+  if status in {struck, overridden, refuted}, or unknown    -> excluded
   if entry.type == UV:
     status == open      -> advisory
     status == verified  -> treat like verified TB (normally a TB was minted alongside; prefer that)
@@ -51,11 +51,11 @@ Notes on the edges:
 
 - Since 1.0, stenographer records command output a caller submits as `claimed-command`; `command` is reserved for checks stenographer ran itself, and 1.0 ships no runner. So a 1.0 ledger has no new `command` evidence, and `claimed-command` grades asserted by the rule above. Lines exported by 0.x may still carry `command` for output nobody re-ran.
 - A TB minted under a **promotion RULING** (human ruled non-command evidence sufficient) grades **asserted**: the gavel adds accountability, not reproducibility. Don't be tempted to bump it.
-- `x-steno.links` carries `contests`/`overrides`/`verifies` backrefs if you want to render *why* an entry has its status; you don't need links to compute the grade.
+- Each `TRANSITION` line names its `cause` (the contesting UV, the overriding addendum, the strike) if you want to render *why* an entry has its status; you don't need it to compute the grade.
 
 ## Integration shape
 
-**Compile time (recommended, lowest coupling).** Add a compile input — e.g. `--truth ./truth.jsonl` — produced by stenographer's `export_wiki_entries`. During table construction:
+**Compile time (recommended, lowest coupling).** Add a compile input — e.g. `--truth ./truth.jsonl` — produced by stenographer's `export_wiki_entries`. Check the file's hash chain and fold statuses as the spec says. During table construction:
 
 1. Match entries to tools. First pass: exact/substring match of tool selectors against entry text (`claim`/`assertion`) and entity values. Fallback: embedding similarity if smallchat already embeds selectors; skip otherwise — a missed match costs nothing, a wrong rewrite costs trust.
 2. Apply by grade: verified supersessions become selector forwards (the Obj-C deprecated-selector move: old selector stays in the table, dispatches to the successor, annotation says why and cites the entry id). Asserted/migration entries adjust ranking weights. Advisory UVs attach to the tool's metadata so the calling agent sees the dragon marker.
@@ -78,8 +78,8 @@ One flag, one behavior, one test: `--truth truth.jsonl` such that when the file 
 
 ## Pointers
 
-- `src/truth/wiki.ts` — `WikiEntryLine`, the JSONL shape to parse (`x-steno` is ignorable)
+- `spec/truth-format/` — the JSONL format (normative), its JSON Schema, and golden fixtures to run in your tests (`x-steno` is ignorable)
 - `src/truth/types.ts` — evidence kinds, statuses, link types; `CONSUMPTION_RULES` constant
-- `test/wiki-interop.test.ts` — the format's round-trip guarantees
+- `src/truth/wiki.ts` — the reference codec
 - MCP: `export_wiki_entries`, `get_truth`, `search_truth`, `assert_uv`, `list_proposals`
 - Weights (1.0 / 0.75 / 0.5 / ×0.8) are starting values, not gospel — tune against real dispatch outcomes, but keep the *ordering* fixed: verified > asserted > migration, contested below its base, open UV never a ranking input.
