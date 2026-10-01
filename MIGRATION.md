@@ -2,7 +2,7 @@
 
 ## Ingestion (checkpoints, deterministic ids)
 
-**State database.** Opening a pre-1.0 database migrates it in place (`PRAGMA user_version` 0 → 2). Existing rows are kept, and an `ingest_checkpoints` table is added. The database switches to WAL mode, so `-wal` and `-shm` files appear next to it. Copy all three when you move a live database, or stop stenographer first. A 0.x build can't open the database after 1.0 has migrated it.
+**State database.** Opening a pre-1.0 database migrates it in place (`PRAGMA user_version` 0 → 3). Existing rows are kept, and an `ingest_checkpoints` table is added. The database switches to WAL mode, so `-wal` and `-shm` files appear next to it. Copy all three when you move a live database, or stop stenographer first. A 0.x build can't open the database after 1.0 has migrated it.
 
 **First start on an existing database.** Pre-1.0 databases have no checkpoints, so 1.0 reads each log once from the top. For formats whose lines carry an id (`claude-code` uuids, `jsonl` ids), messages that are already indexed are recognized and skipped, and nothing is derived from them a second time. For id-less formats (`openai`, `anthropic`, `generic` lines without `id`), the message id scheme changed (32-bit FNV → 128-bit hash of path, offset and line). That first pass therefore adds each message again under its new id, next to the old row. To avoid the duplicates, index into a fresh state path and carry the signed truth over:
 
@@ -24,3 +24,29 @@ stenographer start ./log.jsonl ./new.db --mode catchup   # then call import_wiki
 - The `message` listener gets `(msg, position)`. Existing one-argument listeners keep working.
 - A custom `LogAdapter.parseLine(line, context?)` can use `context.source` and `context.offset` to derive stable ids.
 - Code that relied on `decision_<ms>_<random>` or `msg_<fnv>` id shapes must treat ids as opaque.
+
+## Extraction and retrieval
+
+**Embedder pinning.** The first 1.0 start on a pre-1.0 database records the embedder it runs with and prints a warning, because the database can't say which embedder wrote its vectors. If that run's `--embeddings` differs from what you used before (for example, the old build silently fell back to hashed on an offline machine), restart once with `--reembed`. After that, starting with a different `--embeddings` fails with `EmbedderMismatchError` instead of mixing vector spaces. To switch embedders on purpose, start with the new `--embeddings` and `--reembed`. Re-embedding covers messages and truth entries and costs about what embedding them cost when they were indexed.
+
+**Offline machines.** A start without `--embeddings` that can't download or load MiniLM now exits with an error instead of switching to hashed. Pass `--embeddings hashed` on machines that are always offline, or `--embeddings auto` to keep the old fallback (it now warns, and pins the database to hashed when it falls back).
+
+**Supersede threshold.** Under `--embeddings hashed` the default is now 0.75 (it was 0.45, which let unrelated decisions close each other). If you tuned `supersedeThreshold` for hashed, check it against `test/fixtures/supersession-pairs.json`. Decisions that were wrongly closed before stay closed: rebuild into a fresh state path (see above) to re-derive them.
+
+**What gets mined.** Decisions, corrections and entities are now extracted only from user and assistant prose. Re-indexing an old log yields fewer decisions (tool output, caveats and subagent prompts no longer count) and some different ones ("use X instead of Y" now records X). Existing rows are not rewritten: derived state changes only for lines indexed from now on, or after a rebuild into a fresh state path.
+
+**Message roles and tags.** Consumers of `get_recent_messages` or `GET /messages` see role `tool` (with `tags: ["tool_result"]`) for Claude Code and Anthropic tool-result turns that used to be `user`, and `tags` on harness, subagent and compaction records. Rows indexed before 1.0 keep their old role.
+
+**GraphRAG results.** `search_conversation` and `GET /graphrag` return only messages. Code that read `type: 'entity'` or `type: 'path'` results should read `meta.matchedEntities` and `meta.paths` on the message results instead; code that parsed the `Context:` block from `content` should read `meta.neighbors`. `score` is a reciprocal-rank-fusion score (small numbers, comparable only within one query); `meta.vectorScore` keeps the cosine.
+
+**Supersession proposals.** New proposals use `targetRef` `<superseded-id>-><successor-id>`. Open proposals written before 1.0 keep the bare decision id as `targetRef`; they still sign and dismiss as before.
+
+**Large `k`.** REST and MCP now clamp `k` to 200 instead of passing it through. Page with smaller queries if you relied on more.
+
+**Library users.**
+
+- Custom `Embedder` implementations need `identity` (`{kind, model, dimensions, version}`) and `supersedeThreshold`.
+- `createEmbedder(model)` throws when a transformer can't load; `createEmbedder('auto')` falls back to hashed.
+- `extractStructure(msg).corrections[].to` is the current statement (read `to`, not `from`).
+- `ConversationMessage` and `IndexedMessage` have optional `tags`; `IndexedMessage` has `seq`, `toolCalls` and `chunkEmbeddings`.
+- `GraphRAGRetriever.indexMessage(msg, embedding?, info?)` takes `{entityIds, importance, seq}` so entity evidence, recency and importance can be ranked. The retriever accepts a `vectorSearch` option to delegate its vector step.

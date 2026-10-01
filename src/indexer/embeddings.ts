@@ -332,8 +332,8 @@ export interface ChunkOptions {
 
 /**
  * Overlapping windows over a long text, broken at whitespace. MiniLM reads
- * about 256 tokens and silently drops the rest, so a long message embedded
- * whole is findable only by its opening lines; each window is embedded on
+ * a few hundred tokens and silently drops the rest, so a long message
+ * embedded whole is findable only by its opening lines; each window is embedded on
  * its own and a message scores as its best window.
  */
 export function chunkText(text: string, options: ChunkOptions = {}): string[] {

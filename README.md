@@ -20,11 +20,11 @@ Point it at a JSONL log, and it gives your agent stack a semantic memory: entiti
 
 ## Features
 
-- **GraphRAG Search** — hybrid vector similarity + entity-graph traversal, merged and re-ranked in one query
-- **Real Local Embeddings** — `all-MiniLM-L6-v2` via `@huggingface/transformers` (~25MB model, downloaded once, runs fully locally, no API keys). Offline hashed-lexical fallback when the model can't load, or opt in explicitly with `--embeddings hashed`
-- **Persistent Vector Index** — `sqlite-vec` KNN index in the same SQLite file as everything else (brute-force cosine fallback if the extension can't load)
-- **Importance Scoring** — a three-signal model (state delta, reference frequency, trajectory discontinuity) flags which messages matter, so retrieval and context-framing can prioritize signal over noise
-- **Decision Supersession (Tombstones)** — decisions are append-only; a newer decision or an "actually, …" correction closes the old record onto its successor, keeping full provenance
+- **GraphRAG Search** — messages ranked by reciprocal rank fusion of vector similarity, entity-graph evidence and recency, with an importance prior; the graph evidence comes back with each result
+- **Real Local Embeddings** — `all-MiniLM-L6-v2` via `@huggingface/transformers` (~25MB model, downloaded once, runs fully locally, no API keys), or the offline hashed-lexical embedder with `--embeddings hashed`. The state database is pinned to the embedder that wrote it (see [Offline mode](#offline-mode))
+- **Persistent Vector Index** — `sqlite-vec` KNN index (cosine, partitioned by session, long messages in overlapping windows) in the same SQLite file as everything else (brute-force cosine fallback if the extension can't load)
+- **Importance Scoring** — a three-signal model (state delta, reference frequency, trajectory discontinuity) scores each message; GraphRAG search uses it as a ranking prior and context frames use it to choose which recent messages get room
+- **Decision Supersession (Tombstones)** — decisions are append-only; a newer decision or an "actually, …" correction closes the old record onto its successor, keeping full provenance. Only what people and the assistant said is mined: tool output, harness records, subagent transcripts and compaction summaries are indexed and searchable, but never read as decisions
 - **Four Modes** — `live`, `catchup`, `watch` (a directory of session logs), `daemon` (live + REST API)
 - **Provider Adapters** — `jsonl`, `claude-code`, `anthropic`, `openai`, `generic`, auto-detected from the first lines written (a log created empty waits for its first line)
 - **Resumable Ingestion** — a per-log checkpoint commits with each message, so a restart picks up where the last run stopped instead of re-reading the log (see [Restarts and log rotation](#restarts-and-log-rotation))
@@ -65,7 +65,9 @@ npx stenographer start ./conversation.jsonl --embeddings hashed
 |------|--------|---------|-------------|
 | `-m, --mode` | `live` \| `catchup` \| `watch` \| `daemon` | `live` | `live`: tail a file and serve MCP. `catchup`: index a completed file, then serve. `watch`: watch a directory for `*.jsonl` session logs. `daemon`: live + REST API |
 | `-a, --adapter` | `jsonl` \| `claude-code` \| `anthropic` \| `openai` \| `generic` | auto-detect | Log format adapter |
-| `-e, --embeddings` | model name \| `hashed` | `Xenova/all-MiniLM-L6-v2` | Transformer model, or the offline lexical embedder (see [Offline mode](#offline-mode)) |
+| `-e, --embeddings` | model name \| `hashed` \| `auto` | `Xenova/all-MiniLM-L6-v2` | Transformer model (fails to start if it can't load), the offline lexical embedder, or `auto`: the embedder the state database is pinned to, else the default model with a loud fallback to hashed (see [Offline mode](#offline-mode)) |
+| `--reembed` | — | off | Re-embed every stored message and truth entry under the chosen embedder before starting. Needed to switch a state database to another embedder |
+| `--supersede-threshold` | number in (0, 1] | per embedder: MiniLM `0.45`, hashed `0.75` | Cosine similarity at which a new decision supersedes an active one (see [Decision Supersession](#decision-supersession)) |
 | `--rest-port` | port number | `8787` in daemon mode, off otherwise | Serve the REST API on this port |
 | `--objections` | `off` \| `shadow` \| `deliver` | `shadow` | Real-time objections to tombstoned literals (see [Real-time objections](#real-time-objections)) |
 | `--objection-channel` | URL (repeatable) | — | smallchat channel bridge to push each objection to as it's raised. Secret from `SMALLCHAT_CHANNEL_SECRET` |
@@ -87,7 +89,9 @@ The tailer holds back a partially written line until its newline arrives (`catch
 
 ### Offline mode
 
-By default, Stenographer downloads a ~25MB embedding model on first run and does everything else locally after that — no ongoing network calls, no API keys, ever. If you need to skip even that one-time download, pass `--embeddings hashed` to use an offline hashed-lexical embedder instead; the same fallback kicks in automatically if the transformer model fails to load.
+By default, Stenographer downloads a ~25MB embedding model on first run and does everything else locally after that — no ongoing network calls, no API keys, ever. If you need to skip even that one-time download, pass `--embeddings hashed` to use an offline hashed-lexical embedder instead. Hashed search is lexical (shared words and spellings), not semantic.
+
+Vectors from two embedders aren't comparable, so the state database records the embedder that wrote it (model, width, version) and refuses to open under a different one, naming both. To switch, restart with the new `--embeddings` and `--reembed`, which recomputes every stored message and truth-entry vector. A model that fails to load is an error, not a silent switch to hashed. If you want the fallback, `--embeddings auto` opts in: it uses the embedder the database is already pinned to, or tries the default model and falls back to hashed with a warning on stderr (the database is then pinned to hashed). `get_status` and `GET /status` report the embedder in use.
 
 ## MCP Tools
 
@@ -100,9 +104,9 @@ By default, Stenographer downloads a ~25MB embedding model on first run and does
 | `get_decision_history` | Full decision history including superseded versions |
 | `get_decision_chain` | Walk one supersession chain, oldest → current |
 | `get_corrections` | Get all corrections/tombstones |
-| **`search_conversation`** | **GraphRAG hybrid semantic search** |
-| `search_similar` | Pure vector search over the persistent index |
-| `get_context_frame` | Build token-budgeted context |
+| **`search_conversation`** | **GraphRAG hybrid search: fused vector, entity-graph and recency ranks** (`k` ≤ 200) |
+| `search_similar` | Pure vector search over the persistent index (`k` ≤ 200) |
+| `get_context_frame` | Entities, active decisions and recent messages within a token budget |
 | `get_status` | Statistics, vector backend, mode |
 
 ### Truth-layer tools (TB/UV v2)
@@ -146,7 +150,7 @@ There's no authentication on these routes, so the server binds to `127.0.0.1` by
 
 ## Importance Scoring
 
-Every indexed message gets a three-signal importance score, used to prioritize what surfaces in search results and context frames:
+Every indexed message gets a three-signal importance score (stored with it). GraphRAG search adds it as a small prior to the fused rank, enough to lift a decision or correction over an equally relevant remark but not over a more relevant message, and the context frame gives room to the most important of the recent messages after the newest one. Pure vector search (`search_similar`) doesn't use it.
 
 | Signal | Weight | What it captures |
 |--------|--------|-------------------|
@@ -169,7 +173,9 @@ produces:
 - decision B (sqlite): active, `sourceMessageId: m3`
 - a tombstone: what was superseded, what corrected it, why, and the triggering message
 
-Matching uses embedding similarity (`supersedeThreshold`, default 0.45, calibrated for MiniLM: rewrites of the same decision score ~0.46–0.94, unrelated decisions ~0.06). `get_decision_chain` walks any chain oldest → current.
+Matching uses embedding similarity at a threshold calibrated per embedder on [`test/fixtures/supersession-pairs.json`](./test/fixtures/supersession-pairs.json): MiniLM `0.45` (rewrites of one decision score 0.57–0.94, unrelated decisions 0.04–0.44) and hashed `0.75` (rewrites 0.84–0.93, unrelated 0.04–0.56). Other transformer models get 0.45 until you calibrate them with `--supersede-threshold`. Of two matching versions, the one with the later timestamp closes the other, whichever was indexed first. In `watch` mode, matching spans every session in the state database (each conversation is its own log); other modes match within the log's session. `get_decision_chain` walks any chain oldest → current.
+
+What gets mined is a heuristic (Tier 0 patterns), applied sentence by sentence to user and assistant prose only, without code blocks, quoted lines or harness blocks. Each sentence yields at most one decision or correction. "Use X instead of Y", "X rather than Y", "X, not Y" and "not X but Y" record X as current and Y as what it replaces; first-person tool narration ("I'll use the Read tool to …") and questions are skipped. Claude Code tool results become role `tool` (tagged `tool_result`), and `isMeta`, slash-command, `isSidechain` and `isCompactSummary` records are tagged `meta`, `sidechain` and `compact_summary`. All of them stay searchable. Precision and recall are measured in CI on a labeled corpus ([`test/fixtures/extraction-corpus.json`](./test/fixtures/extraction-corpus.json), floors 0.95 and 0.90). It's a small development set, not a benchmark.
 
 ## Asserted Truth Layer (TB/UV v2)
 
@@ -239,13 +245,16 @@ Delivery state is durable: a partial batch survives a restart, failed deliveries
 
 ## GraphRAG Search
 
-The `search_conversation` tool performs **hybrid retrieval**:
+The `search_conversation` tool ranks **messages** with hybrid retrieval:
 
-1. **Vector Search** — Semantic similarity on message embeddings
-2. **Entity Extraction** — Find relevant entities from query
-3. **Graph Traversal** — Expand to related entities (configurable depth)
-4. **Merge & Re-rank** — Weighted combination of vector + graph scores
-5. **Context Enrichment** — Add neighboring messages as context
+1. **Vector search**: cosine similarity over the persistent index (a long message scores as its best window), over-fetched into a candidate pool
+2. **Entity evidence**: entities the query names (whole words), expanded through the co-mention graph (`graph_depth`, default 2); messages that mention them join the pool
+3. **Reciprocal rank fusion** (K = 60) of the vector ranking, the entity ranking and a quarter-weight recency ranking, plus a small importance prior
+4. **Evidence in `meta`**: `vectorScore`, `matchedEntities`, `paths`, `importance`, and `neighbors` (the adjacent messages in the same session)
+
+Entities and paths are evidence on messages, not results of their own. Each message is embedded with its tool calls (name and arguments), so "which file did we edit" can find the edit.
+
+The context frame (`get_context_frame`, `GET /context-frame`) keeps every section within the budget (estimated at 4 characters per token). Recent messages get 50%, decisions 35% and entities 15%, and whatever a section leaves unused goes to the others. The newest message always gets room first.
 
 ## Architecture
 
@@ -263,7 +272,7 @@ The `search_conversation` tool performs **hybrid retrieval**:
 │                  Core Engine (StenographerAPI)               │
 │  Importance Detector → Structure Extraction → Embedder      │
 │  Decision supersession (tombstones, provenance chains)      │
-│  GraphRAG retriever (entity graph + in-memory vectors)      │
+│  GraphRAG retriever (entity graph; vectors via sqlite-vec)  │
 └─────────────────────────┬───────────────────────────────────┘
                           ▼
 ┌─────────────────────────────────────────────────────────────┐
@@ -293,7 +302,7 @@ npm test        # vitest
 npm run lint    # tsc --noEmit
 ```
 
-Tests live in [`test/`](./test), covering the core engine, GraphRAG retriever, embeddings, importance scoring, provider adapters, the tailer, the SQLite store, and the REST API.
+Tests live in [`test/`](./test), covering the core engine, GraphRAG retriever, embeddings, importance scoring, extraction precision on a labeled corpus, provider adapters, the tailer, the SQLite store, the REST API, and an indexing-time bound. Two tests need the MiniLM weights on disk and are skipped otherwise; set `STENOGRAPHER_TEST_MODEL_CACHE` to a transformers.js cache directory to run them.
 
 ## Contributing
 
