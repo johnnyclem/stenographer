@@ -19,6 +19,7 @@
 ## Runtime, package and CLI
 
 - **Node.js 22 or newer** (`engines.node` is `>=22`). Node 20 reached end of life in April 2026. CI runs Node 22 and 24.
+- **SQLite driver: `better-sqlite3` 13.** It ships prebuilt binaries for Linux (glibc and musl), macOS and Windows on x64 and arm64, and installs without a compiler or a download. On any other platform, build it from source after installing: `npm run build-release` in `node_modules/better-sqlite3`, with a C++ toolchain. Library users who pass their own handle to `new TruthLedger(db)` or `new ObjectionLog(db, ledger)` open it with `better-sqlite3` 13 (and type it with `@types/better-sqlite3` 9). State files need nothing.
 - **Run the scoped package.** Use `npx -y @stenographer/core <command>`, or `stenographer <command>` once `@stenographer/core` is installed. `npx stenographer` is a different npm package.
 - **`stenographer init` is removed.** It printed a hint and set nothing up. Start with `stenographer start <log-path> [state-path]`; for the pre-dispatch gate, add the hook from the README's "Pre-dispatch gate".
 

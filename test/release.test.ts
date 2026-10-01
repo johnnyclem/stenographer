@@ -83,6 +83,41 @@ describe('release metadata', () => {
     expect(ci.indexOf('appa-install.sh')).toBeLessThan(ci.indexOf('npm run test:openappa'));
   });
 
+  // better-sqlite3 11 on Node 24: vitest's fork workers abort at teardown,
+  // "Assertion failed: (env) != nullptr" from Statement::~Statement() in
+  // node::RemoveEnvironmentCleanupHook. 13.0.3 (Node-API, prebuilt) fixes it.
+  it('locks a SQLite driver that runs on every CI Node major', () => {
+    const lock = JSON.parse(read('package-lock.json')) as {
+      packages: Record<string, { version?: string; engines?: { node?: string } }>;
+    };
+    const driver = lock.packages['node_modules/better-sqlite3'];
+    const [major, minor, patch] = (driver?.version ?? '0.0.0').split('.').map(Number);
+    expect(major * 1e6 + minor * 1e3 + patch, `better-sqlite3 ${driver?.version}`).toBeGreaterThanOrEqual(13_000_003);
+    expect(driver.engines?.node).toBe(pkg.engines.node);
+  });
+
+  // npm 11 (Node 24) `npm ci` refuses a lockfile that leaves out another
+  // platform's optional packages; npm 10 installs from it without them, so a
+  // Mac got no sqlite-vec binary and fell back to the slow vector path.
+  it('the lockfile lists every optional platform package, so npm ci works on npm 10 and 11', () => {
+    const { packages } = JSON.parse(read('package-lock.json')) as {
+      packages: Record<string, { optionalDependencies?: Record<string, string> }>;
+    };
+    // npm resolves a dependency in the nearest node_modules up the tree
+    const resolves = (from: string, name: string) => {
+      for (let dir = from; ; dir = dir.replace(/\/?node_modules\/(@[^/]+\/)?[^/]+$/, '')) {
+        if (packages[`${dir ? `${dir}/` : ''}node_modules/${name}`]) return true;
+        if (!dir) return false;
+      }
+    };
+    const missing = Object.entries(packages).flatMap(([path, entry]) =>
+      Object.keys(entry.optionalDependencies ?? {})
+        .filter((name) => !resolves(path, name))
+        .map((name) => `${path || '(root)'} -> ${name}`)
+    );
+    expect(missing).toEqual([]);
+  });
+
   it('the README badges and requirements match package.json', () => {
     const readme = read('README.md');
     // shields.io escapes a dash in a badge value as --
