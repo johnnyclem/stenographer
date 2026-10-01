@@ -187,4 +187,26 @@ describe('embedder pinning (IDX-24)', () => {
     const pinned = await createEmbedder('auto', { pinned: new HashedEmbedder().identity });
     expect(pinned).toBeInstanceOf(HashedEmbedder);
   });
+
+  it('adopts a database from before pinning, with a warning', async () => {
+    const { log, statePath } = setup();
+    const seed = new StateStore(statePath);
+    seed.addMessage({
+      id: 'old',
+      sessionId: 's',
+      role: 'user',
+      content: 'we decided to use postgres',
+      timestamp: '2026-06-09T09:00:00Z',
+      embedding: await new HashedEmbedder().embed('we decided to use postgres'),
+      importanceScore: { total: 0, stateDelta: 0, referenceFrequency: 0, trajectoryDiscontinuity: 0 },
+      entityIds: [],
+    });
+    seed.close();
+
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+    engine = new Stenographer(config(log, statePath));
+    await engine.start();
+    expect(errors.mock.calls.flat().join('\n')).toMatch(/predates embedder pinning.*--reembed/s);
+    expect(engine.store.getMeta('embedder')).toEqual(new HashedEmbedder().identity);
+  });
 });

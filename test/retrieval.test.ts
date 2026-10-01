@@ -2,6 +2,8 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import Database from 'better-sqlite3';
+import * as sqliteVec from 'sqlite-vec';
 import { Stenographer } from '../src/core/stenographer.js';
 import { StateStore } from '../src/store/index.js';
 import { HashedEmbedder, type Embedder } from '../src/indexer/embeddings.js';
@@ -203,5 +205,44 @@ describe('retrieval', () => {
     const results = await e.searchGraphRAG({ query: 'redis cache settings', k: 2 });
     expect(results[0].id).toBe('m2');
     expect(results[0].meta.importance).toBeGreaterThan(results[1].meta.importance);
+  });
+
+  it('a pre-1.0 vector index is rebuilt from the stored embeddings, and old rows keep their order', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'steno-retrieval-'));
+    const path = join(dir, 'state.db');
+    const h = new HashedEmbedder();
+    const legacy = new Database(path);
+    sqliteVec.load(legacy);
+    legacy.exec(`
+      CREATE TABLE messages (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, role TEXT NOT NULL,
+        content TEXT NOT NULL, timestamp TEXT NOT NULL, embedding BLOB,
+        importance_state_delta REAL, importance_reference_freq REAL,
+        importance_trajectory_disc REAL, entity_ids TEXT);
+      CREATE VIRTUAL TABLE message_vectors USING vec0(message_id TEXT PRIMARY KEY, embedding float[384]);
+    `);
+    const rows: Array<[string, string, string]> = [
+      ['z-first', 'A', 'we run postgres for orders'],
+      ['a-second', 'B', 'we run postgres for billing'],
+      ['m-third', 'B', 'lunch is at noon'],
+    ];
+    for (const [id, session, content] of rows) {
+      const blob = Buffer.from(new Float32Array(await h.embed(content)).buffer);
+      // Same timestamp for all: only insertion order tells them apart
+      legacy
+        .prepare('INSERT INTO messages (id, session_id, role, content, timestamp, embedding, entity_ids) VALUES (?, ?, ?, ?, ?, ?, ?)')
+        .run(id, session, 'user', content, '2026-01-01T00:00:00Z', blob, '[]');
+      legacy.prepare('INSERT INTO message_vectors (message_id, embedding) VALUES (?, ?)').run(id, blob);
+    }
+    legacy.close();
+
+    const store = new StateStore(path);
+    const scoped = store.searchSimilar(await h.embed('postgres'), 1, 'B');
+    expect(scoped.map((r) => r.message.id)).toEqual(['a-second']);
+    expect(store.getRecentMessages(null, 3).map((m) => m.id)).toEqual(['m-third', 'a-second', 'z-first']);
+    if (store.vectorSearchBackend === 'sqlite-vec') {
+      // Cosine, not L2 on unit vectors: the same text scores 1
+      expect(store.searchSimilar(await h.embed('lunch is at noon'), 1)[0].score).toBeCloseTo(1, 5);
+    }
+    store.close();
   });
 });

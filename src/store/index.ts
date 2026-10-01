@@ -171,11 +171,15 @@ export class StateStore {
     this.transaction(() => {
       if (existing) this.db.exec('DROP TABLE message_vectors');
       this.db.exec(definition);
-      const rows = this.db
-        .prepare('SELECT id, session_id, embedding FROM messages WHERE embedding IS NOT NULL')
-        .iterate() as IterableIterator<{ id: string; session_id: string; embedding: Buffer }>;
-      for (const row of rows) {
-        this.insertVectors(row.id, row.session_id, this.decodeVectors(row.embedding));
+      // In pages: the connection can't write while a cursor is open
+      const page = this.db.prepare(
+        'SELECT rowid, id, session_id, embedding FROM messages WHERE embedding IS NOT NULL AND rowid > ? ORDER BY rowid LIMIT 500'
+      );
+      for (let after = 0; ; ) {
+        const rows = page.all(after) as Array<{ rowid: number; id: string; session_id: string; embedding: Buffer }>;
+        if (rows.length === 0) break;
+        for (const row of rows) this.insertVectors(row.id, row.session_id, this.decodeVectors(row.embedding));
+        after = rows[rows.length - 1].rowid;
       }
     });
   }
