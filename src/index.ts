@@ -13,6 +13,8 @@ export {
   type TailPosition,
   type IngestPosition,
 } from './indexer/tailer.js';
+export { type RestServerOptions } from './api/rest.js';
+export { resolveRestToken, restTokenPath, REST_TOKEN_FILE, type RestToken } from './api/auth.js';
 export {
   OpenAIAdapter,
   AnthropicAdapter,

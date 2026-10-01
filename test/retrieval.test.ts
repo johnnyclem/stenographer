@@ -158,7 +158,9 @@ describe('retrieval', () => {
   it('REST and MCP clamp k instead of failing (IDX-13)', async () => {
     const e = await index([jsonl('m1', 'we decided to use postgres', '2026-01-01T00:00:00Z')], { restPort: 0 });
     for (const path of ['/search?q=postgres&k=5000', '/search?q=postgres&k=4096', '/graphrag?q=postgres&k=5000']) {
-      const res = await fetch(`http://127.0.0.1:${e.restPort}${path}`);
+      const res = await fetch(`http://127.0.0.1:${e.restPort}${path}`, {
+        headers: { Authorization: `Bearer ${e.restToken}` },
+      });
       expect(res.status).toBe(200);
     }
   });

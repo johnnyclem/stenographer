@@ -266,11 +266,28 @@ export interface StenographerConfig {
   restPort?: number;
   /**
    * Host/interface for the REST API to bind to. Defaults to `127.0.0.1` —
-   * the API has no authentication, so it stays loopback-only unless the
+   * the API serves transcripts, so it stays loopback-only unless the
    * operator explicitly opts into wider exposure (e.g. `0.0.0.0` in a
-   * container reached only through a trusted network boundary).
+   * container reached only through a trusted network boundary). A named
+   * host is also accepted in the Host header.
    */
   restHost?: string;
+  /**
+   * Bearer token every REST request must carry (`STENOGRAPHER_REST_TOKEN`,
+   * at least 16 characters). Default: one generated on first run into
+   * `<state dir>/rest-token`, mode 0600, and reused after.
+   */
+  restToken?: string;
+  /**
+   * Serve REST without a bearer token (`--rest-insecure`). Host and Origin
+   * are still checked, so a web page can't read it by DNS rebinding.
+   */
+  restInsecure?: boolean;
+  /**
+   * Host names REST answers to besides loopback and `restHost`
+   * (`--rest-allow-host`, e.g. the name a container is reached by).
+   */
+  restAllowedHosts?: string[];
   /** Reserved for Tier-1 model-based extraction (roadmap). */
   extractionThreshold?: number;
   /** Reserved (roadmap). */

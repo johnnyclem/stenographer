@@ -2,6 +2,11 @@
  * Stenographer — REST API
  * Thin HTTP layer over the StenographerAPI surface. No framework — node:http.
  *
+ * Every route checks Host and Origin, and requires `Authorization: Bearer
+ * <token>` unless the server was started with --rest-insecure (./auth.ts).
+ * Query parameters are validated: a malformed one gets 400, an oversized
+ * count is clamped.
+ *
  * Routes:
  *   GET /status
  *   GET /messages?n=10
@@ -23,24 +28,99 @@
  */
 
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from 'node:http';
+import { z } from 'zod';
 import type { Stenographer } from '../core/stenographer.js';
 import { TruthWriteError } from '../truth/ledger.js';
 import { NOTARY_SECRET_HEADER, notarySecretMatches } from '../truth/notary.js';
-import type { ProposalBody } from '../truth/types.js';
+import { allowedHostNames, bearerMatches, hostHeaderName, originAllowed } from './auth.js';
 
 const MAX_BODY_BYTES = 64 * 1024;
 /** Upper bounds for list sizes: larger requests are clamped, not refused. */
 const MAX_K = 200;
 const MAX_MESSAGES = 1000;
 const MAX_DEPTH = 5;
+const MAX_FLAGS = 1000;
+const MAX_BUDGET = 100_000;
+const MAX_QUERY_CHARS = 2_000;
+
+/** A positive integer parameter (0 allowed with `min: 0`): `fallback` when absent, clamped to `max`. */
+const count = (fallback: number, max: number, min: number = 1) =>
+  z.coerce
+    .number()
+    .int()
+    .min(min)
+    .default(fallback)
+    .transform((n) => Math.min(n, max));
+
+const query = z.string().min(1).max(MAX_QUERY_CHARS);
+
+const QUERIES = {
+  messages: z.object({ n: count(10, MAX_MESSAGES) }),
+  flags: z.object({
+    since: z.string().max(64).optional(),
+    status: z.enum(['pending', 'sustained', 'overruled']).optional(),
+    include: z.literal('shadow').optional(),
+    limit: count(100, MAX_FLAGS),
+  }),
+  search: z.object({ q: query, k: count(5, MAX_K) }),
+  graphrag: z.object({ q: query, k: count(5, MAX_K), depth: count(2, MAX_DEPTH, 0) }),
+  proposals: z.object({
+    status: z.enum(['open', 'signed', 'dismissed']).optional(),
+    kind: z.enum(['tombstone', 'uv']).optional(),
+  }),
+  contextFrame: z.object({ budget: count(2000, MAX_BUDGET) }),
+};
+
+/** A request the caller has to fix: answered with its status, never 500. */
+class RequestError extends Error {
+  constructor(
+    readonly status: number,
+    message: string
+  ) {
+    super(message);
+  }
+}
+
+function parseQuery<T extends z.ZodTypeAny>(schema: T, url: URL): z.infer<T> {
+  const result = schema.safeParse(Object.fromEntries(url.searchParams));
+  if (!result.success) {
+    const issues = result.error.issues.map((i) => `${i.path.join('.') || 'query'}: ${i.message}`);
+    throw new RequestError(400, `Invalid query parameter — ${issues.join('; ')}`);
+  }
+  return result.data;
+}
+
+function decodeSegment(segment: string): string {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    throw new RequestError(400, 'Malformed percent-encoding in path');
+  }
+}
+
+export interface RestServerOptions {
+  /** The bearer token every request must carry. */
+  token?: string | null;
+  /** Serve without a token (`--rest-insecure`). Host and Origin are still checked. */
+  insecure?: boolean;
+  /** Host names to answer to besides loopback: the bind host, `--rest-allow-host`. */
+  allowedHosts?: string[];
+}
 
 export class RestServer {
   private engine: Stenographer;
   private server: Server | null = null;
   private boundPort: number | null = null;
+  private token: string | null;
+  private hosts: Set<string>;
 
-  constructor(engine: Stenographer) {
+  constructor(engine: Stenographer, options: RestServerOptions) {
+    if (!options?.token && !options?.insecure) {
+      throw new Error('RestServer needs a bearer token (or insecure: true to serve without one)');
+    }
     this.engine = engine;
+    this.token = options.token || null;
+    this.hosts = allowedHostNames(options.allowedHosts);
   }
 
   get port(): number | null {
@@ -48,16 +128,21 @@ export class RestServer {
   }
 
   /**
-   * Starts the REST server. Binds to `host` (default `127.0.0.1`) — this API
-   * has no authentication, so it must not listen on all interfaces unless
-   * the caller explicitly opts in (e.g. `--rest-host 0.0.0.0` in a
-   * container where the operator accepts that tradeoff).
+   * Starts the REST server. Binds to `host` (default `127.0.0.1`): the API
+   * serves transcripts, so it listens on all interfaces only when the
+   * operator asks (e.g. `--rest-host 0.0.0.0` in a container, with
+   * `--rest-allow-host` for the name clients use).
    */
   start(port: number, host: string = '127.0.0.1'): Promise<void> {
     return new Promise((resolve, reject) => {
       this.server = createServer((req, res) => {
         this.handle(req, res).catch((err) => {
-          sendJson(res, 500, { error: err instanceof Error ? err.message : String(err) });
+          if (res.headersSent) {
+            res.destroy();
+            return;
+          }
+          const status = err instanceof RequestError ? err.status : 500;
+          sendJson(res, status, { error: err instanceof Error ? err.message : String(err) });
         });
       });
       this.server.once('error', reject);
@@ -75,7 +160,32 @@ export class RestServer {
     this.boundPort = null;
   }
 
+  /**
+   * Host, Origin and bearer token, before anything else is read: a refused
+   * request learns nothing but its status.
+   */
+  private refuse(req: IncomingMessage, res: ServerResponse): boolean {
+    const host = hostHeaderName(req.headers.host);
+    let refusal: { status: number; error: string; headers?: Record<string, string> } | null = null;
+    if (!host || !this.hosts.has(host)) {
+      refusal = { status: 421, error: 'Host not allowed (DNS rebinding guard); use a loopback name or --rest-allow-host' };
+    } else if (!originAllowed(req.headers.origin, this.hosts)) {
+      refusal = { status: 403, error: 'Cross-origin requests are not allowed' };
+    } else if (this.token && !bearerMatches(this.token, req.headers.authorization)) {
+      refusal = {
+        status: 401,
+        error: 'Missing or invalid bearer token (see <state dir>/rest-token)',
+        headers: { 'WWW-Authenticate': 'Bearer realm="stenographer"' },
+      };
+    }
+    if (!refusal) return false;
+    req.resume();
+    sendJson(res, refusal.status, { error: refusal.error }, refusal.headers);
+    return true;
+  }
+
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (this.refuse(req, res)) return;
     const url = new URL(req.url || '/', 'http://localhost');
     const path = url.pathname.replace(/\/+$/, '') || '/';
 
@@ -90,7 +200,7 @@ export class RestServer {
 
     const chainMatch = path.match(/^\/decisions\/([^/]+)\/chain$/);
     if (chainMatch) {
-      sendJson(res, 200, await this.engine.getDecisionChain(decodeURIComponent(chainMatch[1])));
+      sendJson(res, 200, await this.engine.getDecisionChain(decodeSegment(chainMatch[1])));
       return;
     }
 
@@ -107,7 +217,7 @@ export class RestServer {
         return;
 
       case '/messages': {
-        const n = intParam(url, 'n', 10, MAX_MESSAGES);
+        const { n } = parseQuery(QUERIES.messages, url);
         sendJson(res, 200, await this.engine.getRecentMessages(n));
         return;
       }
@@ -135,76 +245,36 @@ export class RestServer {
       case '/flags': {
         // Pull transport: consumers poll with the last id they saw. SSE vs
         // webhook push is an open question (§14.8); both can layer on this.
-        const status = url.searchParams.get('status');
-        if (status && !['pending', 'sustained', 'overruled'].includes(status)) {
-          sendJson(res, 400, { error: `Invalid status: ${status}` });
-          return;
-        }
+        const { since, status, include, limit } = parseQuery(QUERIES.flags, url);
         sendJson(
           res,
           200,
-          await this.engine.getObjections({
-            since: url.searchParams.get('since') ?? undefined,
-            status: (status as 'pending' | 'sustained' | 'overruled' | null) ?? undefined,
-            includeShadow: url.searchParams.get('include') === 'shadow',
-            limit: intParam(url, 'limit', 100),
-          })
+          await this.engine.getObjections({ since, status, includeShadow: include === 'shadow', limit })
         );
         return;
       }
 
       case '/search': {
-        const q = url.searchParams.get('q');
-        if (!q) {
-          sendJson(res, 400, { error: 'Missing query parameter: q' });
-          return;
-        }
-        sendJson(res, 200, await this.engine.searchSimilar(q, intParam(url, 'k', 5, MAX_K)));
+        const { q, k } = parseQuery(QUERIES.search, url);
+        sendJson(res, 200, await this.engine.searchSimilar(q, k));
         return;
       }
 
       case '/graphrag': {
-        const q = url.searchParams.get('q');
-        if (!q) {
-          sendJson(res, 400, { error: 'Missing query parameter: q' });
-          return;
-        }
-        sendJson(
-          res,
-          200,
-          await this.engine.searchGraphRAG({
-            query: q,
-            k: intParam(url, 'k', 5, MAX_K),
-            graphDepth: intParam(url, 'depth', 2, MAX_DEPTH, 0),
-          })
-        );
+        const { q, k, depth } = parseQuery(QUERIES.graphrag, url);
+        sendJson(res, 200, await this.engine.searchGraphRAG({ query: q, k, graphDepth: depth }));
         return;
       }
 
       case '/proposals': {
-        const status = url.searchParams.get('status');
-        if (status && !['open', 'signed', 'dismissed'].includes(status)) {
-          sendJson(res, 400, { error: `Invalid status: ${status}` });
-          return;
-        }
-        const kind = url.searchParams.get('kind');
-        if (kind && !['tombstone', 'uv'].includes(kind)) {
-          sendJson(res, 400, { error: `Invalid kind: ${kind}` });
-          return;
-        }
-        sendJson(
-          res,
-          200,
-          await this.engine.listProposals(
-            (status as ProposalBody['status'] | null) ?? undefined,
-            (kind as ProposalBody['kind'] | null) ?? undefined
-          )
-        );
+        const { status, kind } = parseQuery(QUERIES.proposals, url);
+        sendJson(res, 200, await this.engine.listProposals(status, kind));
         return;
       }
 
       case '/context-frame': {
-        const frame = await this.engine.buildContextFrame(intParam(url, 'budget', 2000));
+        const { budget } = parseQuery(QUERIES.contextFrame, url);
+        const frame = await this.engine.buildContextFrame(budget);
         res.writeHead(200, { 'Content-Type': 'text/markdown; charset=utf-8' });
         res.end(frame);
         return;
@@ -278,30 +348,23 @@ async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> 
   let size = 0;
   for await (const chunk of req) {
     size += (chunk as Buffer).length;
-    if (size > MAX_BODY_BYTES) throw new Error('request body too large');
+    if (size > MAX_BODY_BYTES) throw new RequestError(413, 'request body too large');
     chunks.push(chunk as Buffer);
   }
   const text = Buffer.concat(chunks).toString('utf8');
-  const parsed = text ? JSON.parse(text) : {};
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('body must be a JSON object');
+  let parsed: unknown;
+  try {
+    parsed = text ? JSON.parse(text) : {};
+  } catch {
+    throw new RequestError(400, 'body is not valid JSON');
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new RequestError(400, 'body must be a JSON object');
+  }
   return parsed as Record<string, unknown>;
 }
 
-/** An integer query parameter: `fallback` when absent or below `min`, clamped to `max`. */
-function intParam(
-  url: URL,
-  name: string,
-  fallback: number,
-  max: number = Number.MAX_SAFE_INTEGER,
-  min: number = 1
-): number {
-  const raw = url.searchParams.get(name);
-  if (!raw) return fallback;
-  const parsed = Number.parseInt(raw, 10);
-  return Number.isFinite(parsed) && parsed >= min ? Math.min(parsed, max) : fallback;
-}
-
-function sendJson(res: ServerResponse, status: number, body: unknown): void {
-  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', ...headers });
   res.end(JSON.stringify(body, null, 2));
 }

@@ -66,8 +66,16 @@ Options (start):
                            per embedder — MiniLM 0.45, hashed 0.75)
       --rest-port <port>   Serve the REST API on this port
       --rest-host <host>   Interface for the REST API to bind to
-                           (default: 127.0.0.1 — the API has no auth,
-                           so it stays loopback-only unless overridden)
+                           (default: 127.0.0.1 — the API serves
+                           transcripts, so it stays loopback-only unless
+                           overridden)
+      --rest-allow-host <name>
+                           also answer to this Host name (repeatable;
+                           loopback names and --rest-host always are)
+      --rest-insecure      serve REST without a bearer token (by default
+                           every route needs Authorization: Bearer <token>,
+                           from STENOGRAPHER_REST_TOKEN or generated into
+                           <state dir>/rest-token, mode 0600)
       --objections <mode>  off | shadow | deliver  (default: shadow)
                            real-time objections to tombstoned literals;
                            shadow records them without emitting on /flags

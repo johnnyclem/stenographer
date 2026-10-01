@@ -24,6 +24,7 @@ import {
   type EmbedderIdentity,
 } from '../indexer/embeddings.js';
 import { RestServer } from '../api/rest.js';
+import { resolveRestToken, type RestToken } from '../api/auth.js';
 import {
   exportWikiEntries,
   importWikiEntries,
@@ -110,6 +111,7 @@ export class Stenographer implements StenographerAPI {
   private dirWatcher: FSWatcher | null = null;
   private stopped = false;
   private restServer: RestServer | null = null;
+  private restAuth: RestToken | null = null;
   private sessionId: string;
   private indexing: Promise<void> = Promise.resolve();
   private supersedeThreshold: number;
@@ -196,9 +198,24 @@ export class Stenographer implements StenographerAPI {
       this.config.restPort ?? (this.config.mode === 'daemon' ? DEFAULT_DAEMON_REST_PORT : undefined);
     if (restPort !== undefined) {
       const restHost = this.config.restHost ?? '127.0.0.1';
-      this.restServer = new RestServer(this);
+      const auth = this.config.restInsecure
+        ? null
+        : resolveRestToken(this.config.statePath || './stenographer.db', this.config.restToken);
+      this.restAuth = auth;
+      this.restServer = new RestServer(this, {
+        token: auth?.token,
+        insecure: this.config.restInsecure,
+        allowedHosts: [restHost, ...(this.config.restAllowedHosts ?? [])],
+      });
       await this.restServer.start(restPort, restHost);
       console.error(`🌐 REST API listening on http://${restHost}:${this.restServer.port}`);
+      if (!auth) {
+        console.error('⚠️  REST API has no bearer token (--rest-insecure): any local process can read transcripts');
+      } else if (auth.path) {
+        console.error(`🔑 REST bearer token${auth.created ? ' created' : ''}: ${auth.path} (send Authorization: Bearer <contents>)`);
+      } else {
+        console.error(`🔑 REST bearer token: ${this.config.restToken ? 'as configured' : 'in memory only (in-memory state)'}`);
+      }
     }
   }
 
@@ -228,6 +245,16 @@ export class Stenographer implements StenographerAPI {
 
   get restPort(): number | null {
     return this.restServer?.port ?? null;
+  }
+
+  /** The bearer token REST requires; null when REST is off or started with --rest-insecure. */
+  get restToken(): string | null {
+    return this.restServer ? (this.restAuth?.token ?? null) : null;
+  }
+
+  /** Where that token is stored (`<state dir>/rest-token`); null when configured or in memory. */
+  get restTokenPath(): string | null {
+    return this.restServer ? (this.restAuth?.path ?? null) : null;
   }
 
   /** The embedder in use (and the state database is pinned to), once started. */

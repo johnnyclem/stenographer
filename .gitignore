@@ -6,3 +6,4 @@ dist-cli/
 *.log
 *.db
 *.jsonl
+rest-token

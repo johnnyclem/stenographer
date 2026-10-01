@@ -337,6 +337,8 @@ describe('REST /flags', () => {
     await settle(engine);
 
     const base = `http://localhost:${engine.restPort}`;
+    const headers = { Authorization: `Bearer ${engine.restToken}` };
+    const fetch = (url: string, init: RequestInit = {}) => globalThis.fetch(url, { ...init, headers });
     const all = await (await fetch(`${base}/flags`)).json();
     expect(all).toHaveLength(2);
     expect(all[0]).toHaveProperty('exhibit');
