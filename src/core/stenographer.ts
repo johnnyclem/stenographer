@@ -1335,9 +1335,17 @@ export class Stenographer implements StenographerAPI {
     await this.store.objectionDelivery.pump();
   }
 
-  /** The tuning dial: a falling sustain rate means tighten the matcher. */
-  async getObjectionStats(): Promise<ObjectionStats & { mode: ObjectionMode }> {
-    return { ...this.store.objections.stats(), mode: this.objectionMode };
+  /**
+   * The tuning dial: a falling sustain rate means tighten the matcher.
+   * `deadLettered` counts objections a receiver refused for good or never
+   * took within its attempts.
+   */
+  async getObjectionStats(): Promise<ObjectionStats & { mode: ObjectionMode; deadLettered: number }> {
+    return {
+      ...this.store.objections.stats(),
+      mode: this.objectionMode,
+      deadLettered: this.store.objectionDelivery.deadLetterCount(),
+    };
   }
 
   /** §8 export: signed truth only, x-steno namespaced extras. */

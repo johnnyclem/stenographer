@@ -89,10 +89,21 @@ export {
   createMcpChannelTransport,
   formatObjection,
   formatObjectionBatch,
+  redactUrl,
+  webhookHeaders,
+  webhookId,
+  assertWebhookSecret,
+  DeliveryError,
   DEFAULT_OBJECTION_BATCH_SIZE,
+  DEFAULT_MAX_ATTEMPTS,
+  DEFAULT_RETRY_BASE_MS,
+  DEFAULT_MAX_BATCH_DELAY_MS,
+  MIN_WEBHOOK_SECRET_BYTES,
   type ObjectionSinkConfig,
   type ObjectionTransport,
+  type DeadLetter,
 } from './truth/delivery.js';
+export { displayText } from './truth/display.js';
 export {
   raiseForNotarization,
   formatProposalNotice,
