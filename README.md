@@ -68,6 +68,8 @@ Each guarantee below states the property that is enforced, and where it stops. T
 npm install @stenographer/core
 ```
 
+The SQLite driver, better-sqlite3 13, ships prebuilt binaries for Linux, macOS and Windows on x64 and arm64. An install from a lockfile (`npm ci`) still runs its `node-gyp rebuild` step, which compiles nothing when a prebuild matches but needs Python 3 and `make`. On a host without them, such as `node:22-slim`, use `npm ci --ignore-scripts`. [MIGRATION.md](MIGRATION.md#runtime-package-and-cli) says why that is safe and what to do on other platforms.
+
 ## Quick Start
 
 ```bash
@@ -541,7 +543,7 @@ npm run lint    # tsc --noEmit
 npm run test:openappa   # OpenAPPA battery checks; skipped without an appa binary
 ```
 
-Tests live in [`test/`](./test), covering the core engine, ingestion across restarts, the tailer, provider adapters, extraction precision on a labeled corpus, embeddings and embedder pinning, GraphRAG retrieval, importance scoring, the SQLite store and its migrations, the REST API and its access checks, the truth ledger (authority model, notary, hash chain and `verify`, truth format v2 fixtures, wiki interop, intake), objections and their delivery, the gate, the OpenAPPA battery and context route, and an indexing-time bound. Two tests need the MiniLM weights on disk and are skipped otherwise; set `STENOGRAPHER_TEST_MODEL_CACHE` to a transformers.js cache directory to run them. CI runs lint, tests, build and `test:openappa` on Node 22 and 24, installing OpenAPPA 0.30.0 for the last one (a missing `appa` fails there rather than skipping).
+Tests live in [`test/`](./test), covering the core engine, ingestion across restarts, the tailer, provider adapters, extraction precision on a labeled corpus, embeddings and embedder pinning, GraphRAG retrieval, importance scoring, the SQLite store and its migrations, the REST API and its access checks, the truth ledger (authority model, notary, hash chain and `verify`, truth format v2 fixtures, wiki interop, intake), objections and their delivery, the gate, the OpenAPPA battery and context route, and an indexing-time bound. Two tests need the MiniLM weights on disk and are skipped otherwise; set `STENOGRAPHER_TEST_MODEL_CACHE` to a transformers.js cache directory to run them. CI runs lint, tests, build and `test:openappa` on Node 22 and 24, installing OpenAPPA 0.30.0 for the last one (a missing `appa` fails there rather than skipping). It also installs the packed package on `node:22-slim`, which has no Python or `make`: fresh, then from the lockfile with `npm ci --ignore-scripts`.
 
 ## Contributing
 

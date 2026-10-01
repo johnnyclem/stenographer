@@ -4,7 +4,7 @@
 
 ## Upgrade checklist
 
-1. **Run Node.js 22 or newer**, and use the scoped package name. See [Runtime, package and CLI](#runtime-package-and-cli).
+1. **Run Node.js 22 or newer**, and use the scoped package name. A CI image without Python 3 and `make` (such as `node:22-slim`) now installs with `npm ci --ignore-scripts`. See [Runtime, package and CLI](#runtime-package-and-cli).
 2. **Back up the state database.** Stop stenographer and copy `stenographer.db`. The first 1.0 start migrates it in place, and a 0.x build can't open it afterwards. See [State database: automatic migration, then verify](#state-database-automatic-migration-then-verify).
 3. **Start with the embedder you used before.** If an offline machine may have fallen back to hashed embeddings under 0.x, add `--reembed` to the first start. See [Extraction and retrieval](#extraction-and-retrieval).
 4. **Verify the ledger** with `npx -y @stenographer/core verify ./stenographer.db`, and keep the head hash it prints somewhere other than the state file.
@@ -19,7 +19,15 @@
 ## Runtime, package and CLI
 
 - **Node.js 22 or newer** (`engines.node` is `>=22`). Node 20 reached end of life in April 2026. CI runs Node 22 and 24.
-- **SQLite driver: `better-sqlite3` 13.** It ships prebuilt binaries for Linux (glibc and musl), macOS and Windows on x64 and arm64, and installs without a compiler or a download. On any other platform, build it from source after installing: `npm run build-release` in `node_modules/better-sqlite3`, with a C++ toolchain. Library users who pass their own handle to `new TruthLedger(db)` or `new ObjectionLog(db, ledger)` open it with `better-sqlite3` 13 (and type it with `@types/better-sqlite3` 9). State files need nothing.
+- **SQLite driver: `better-sqlite3` 13.** It ships prebuilt binaries for Linux (glibc and musl), macOS and Windows on x64 and arm64, and loads them from its own `prebuilds/` directory. Library users who pass their own handle to `new TruthLedger(db)` or `new ObjectionLog(db, ledger)` open it with `better-sqlite3` 13 (and type it with `@types/better-sqlite3` 9). State files need nothing.
+- **Installing from a lockfile can need Python 3 and `make`.** A fresh `npm install` takes better-sqlite3's prebuilt binary as it is. An install from a lockfile (`npm ci`, or `npm install` in a project with a `package-lock.json`) runs npm's implicit `node-gyp rebuild` for it, because the package ships `binding.gyp` and the lockfile can't record that the package opts out. With a prebuild for the host that compiles nothing, but it needs Python 3 and `make` (Visual Studio Build Tools on Windows) and downloads the Node headers unless node-gyp has them cached. better-sqlite3 11 downloaded a prebuilt binary instead, so a CI image or container that installed 0.x without build tools fails now (`gyp ERR! find Python`, or `not found: make`), for example `node:22-slim` or an offline runner. Either give it Python 3 and `make` (on Debian, `apt-get install -y python3 make`), or skip install scripts:
+
+  ```bash
+  npm ci --ignore-scripts
+  ```
+
+  Among stenographer's own dependencies, that skips nothing it needs: better-sqlite3 loads its prebuilt binary without a build, `onnxruntime-node`'s postinstall only downloads its optional CUDA libraries, `sharp`'s install script only checks for its prebuilt `@img/sharp-*` package, and `protobufjs`'s postinstall only prints a version warning. Check your project's other dependencies before you skip their scripts too. CI installs the packed package this way on `node:22-slim`.
+- **On a platform without a prebuild**, the lockfile install's `node-gyp rebuild` compiles better-sqlite3 from source, with a C++ toolchain. After an install that skipped it (a fresh `npm install`, or `--ignore-scripts`), run `npm run build-release` in `node_modules/better-sqlite3`.
 - **Run the scoped package.** Use `npx -y @stenographer/core <command>`, or `stenographer <command>` once `@stenographer/core` is installed. `npx stenographer` is a different npm package.
 - **`stenographer init` is removed.** It printed a hint and set nothing up. Start with `stenographer start <log-path> [state-path]`; for the pre-dispatch gate, add the hook from the README's "Pre-dispatch gate".
 

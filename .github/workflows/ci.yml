@@ -37,3 +37,31 @@ jobs:
         env:
           APPA_BIN: ${{ runner.temp }}/appa/appa
           APPA_REQUIRED: '1'
+
+  # better-sqlite3 13 loads a prebuilt binary, but an install from a
+  # lockfile still runs npm's implicit `node-gyp rebuild` for it, which
+  # needs Python 3 and make even when it compiles nothing. node:22-slim has
+  # neither: install the packed package there as MIGRATION.md says, fresh
+  # and then from the lockfile that wrote, and run it.
+  slim-install:
+    name: Install the packed package on node:22-slim
+    runs-on: ubuntu-latest
+    container: node:22-slim
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      - run: npm pack --pack-destination /tmp
+      - name: Install it into a new project, then again from that project's lockfile
+        working-directory: /tmp
+        env:
+          # onnxruntime-node's postinstall would download its optional CUDA libraries
+          ONNXRUNTIME_NODE_INSTALL: skip
+        run: |
+          mkdir consumer && cd consumer
+          npm init -y
+          npm install /tmp/stenographer-core-*.tgz
+          rm -rf node_modules
+          npm ci --ignore-scripts
+          npx stenographer proposals ./state.db
+          npx stenographer verify ./state.db

@@ -7,7 +7,7 @@
  * `npx stenographer`, which is not this package (STENO-T-25, STENO-IDX-29).
  */
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, writeFileSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { existsSync, mkdtempSync, writeFileSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -94,6 +94,30 @@ describe('release metadata', () => {
     const [major, minor, patch] = (driver?.version ?? '0.0.0').split('.').map(Number);
     expect(major * 1e6 + minor * 1e3 + patch, `better-sqlite3 ${driver?.version}`).toBeGreaterThanOrEqual(13_000_003);
     expect(driver.engines?.node).toBe(pkg.engines.node);
+  });
+
+  // better-sqlite3 13 says "gypfile": false, which a fresh `npm install`
+  // honours. A lockfile entry can't carry that field, and the package ships
+  // binding.gyp, so `npm ci` runs npm's implicit `node-gyp rebuild`: it
+  // compiles nothing when a prebuild matches, but needs Python 3 and make
+  // and fetches the Node headers, and fails on node:22-slim, Alpine or an
+  // offline host. The docs said it runs no install script.
+  it('says what an install from the lockfile needs for better-sqlite3, and CI installs it on a host without those tools', () => {
+    const lock = JSON.parse(read('package-lock.json')) as { packages: Record<string, Record<string, unknown>> };
+    // The premise: what makes npm ci run node-gyp. When either changes, so do the docs.
+    expect(existsSync(join(ROOT, 'node_modules/better-sqlite3/binding.gyp'))).toBe(true);
+    expect(lock.packages['node_modules/better-sqlite3']).not.toHaveProperty('gypfile');
+
+    for (const file of ['CHANGELOG.md', 'MIGRATION.md', 'README.md']) {
+      expect(read(file), file).not.toMatch(/runs no install script|without a compiler or a download/);
+    }
+    for (const file of ['CHANGELOG.md', 'MIGRATION.md']) {
+      expect(read(file), file).toContain('node-gyp rebuild');
+      expect(read(file), file).toContain('npm ci --ignore-scripts');
+    }
+    const ci = read('.github/workflows/ci.yml');
+    expect(ci).toMatch(/container:\s*node:22-slim/);
+    expect(ci).toContain('npm ci --ignore-scripts');
   });
 
   // npm 11 (Node 24) `npm ci` refuses a lockfile that leaves out another
