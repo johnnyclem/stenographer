@@ -84,6 +84,31 @@ export function hasControlCharacters(identity: string): boolean {
   return /\p{Cc}/u.test(identity);
 }
 
+const RFC3339_DATE_TIME = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|[+-](\d{2}):(\d{2}))$/;
+
+/** Whether `s` is shaped like an RFC 3339 date-time (`T` and `Z` upper case), whatever its field values. */
+export function hasRfc3339Shape(s: string): boolean {
+  return RFC3339_DATE_TIME.test(s);
+}
+
+/**
+ * Whether `s` is an RFC 3339 date-time whose fields name a real time: no
+ * February 30, no 24:00, no offset past 23:59, and no leap second, which
+ * Date.parse would otherwise roll over or refuse. Never looser than JSON
+ * Schema's `date-time` format, so a line stenographer writes passes it.
+ */
+export function isRfc3339DateTime(s: string): boolean {
+  const m = RFC3339_DATE_TIME.exec(s);
+  if (!m) return false;
+  const [year, month, day, hour, minute, second] = m.slice(1, 7).map(Number);
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  if (month < 1 || month > 12 || day < 1 || day > days[month - 1]) return false;
+  if (hour > 23 || minute > 59 || second > 59) return false;
+  if (m[7] !== undefined && (Number(m[7]) > 23 || Number(m[8]) > 59)) return false;
+  return Number.isFinite(Date.parse(s));
+}
+
 /** Author string: never blank, never a generic non-identity, never a reserved one. */
 export const AuthorSchema = z
   .string()

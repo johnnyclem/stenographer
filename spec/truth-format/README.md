@@ -34,7 +34,7 @@ Every line is a JSON object with `schemaVersion: 2`, `seq`, `id`, `type`, `ts`, 
 |---|---|
 | `id` | Unique across the team's ledgers. Stenographer writes ULIDs. Letters, digits and `. _ : -`, 1–256 characters, starting with a letter or digit. |
 | `type` | `TB`, `UV`, `ADDENDUM`, `RULING`, `PROPOSAL` or `TRANSITION`. |
-| `ts` | RFC 3339 date-time. Stenographer writes UTC with milliseconds. |
+| `ts` | RFC 3339 date-time naming a real time: no February 30, no `24:00`, no offset past `23:59`. Stenographer writes UTC with milliseconds, and its codec also refuses a leap second (`:60`) and a lower-case `t` or `z`. |
 | `author` | Who wrote the entry (see [Identities](#identities)). |
 | `x-steno` | Optional. Stenographer's own fields: `origin`, `provenance` (`{kind, ref?, line?}`), `agentSessionId`, `targetRef`, `links` (the links the entry's own write created, `{fromId, toId, type}`) and `ledgerHash` (the entry's hash in its writer's ledger chain, which `stenographer verify` checks). Readers that only fold statuses can ignore it. |
 
@@ -83,7 +83,8 @@ Their `x-steno.links` say what they do (`verifies`, `refutes`, `overrides`, `str
 | `target` | The TB or UV whose status changed. |
 | `status` | Its new status. |
 | `cause` | `{kind, ref}`. `kind` is `contest`, `override`, `strike`, `verify` or `refute`, or, in proposal streams, `dismiss` or `promote`. `ref` is the id of the entry that caused the change (the contesting UV, the addendum, the ruling), or `null` when that entry has no line in the stream (stenographer leaves out a pre-1.0 entry the format can't express, and reports it in the export's `skipped`). |
-| `author`, `ts` | The cause's. |
+| `author`, `ts` | The cause's. No cause of a status change is written by `migration` or a detector, so a TRANSITION's author is never reserved. |
+| `id` | Stenographer writes `<cause id>:<target id>`, or `transition:` and the SHA-256 hex of that when it would be longer than 256 characters. Readers don't derive anything from it. |
 
 A status change is never an edit. It is an appended TRANSITION line. Stenographer writes one each time an exported entry's status changes, right after the line that caused it:
 
@@ -104,7 +105,7 @@ A reader's current status for an entry is **the `status` of the highest-`seq` TR
 | UV | `open`, `verified`, `refuted`, `struck` | `open` (a heads-up) |
 
 - **Fail closed.** A missing or unknown status means the entry is not current truth. The reader keeps the line as history and preserves it verbatim if it re-serializes.
-- `overridden` and `struck` never change again in a stenographer stream.
+- In a stenographer stream, `struck` never changes again, and `overridden`, `verified` and `refuted` can only become `struck` (a strike can target a resolved entry). This is the lattice below, one writer at a time.
 - A UV that is open and contests a TB is attached to that TB whatever the TB's status says, so the dispute is always visible.
 - Consumers SHOULD treat an active TB as ground truth, a contested TB as ground truth with a visible asterisk (cite the contesting UV), and an open UV as a heads-up, never a demand. A refuted UV and an overridden or struck TB are history: never cite them as support.
 - Each file is one writer's view. A reader that merges several files folds each one on its own, then takes, per entry, the most advanced status on the lattice TB `active < contested < overridden < struck`, UV `open < verified < refuted < struck`.
@@ -123,7 +124,7 @@ Stenographer's import is stricter about what it admits as truth (see [Importing]
 
 - is anonymous or generic: `system`, `assistant`, `agent`, `ai`, `bot`, `anonymous`, `unknown`, `user`, `human`, `admin`, `null`, `none`, `me`, or empty;
 - contains a control character (Unicode category Cc);
-- is reserved where it doesn't belong: `migration` authors only an unsigned backfilled TB, and `detector:*` authors only PROPOSAL lines (a TRANSITION takes its cause's author).
+- is reserved where it doesn't belong: `migration` authors only an unsigned backfilled TB, and `detector:*` authors only PROPOSAL lines. A TRANSITION takes its cause's author, so it is never reserved.
 
 Identities compare by key: Unicode NFKC, default-ignorable code points removed, trimmed, lowercased. So `Assistant` and `ａｓｓｉｓｔａｎｔ` are both refused, and `Alice` and `alice` are one person. Lines store identities as written.
 
@@ -217,7 +218,7 @@ v1 couldn't carry status changes, and a 0.x full export rewrote the file, which 
 | `invalid/codec.jsonl`, `codec.expected.json` | Lines the schema accepts and the codec refuses: hash, identity and link rules that JSON Schema can't express. `error` is a regular expression for stenographer's message; other readers need only refuse the line. |
 | `invalid/chain-gap.jsonl`, `chain-fork.jsonl`, `chain.expected.json` | Valid lines that aren't one stream: a missing line, and a line from another writer. |
 
-A consumer's test SHOULD validate every valid line against the schema, parse it with its own codec, recompute every `hash`, check each file's chain, fold `ledger.jsonl` and `unknown.jsonl` and compare the results with their expected files, and refuse every invalid line.
+A consumer's test SHOULD validate every valid line against the schema, parse it with its own codec, recompute every `hash`, check the chain of each valid file except `routing.jsonl` (its lines come from two ledgers and are imported one at a time, so it is not one stream), fold `ledger.jsonl` and `unknown.jsonl` and compare the results with their expected files, and refuse every invalid line.
 
 The fixtures come from a real ledger with the clock and the random source pinned, so the same code always writes the same bytes. A change to the fixtures is a change to the format. `UPDATE_TRUTH_FORMAT_FIXTURES=1 npx vitest run test/truth-format.test.ts` regenerates them; review the diff.
 

@@ -62,5 +62,17 @@
   {
     "line": 16,
     "reason": "a link listed twice"
+  },
+  {
+    "line": 17,
+    "reason": "a date that does not exist (February 30)"
+  },
+  {
+    "line": 18,
+    "reason": "an hour out of range (24:00)"
+  },
+  {
+    "line": 19,
+    "reason": "an empty status"
   }
 ]

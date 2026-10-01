@@ -51,6 +51,7 @@ import {
   identityKey,
   isAnonymousIdentity,
   isReservedIdentity,
+  isRfc3339DateTime,
   type LinkType,
   type TruthEntryType,
   type TruthLink,
@@ -118,28 +119,25 @@ export class WikiLineError extends Error {}
 const ID = z
   .string()
   .regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/, 'an id is 1–256 characters: letters, digits, . _ : -');
-const RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
-const Timestamp = z
-  .string()
-  .refine((s) => RFC3339.test(s) && Number.isFinite(Date.parse(s)), 'ts must be an RFC 3339 date-time');
+const Timestamp = z.string().refine(isRfc3339DateTime, 'ts must be an RFC 3339 date-time naming a real time');
 const Hex64 = z.string().regex(/^[0-9a-f]{64}$/, 'a hash is 64 lowercase hex digits');
 const Text = z.string().min(1);
 const Blankless = z.string().refine((s) => s.trim().length > 0, 'cannot be blank');
 
 /** An identity someone stands behind: the write-time rules (types.ts AuthorSchema), without canonicalizing. */
-function identityIssue(s: string, opts: { reserved?: 'detector' | 'any' } = {}): string | null {
+function identityIssue(s: string, opts: { reserved?: 'detector' } = {}): string | null {
   if (isAnonymousIdentity(s)) {
     return 'anonymous or generic identities cannot assert truth — use a registered human handle or agent identity';
   }
   if (hasControlCharacters(s)) return 'identities cannot contain control characters';
   if (isReservedIdentity(s)) {
     const detector = identityKey(s).startsWith('detector:');
-    if (opts.reserved === 'any' || (opts.reserved === 'detector' && detector)) return null;
+    if (opts.reserved === 'detector' && detector) return null;
     return `'migration' and 'detector:*' are reserved for the backfill and detector paths`;
   }
   return null;
 }
-const identity = (opts: { reserved?: 'detector' | 'any' } = {}) =>
+const identity = (opts: { reserved?: 'detector' } = {}) =>
   z.string().superRefine((s, ctx) => {
     const issue = identityIssue(s, opts);
     if (issue) ctx.addIssue({ code: z.ZodIssueCode.custom, message: issue });
@@ -194,7 +192,7 @@ const TbLine = z
     evidence: z.array(Evidence).min(1, 'a TB requires at least one piece of evidence'),
     signedBy: Identity.nullable(),
     literals: z.array(Literal).min(1, 'omit literals rather than send none').optional(),
-    status: z.string().optional(),
+    status: Text.optional(),
   })
   .passthrough();
 const UvLine = z
@@ -206,7 +204,7 @@ const UvLine = z
     basis: Text,
     verifyBy: VerifyBy,
     contests: ID.nullable(),
-    status: z.string().optional(),
+    status: Text.optional(),
   })
   .passthrough();
 const AddendumLine = z
@@ -238,8 +236,8 @@ const TransitionLine = z
   .object({
     ...Envelope,
     type: z.literal('TRANSITION'),
-    // A transition's author is its cause's, which may be the backfill's 'migration'
-    author: identity({ reserved: 'any' }),
+    // A transition's author is its cause's: a person or an agent, never 'migration' or a detector
+    author: Identity,
     target: ID,
     status: Text,
     cause: z.object({ kind: Text, ref: ID.nullable() }).passthrough(),
@@ -529,8 +527,10 @@ function buildStream(ledger: TruthLedger): { lines: WikiLine[]; skipped: Array<{
       if (id === r.id || was === undefined) continue;
       const now = wikiStatus(derived.get(id)!);
       if (now === was) continue;
+      // `<cause>:<target>`, or its hash when that would break the 256-character id rule
+      const composed = `${r.id}:${id}`;
       const transition = {
-        id: `${r.id}:${id}`,
+        id: composed.length <= 256 ? composed : `transition:${sha256Hex(composed)}`,
         type: 'TRANSITION',
         ts: r.createdAt,
         author: r.author,

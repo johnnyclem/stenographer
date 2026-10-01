@@ -8,6 +8,7 @@ import { Stenographer } from '../src/core/stenographer.js';
 import { exportWikiEntries, importWikiEntries, decodeWikiLine, wikiLineHash } from '../src/truth/wiki.js';
 import { SignerRegistry } from '../src/truth/identity.js';
 import { appendWikiFile } from '../src/truth/wiki-file.js';
+import { wikiMatchableTombstones } from '../src/truth/gate.js';
 import { TruthLedger } from '../src/truth/ledger.js';
 import type { Evidence, TbEntry, UvEntry } from '../src/truth/types.js';
 
@@ -810,6 +811,47 @@ describe('the stream states what the ledger derives', () => {
     expect(result).toMatchObject({ committed: true, errors: [] });
     store.close();
     raw.close();
+  });
+});
+
+// F5: a TRANSITION id was `<cause>:<target>`, which overflows the 256-character
+// id rule when the ids are long: the line failed the codec, was skipped, and
+// teammates kept enforcing an overridden TB.
+describe('TRANSITION ids', () => {
+  it('fit the id rule however long the cause and target ids are', () => {
+    const source = new StateStore(':memory:');
+    const store = new StateStore(':memory:');
+    try {
+      const longId = `01M9${'L'.repeat(236)}`;
+      const line = streamLine({
+        id: longId,
+        type: 'TB',
+        ts: '2026-02-01T00:00:00Z',
+        author: 'johnny',
+        claim: 'LOG_BUDGET 30 is dead',
+        evidence: commitEvidence,
+        signedBy: 'johnny',
+        literals: [{ subject: 'LOG_BUDGET', dead: '30', current: '100' }],
+        status: 'active',
+      });
+      expect(importWikiEntries(store.truth, { lines: [line] })).toMatchObject({ committed: true, inserted: 1 });
+      store.truth.overrideTombstone(longId, { evidence: [{ kind: 'commit', ref: 'feed123' }] }, { author: 'kim' });
+
+      const out = exportWikiEntries(store.truth);
+      expect(out.skipped).toEqual([]);
+      const transition = parse(out.lines).find((l) => l.type === 'TRANSITION');
+      expect(transition).toMatchObject({ target: longId, status: 'overridden' });
+      expect(transition.id.length).toBeLessThanOrEqual(256);
+      expect(wikiMatchableTombstones(out.lines).tombstones.map((tb) => tb.id)).not.toContain(longId);
+      // Short ids keep the readable form
+      const { tb } = seedLedger(source.truth);
+      source.truth.overrideTombstone(tb.id, { evidence: [{ kind: 'commit', ref: 'feed123' }] }, { author: 'kim' });
+      const short = parse(exportWikiEntries(source.truth).lines).filter((l) => l.type === 'TRANSITION' && l.target === tb.id).at(-1);
+      expect(short.id).toBe(`${short.cause.ref}:${tb.id}`);
+    } finally {
+      source.close();
+      store.close();
+    }
   });
 });
 

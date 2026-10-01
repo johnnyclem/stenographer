@@ -43,5 +43,15 @@
     "line": 9,
     "reason": "a proposal with an anonymous author",
     "error": "anonymous"
+  },
+  {
+    "line": 10,
+    "reason": "'migration' authoring a TRANSITION",
+    "error": "reserved"
+  },
+  {
+    "line": 11,
+    "reason": "a detector authoring a TRANSITION",
+    "error": "reserved"
   }
 ]

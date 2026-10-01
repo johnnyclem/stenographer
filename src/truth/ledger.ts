@@ -25,6 +25,8 @@ import {
   isAnonymousIdentity,
   isReservedIdentity,
   hasControlCharacters,
+  hasRfc3339Shape,
+  isRfc3339DateTime,
   isSelfSigningEvidence,
   FILED_RULING_KINDS,
   DETECTOR_PREFIX,
@@ -566,8 +568,14 @@ export class TruthLedger {
     }
     const bodySchema = STORED_BODY[entry.type];
     if (!bodySchema) fail(`unknown entry type '${entry.type}'`);
-    if (typeof entry.createdAt !== 'string' || !Number.isFinite(Date.parse(entry.createdAt))) {
-      fail('createdAt must be a timestamp');
+    // An RFC 3339 one must name a real time: Date.parse rolls February 30 over
+    // to March 2, and the wiki format (like JSON Schema's date-time) refuses it
+    if (
+      typeof entry.createdAt !== 'string' ||
+      !Number.isFinite(Date.parse(entry.createdAt)) ||
+      (hasRfc3339Shape(entry.createdAt) && !isRfc3339DateTime(entry.createdAt))
+    ) {
+      fail('createdAt must be a timestamp naming a real time');
     }
 
     // Who: 'migration' writes markers and backfilled TBs, detectors file proposals, nobody else is reserved

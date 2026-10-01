@@ -382,6 +382,9 @@ function buildFixtures(): Map<string, string> {
     [rehash({ ...strikeLine, opinion: '   ' }), 'a ruling with a blank opinion'],
     [rehash(noCause), 'a TRANSITION without a cause'],
     [rehash({ ...contestLine, 'x-steno': { ...contestLine['x-steno'], links: [...contestLine['x-steno'].links, ...contestLine['x-steno'].links] } }), 'a link listed twice'],
+    [rehash({ ...tbLine, ts: '2026-02-30T10:00:00.000Z' }), 'a date that does not exist (February 30)'],
+    [rehash({ ...tbLine, ts: '2026-09-01T24:00:00Z' }), 'an hour out of range (24:00)'],
+    [rehash({ ...tbLine, status: '' }), 'an empty status'],
   ];
   files.set('invalid/schema.jsonl', jsonl(schemaInvalid.map(([line]) => line)));
   files.set('invalid/schema.expected.json', json(schemaInvalid.map(([, reason], i) => ({ line: i + 1, reason }))));
@@ -405,6 +408,8 @@ function buildFixtures(): Map<string, string> {
       'only the links it writes',
     ],
     [rehash({ ...parse(proposals[1]), author: 'system' }), 'a proposal with an anonymous author', 'anonymous'],
+    [rehash({ ...transitionLine, author: 'migration' }), "'migration' authoring a TRANSITION", 'reserved'],
+    [rehash({ ...transitionLine, author: 'detector:supersession' }), 'a detector authoring a TRANSITION', 'reserved'],
   ];
   files.set('invalid/codec.jsonl', jsonl(codecInvalid.map(([line]) => line)));
   files.set('invalid/codec.expected.json', json(codecInvalid.map(([, reason, error], i) => ({ line: i + 1, reason, error }))));
@@ -632,6 +637,17 @@ describe('invalid fixtures', () => {
       expect(schemaValid(line), `line ${i + 1} (${want[i].reason}): ${ajv.errorsText(validate.errors)}`).toBe(true);
       expect(() => decodeWikiLine(line), `line ${i + 1} (${want[i].reason})`).toThrow(new RegExp(want[i].error));
     }
+  });
+
+  // F7: admission only checked Date.parse, which rolls February 30 over, so
+  // the ledger could store, and export, a ts schema-validating readers refuse
+  it('the ledger refuses a createdAt naming no real time, as the format does', () => {
+    const ledger = fresh();
+    const uv = { assertion: 'The cache is shared.', basis: 'a trace', verifyBy: { kind: 'ask' as const, value: 'ops' } };
+    for (const timestamp of ['2026-02-30T10:00:00.000Z', '2026-09-01T24:00:00Z', '2026-09-01T10:00:00+24:00']) {
+      expect(() => ledger.assertUv(uv, { author: 'sam', timestamp }), timestamp).toThrow(/real time/);
+    }
+    expect(ledger.assertUv(uv, { author: 'sam', timestamp: '2028-02-29T23:59:59.999+05:30' }).createdAt).toBe('2028-02-29T23:59:59.999+05:30');
   });
 
   it('invalid/chain-*.jsonl: valid lines that are not one stream; the import writes nothing', () => {
