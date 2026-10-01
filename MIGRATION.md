@@ -12,7 +12,7 @@
 6. **Notary UIs and scripts** that sign, dismiss, override, strike, rule, assert TBs, or import and export the wiki over MCP: point them at a `--profile operator` server, the REST notary routes, or `stenographer notarize`. Consider a `--signer-registry`. See [Tools that moved to the operator profile](#tools-that-moved-to-the-operator-profile).
 7. **REST clients:** send `Authorization: Bearer <token>` (from `<state dir>/rest-token` or `STENOGRAPHER_REST_TOKEN`), and add `--rest-allow-host` for any `Host` name other than loopback. See [REST, delivery and session identity](#rest-delivery-and-session-identity).
 8. **Webhook receivers:** verify the Standard Webhooks headers instead of `X-Stenographer-Signature`, use a secret of at least 24 bytes, and configure the final URL (redirects now fail). See [Webhook signatures](#rest-delivery-and-session-identity).
-9. **Wiki files:** move them into the wiki directory (`--wiki-dir`, default `wiki/` next to the state file), call the tools with `file` instead of `path`, and give each writer a file of its own. v1 files are still read, but their TBs arrive as proposals. See [Team wiki: truth format v2](#team-wiki-truth-format-v2).
+9. **Wiki files:** move them into the wiki directory (`--wiki-dir`, default `wiki/` next to the state file), call the tools with `file` instead of `path`, and give each writer a file of its own. A tool that appended TBs or UVs to a file stenographer also exports (the Swift messenger) submits them to `POST /proposals` instead. v1 files are still read, but their TBs arrive as proposals. See [Team wiki: truth format v2](#team-wiki-truth-format-v2).
 10. **Session ids:** anything keyed on `session_<ms>` now sees the harness's session id or the log's basename. See [Session identity](#session-identity).
 11. **Library users:** read the *Library users* notes in each section below.
 
@@ -144,7 +144,7 @@ The wiki directory is `wiki/` next to the state file. Pass `--wiki-dir <dir>` to
 
 ### One writer per file
 
-Each person's stenographer exports to a file of its own (for example `wiki/<handle>.jsonl`) and imports the others'. Export appends only what its file lacks, and refuses a file holding lines it didn't write, so a shared `truth.jsonl` that several people exported into won't take a 1.0 export: start a file per person. Tools that author truth outside stenographer (the Swift messenger) go through stenographer's API or MCP tools, not the file.
+Each person's stenographer exports to a file of its own (for example `wiki/<handle>.jsonl`) and imports the others'. Export appends only what its file lacks, and refuses a file holding lines it didn't write, so a shared `truth.jsonl` that several people exported into won't take a 1.0 export: start a file per person. Tools that author truth outside stenographer (the Swift messenger) go through stenographer's API or MCP tools, not the file: they submit a PROPOSAL envelope to `POST /proposals` for a person to notarize (see [REST](#rest-delivery-and-session-identity)).
 
 `since` exports still work but are deprecated: pass `sinceSeq` with the `lastSeq` of your previous export.
 
@@ -163,7 +163,7 @@ If you use a signer registry, list your teammates in it: with one, a TB from the
 - `exportWikiEntries(ledger, {sinceSeq?, since?})` returns `{lines, count, lastSeq, skipped}` and touches no file; write with `appendWikiFile({dir, file, statePath}, lines)`. `importWikiEntries(ledger, {lines}, {signers?, embeddings?})` takes lines; read them with `readWikiFile({dir, file})`. Neither accepts `path` any more.
 - `entryToWikiLine`, `wikiLineToEntry`, `WikiEntryLine` and `TruthLedger.getExportableEntries` are gone. To read lines, use `decodeWikiLine` and `checkWikiChain`. `TruthLedger.importEntry` takes `(entry, links, opts)`, and `importChange` imports addenda and rulings.
 - Consumers of the format (short-hand, smallchat, smallchat-swift): follow `spec/truth-format/README.md`, and run `spec/truth-format/fixtures/` in your tests. A line's current status is its latest TRANSITION's, else the entry line's own `status`; unknown statuses fail closed.
-- Proposal files: write the v2 PROPOSAL envelope (`kind: "tb"|"uv"`, `signal.source: "compaction-candidate"|"agent"|"detector:<name>"`, chained with `seq`, `prevHash`, `hash`). The bare short-hand dialect and `shorthand-compaction` are still read.
+- Proposal files: write the v2 PROPOSAL envelope (`kind: "tb"|"uv"`, `signal.source: "compaction-candidate"|"agent"|"detector:<name>"`, chained with `seq`, `prevHash`, `hash`). The bare short-hand dialect and `shorthand-compaction` are still read. An id names one envelope: re-exporting it, at any `seq`, is a no-op, and a different envelope under an id already filed is reported as an error.
 
 ## Objections and the pre-dispatch gate
 
@@ -245,6 +245,8 @@ The export is a hash-chained v2 stream, so its signed TBs land as truth in the n
 ## REST, delivery and session identity
 
 **REST needs a bearer token.** Every route, including the notary routes and `GET /proposals`, now needs `Authorization: Bearer <token>`. On first start with REST on, stenographer writes a token to `rest-token` next to the state database (mode 0600) and prints the path. Give its contents to each client: dashboards, scripts (`curl -H "Authorization: Bearer $(cat rest-token)"`), smallchat's notary client (it also still sends `X-Notary-Secret`, and its bodies must be exactly `{notary, edits?}` or `{dismissedBy, reason}`, with `edits` holding only the draft's own fields; anything else is a `400`), and OpenAPPA (`token_env`). To choose the token yourself, set `STENOGRAPHER_REST_TOKEN` (at least 16 characters). To keep 0.x behavior on a trusted machine, pass `--rest-insecure`. Requests must also name an allowed `Host`. Clients that connect to `localhost`, `127.0.0.1` or `[::1]` need nothing extra. If you bind `--rest-host 0.0.0.0` and clients use another name (a container hostname), add `--rest-allow-host <name>`. Library users construct `new RestServer(engine, { token })` (or `{ insecure: true }`).
+
+**New: `POST /proposals`.** A tool that used to append TBs or UVs to a wiki file stenographer also exports (the Swift messenger) now posts each one as a truth format v2 PROPOSAL envelope, with the bearer token and `X-Notary-Secret`, and a person notarizes it with `POST /proposals/:id/notarize`. `seq`, `prevHash` and `hash` are optional for a single envelope. The answer is `201 {proposalId}`; re-sending the same envelope answers `200` with the same id, so retries are safe. Give each envelope its own `id`: a different envelope under a used id is a `409`. The envelope's `author` must be a person or an agent (listed as one with `--signer-registry`), and can't notarize its own submission. The README's "Submitting a proposal" has the details.
 
 **Stricter query parameters.** Values that 0.x replaced with defaults (`k=abc`, `n=0`, `depth=-1`, `include=all`) now get 400. Send integers, or leave the parameter out.
 

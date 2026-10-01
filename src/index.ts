@@ -120,8 +120,12 @@ export {
 } from './truth/wiki-file.js';
 export {
   importProposalDrafts,
+  submitProposalEnvelope,
+  ProposalEnvelopeError,
+  ProposalConflictError,
   COMPACTION_DETECTOR,
   type IntakeResult,
+  type FileOutcome,
 } from './truth/intake.js';
 export {
   ObjectionLog,

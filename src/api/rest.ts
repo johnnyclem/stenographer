@@ -30,12 +30,22 @@
  * is configured (it must be a person):
  *   POST /proposals/:id/notarize  {notary, edits?}
  *   POST /proposals/:id/dismiss   {dismissedBy, reason}
+ *
+ * Proposal submission — same secret, for a tool that authors truth outside
+ * stenographer (the Swift messenger; one writer per wiki file): one truth
+ * format v2 PROPOSAL envelope, filed by the proposals-stream intake as an
+ * open proposal that needs a notary. Its author must be a person or an agent
+ * (registered as one, with a signer registry). 201 {proposalId} when filed,
+ * 200 {proposalId} when this envelope id was filed before, 409 for a
+ * different envelope under a filed id:
+ *   POST /proposals               {schemaVersion: 2, type: "PROPOSAL", id, ts, author, kind, draft, …}
  */
 
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from 'node:http';
 import { z } from 'zod';
 import type { Stenographer } from '../core/stenographer.js';
 import { TruthWriteError } from '../truth/ledger.js';
+import { ProposalConflictError, ProposalEnvelopeError } from '../truth/intake.js';
 import { DraftEditsSchema } from '../truth/types.js';
 import { NOTARY_SECRET_HEADER, notarySecretMatches } from '../truth/notary.js';
 import { allowedHostNames, bearerMatches, hostHeaderName, originAllowed } from './auth.js';
@@ -332,13 +342,15 @@ export class RestServer {
 
   /**
    * The notary routes: a person approving (or declining) a proposal from a UI
-   * that holds the notary secret. The agent MCP profile has no tool that
-   * reaches them; the secret itself is only as private as this process's
-   * environment (see the README's threat model).
+   * that holds the notary secret, and that UI submitting a proposal for it.
+   * The agent MCP profile has no tool that reaches them; the secret itself
+   * is only as private as this process's environment (see the README's
+   * threat model).
    */
   private async handleNotary(req: IncomingMessage, res: ServerResponse, path: string): Promise<void> {
+    const submission = path === '/proposals';
     const match = path.match(/^\/proposals\/([^/]+)\/(notarize|dismiss)$/);
-    if (!match) {
+    if (!submission && !match) {
       // Everything else is read-only
       sendJson(res, 405, { error: 'Method not allowed' });
       return;
@@ -354,12 +366,17 @@ export class RestServer {
       sendJson(res, 401, { error: 'invalid or missing notary secret' });
       return;
     }
+    if (submission) {
+      await this.handleSubmission(req, res);
+      return;
+    }
 
     // Malformed requests are the caller's to fix (400, 413), before anything is written
-    const proposalId = decodeSegment(match[1]);
+    const [, id, action] = match!;
+    const proposalId = decodeSegment(id);
     const body = await readJson(req);
     try {
-      if (match[2] === 'notarize') {
+      if (action === 'notarize') {
         const { notary, edits } = parseBody(BODIES.notarize, body);
         sendJson(res, 200, await engine.notarizeProposal(proposalId, notary, edits));
       } else {
@@ -370,6 +387,28 @@ export class RestServer {
       if (err instanceof RequestError) throw err;
       // Ledger rules (contempt, already-signed, invalid literals) are the caller's to fix
       const status = err instanceof TruthWriteError || (err as { name?: string })?.name === 'ZodError' ? 422 : 500;
+      sendJson(res, status, { error: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
+  /**
+   * One PROPOSAL envelope from a tool that authors truth outside
+   * stenographer, filed the way the intake files a proposals stream.
+   * Idempotent by envelope id.
+   */
+  private async handleSubmission(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const envelope = await readJson(req);
+    try {
+      const { outcome, proposal } = await this.engine.submitProposal(envelope);
+      sendJson(res, outcome === 'filed' ? 201 : 200, { proposalId: proposal.id });
+    } catch (err) {
+      if (err instanceof ProposalEnvelopeError) throw new RequestError(400, `Invalid PROPOSAL envelope — ${err.message}`);
+      if (err instanceof ProposalConflictError) {
+        sendJson(res, 409, { error: err.message, proposalId: err.proposal.id });
+        return;
+      }
+      // An author the identity rules or the signer registry refuse
+      const status = err instanceof TruthWriteError ? 422 : 500;
       sendJson(res, status, { error: err instanceof Error ? err.message : String(err) });
     }
   }

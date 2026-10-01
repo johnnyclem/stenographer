@@ -272,6 +272,25 @@ describe('the suite PROPOSAL envelope (truth format v2)', () => {
     expect(importProposalDrafts(store.truth, { lines })).toMatchObject({ filed: [], deduped: 2 });
   });
 
+  // An envelope id names one envelope: the dedupe looked only under the
+  // line's targetRef, so the same id pointing elsewhere was filed twice, and
+  // a changed envelope under a filed id was counted as already filed.
+  it('files an id once wherever it points, and reports a different envelope under a filed id', () => {
+    importProposalDrafts(store.truth, { lines: stream(tb) });
+    const retargeted = importProposalDrafts(store.truth, { lines: stream({ ...tb, targetRef: 'shorthand:tombstone:m6' }) });
+    const changed = importProposalDrafts(store.truth, { lines: stream({ ...tb, draft: { ...tb.draft, claim: 'LOG_BUDGET 30 is dead; it is 200.' } }) });
+    for (const result of [retargeted, changed]) {
+      expect(result).toMatchObject({ filed: [], deduped: 0 });
+      expect(result.errors).toMatchObject([{ line: 1, error: expect.stringMatching(new RegExp(`${tb.id} was already filed .* with different content`)) }]);
+    }
+    expect(store.truth.listProposals()).toHaveLength(1);
+    // The same envelope at another place in another stream is the same envelope
+    const shifted = importProposalDrafts(store.truth, { lines: stream(uv, tb) });
+    expect(shifted).toMatchObject({ errors: [], deduped: 1 });
+    expect(shifted.filed.map((p) => (p.body.meta?.intake as { id: string }).id)).toEqual([uv.id]);
+    expect(store.truth.listProposals()).toHaveLength(2);
+  });
+
   // F3: the spec says readers MUST NOT reject a line for an unknown evidence
   // or verifyBy kind or proposal signal.source; a proposal is never truth.
   it('files a line with values it does not know, recording them for the notary', () => {

@@ -36,6 +36,7 @@ import type { TruthFilter } from '../truth/ledger.js';
 import type { Objection, ObjectionMode, ObjectionStatus, ObjectionStats } from '../truth/objections.js';
 import { createSinkTransport, type ObjectionTransport } from '../truth/delivery.js';
 import { formatProposalNotice, raiseForNotarization } from '../truth/notary.js';
+import { submitProposalEnvelope } from '../truth/intake.js';
 import { ContemptError } from '../truth/ledger.js';
 import { SignerRegistry, resolveIdentity, type SignerRole } from '../truth/identity.js';
 import type {
@@ -1155,6 +1156,19 @@ export class Stenographer implements StenographerAPI {
   ): Promise<TbEntry | UvEntry> {
     const signer = this.resolveIdentity(notary, ['human'], 'notary');
     return this.mintProposal(proposalId, signer, edits, { notarized: true });
+  }
+
+  /**
+   * Files a truth format v2 PROPOSAL envelope that a tool authoring truth
+   * outside stenographer submitted on its own (REST `POST /proposals`), by
+   * the proposals-stream intake: an open proposal that only a person can
+   * turn into truth, by notarizing it. It is filed under the envelope's
+   * author, who must be a person or an agent (listed as one when a signer
+   * registry is configured), so that author can't notarize it. `duplicate`
+   * means this envelope was filed before.
+   */
+  async submitProposal(envelope: Record<string, unknown>): Promise<{ outcome: 'filed' | 'duplicate'; proposal: ProposalEntry }> {
+    return submitProposalEnvelope(this.store.truth, envelope, (author) => this.resolveIdentity(author, ['agent', 'human'], 'author'));
   }
 
   /** Where a notary approves a proposal over REST, when the API is up. */

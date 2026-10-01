@@ -1423,6 +1423,14 @@ export class TruthLedger {
     return rows.map((r) => this.rowToEntry(r) as ProposalEntry);
   }
 
+  /** The proposal the intake filed from the envelope with this id (`meta.intake.id`), whatever became of it. */
+  intakeProposal(envelopeId: string): ProposalEntry | null {
+    const row = this.db
+      .prepare(`SELECT * FROM truth_entries WHERE type = 'PROPOSAL' AND json_extract(body, '$.meta.intake.id') = ? ORDER BY seq LIMIT 1`)
+      .get(envelopeId);
+    return row ? (this.rowToEntry(row) as ProposalEntry) : null;
+  }
+
   /**
    * Stores an embedding for an entry that has none (e.g. imported by a
    * caller without an embedder). The embedding is a cache for ranking, not

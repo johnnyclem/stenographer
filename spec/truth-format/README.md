@@ -12,7 +12,7 @@ This is the contract for truth streams: the JSONL that stenographer's `export_wi
 
 A truth file is UTF-8 JSONL: one JSON object per line, each ending in LF. Readers MUST skip blank lines and MUST count them when they report line numbers.
 
-**One writer per file.** A file holds one writer's stream, and only that writer appends to it. A team shares truth by each member's stenographer exporting to a file of its own (for example `wiki/<handle>.jsonl`) and importing the others'. A tool that authors truth outside stenographer, such as the Swift messenger, writes through stenographer's API or MCP tools, never by appending to a file stenographer exports.
+**One writer per file.** A file holds one writer's stream, and only that writer appends to it. A team shares truth by each member's stenographer exporting to a file of its own (for example `wiki/<handle>.jsonl`) and importing the others'. A tool that authors truth outside stenographer, such as the Swift messenger, writes through stenographer's API or MCP tools, never by appending to a file stenographer exports: it submits a PROPOSAL envelope (`POST /proposals` in stenographer's REST API) for a person to notarize.
 
 **A stream is hash-chained.** Every line carries:
 
@@ -189,7 +189,8 @@ One envelope for every proposal in the suite: short-hand's and smallchat's compa
 - `kind` is `tb` (draft: `claim`, `evidence`, `literals?`) or `uv` (draft: `assertion`, `basis`, `verifyBy`, `contests?`).
 - `signal.source` is `compaction-candidate`, `agent`, or `detector:<name>`.
 - A proposals file is a hash-chained stream like a wiki file, with one writer.
-- Stenographer's intake files each line as an open `PROPOSAL` that only a person can turn into truth, and keeps the envelope's `id`, `author`, `signal.source` and `hash` under `meta.intake`. A line is filed once, by its `id`: re-importing it, after it was signed or dismissed too, files nothing, and envelopes that share a `targetRef` are each filed. A `signal.source`, evidence kind or `verifyBy` kind it doesn't know is kept as written and listed under `meta.intake.unknown`.
+- Stenographer's intake files each line as an open `PROPOSAL` that only a person can turn into truth, and keeps the envelope's `id`, `author`, `signal.source` and `hash` under `meta.intake`. A line is filed once, by its `id`: re-importing it, after it was signed or dismissed too, files nothing, and envelopes that share a `targetRef` are each filed. An `id` names one envelope: the same envelope at another `seq` is the same envelope, and a different one under an `id` already filed is refused (compared as JCS without `seq`, `prevHash` and `hash`). A `signal.source`, evidence kind or `verifyBy` kind it doesn't know is kept as written and listed under `meta.intake.unknown`.
+- An envelope submitted on its own (stenographer's `POST /proposals`) MAY leave out `seq`, `prevHash` and `hash`: it is then read as a stream of one line with `seq` 1. Any of them that is present is checked as in a stream.
 - The older bare short-hand line (`{kind: "tombstone", draft, signal, targetRef?}`) and the `shorthand-compaction` source are still read, and no longer written.
 
 ## Version 1 lines and upgrading
