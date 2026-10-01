@@ -27,11 +27,6 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
     const { runGateCLI } = await import('../dist/truth/gate.js');
     process.exitCode = await runGateCLI(args);
   },
-  init: async (args) => {
-    const [name = 'stenographer'] = args;
-    console.log(`Initializing ${name}...`);
-    console.log(`Run: npx stenographer start <path-to-jsonl>`);
-  },
 };
 
 async function main() {
@@ -63,7 +58,6 @@ Usage:
                                                         (enforce: deny on a hit; shadow, the
                                                         default: record and allow). See README,
                                                         "Pre-dispatch gate"
-  stenographer init [name]                              Initialize a new project
   stenographer -h, --help                               Show help
 
 Options (start):
@@ -107,8 +101,9 @@ Options (start):
                            SMALLCHAT_CHANNEL_SECRET)
       --objection-webhook <url>
                            webhook for harnesses without interrupts: gets
-                           objections in batches (repeatable; HMAC key from
-                           STENOGRAPHER_WEBHOOK_SECRET)
+                           objections in batches (repeatable; Standard
+                           Webhooks signing key from
+                           STENOGRAPHER_WEBHOOK_SECRET, at least 24 bytes)
       --objection-batch-size <n>
                            batch size for --objection-webhook (default: 3)
       --no-mcp-channel     don't push objections to the attached MCP client

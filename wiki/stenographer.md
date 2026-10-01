@@ -9,8 +9,10 @@ sources: [stenographer repo (ground truth), project specification draft (roadmap
 
 > A streaming companion observer for continuous conversation indexing.
 
-**Version:** 0.1.0-alpha.2
+**Version:** 0.1.0-alpha.2 (this page); current release 1.0.0
 **Author:** Johnny Clem
+
+> **Snapshot of 0.1.0-alpha.2, 2026-06-09.** "Current State" below describes that version and is no longer the ground truth. 1.0.0 adds the asserted-truth ledger (TBs, UVs, proposals, hash-chained and verifiable with `stenographer verify`), agent and operator MCP profiles (20 and 28 tools, not 11), real-time objections, the `stenographer gate` PreToolUse hook, truth format v2 wiki sync, OpenAPPA integration, and a REST API that requires a bearer token. The decision pipeline below changed too: fused GraphRAG ranking, embedder pinning (the hashed fallback is opt-in), and checkpointed ingestion. See the [README](../README.md) and [CHANGELOG](../CHANGELOG.md).
 
 **Stenographer** is a background process that continuously reads conversation output (JSONL log files) and maintains a running semantic index — without participating in the conversation.
 

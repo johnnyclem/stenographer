@@ -41,7 +41,7 @@ import { createMcpChannelTransport, type ObjectionSinkConfig } from '../truth/de
 import { startupLedgerCheck } from '../truth/verify-cli.js';
 import type { StenographerConfig, StenographerMode } from '../types.js';
 
-const VERSION = '0.1.0-alpha.2';
+const VERSION = '1.0.0';
 
 export type ToolProfile = 'agent' | 'operator';
 const PROFILES: ToolProfile[] = ['agent', 'operator'];

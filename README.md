@@ -1,22 +1,26 @@
 # Stenographer 🤖
 
 [![CI](https://github.com/johnnyclem/stenographer/actions/workflows/ci.yml/badge.svg)](https://github.com/johnnyclem/stenographer/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.1.0--alpha.2-orange)](https://github.com/johnnyclem/stenographer/releases)
-[![Node](https://img.shields.io/badge/node-%3E%3D20-brightgreen)](https://nodejs.org)
+[![Version](https://img.shields.io/badge/version-1.0.0-blue)](./CHANGELOG.md)
+[![Node](https://img.shields.io/badge/node-%3E%3D22-brightgreen)](https://nodejs.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 
 > MCP court reporter with GraphRAG — a queryable conversation index for AI agents
 
-Stenographer is an MCP server that watches your conversation logs and builds a queryable index in real time. Think of it as a court reporter sitting in the room: it doesn't participate in the conversation, but it's always listening, and it can answer questions about everything that's been said — who decided what, when they changed their mind, and why.
+Stenographer is an MCP server that watches your conversation logs and builds a queryable index in real time. Think of it as a court reporter sitting in the room: unless you ask it to object, it doesn't participate in the conversation, but it's always listening, and it can answer questions about everything that's been said — who decided what, when they changed their mind, and why.
 
 Point it at a JSONL log, and it gives your agent stack a semantic memory: entities, decisions, corrections, and hybrid vector+graph search, all backed by a local SQLite file — no external services required.
 
+On top of the index sits an asserted-truth ledger. When a fact goes stale (a config value bumped, a class deleted), a person signs a tombstone (TB) for the dead value; agents can draft one, but only a person signs it. Stenographer then objects when an agent writes the dead value again, and the optional [pre-dispatch gate](#pre-dispatch-gate) can refuse the tool call before it runs.
+
+Upgrading from 0.1.0-alpha.x? Read [MIGRATION.md](./MIGRATION.md); every change is in the [CHANGELOG](./CHANGELOG.md).
+
 ## Why Stenographer
 
-- **Passive by design** — it never writes back to the conversation or takes actions; it only observes and indexes, so it's safe to attach to any agent loop.
+- **Observes by default** — indexing never writes into the conversation or runs anything. Two opt-in paths act on it: `--objections deliver` pushes objections to the attached MCP client and receivers you configure, and `stenographer gate` in `--mode enforce` denies tool calls (see [Real-time objections](#real-time-objections)).
 - **Decisions don't just vanish when an agent changes its mind** — supersession chains keep the old answer, the new answer, and the provenance linking them, instead of silently overwriting history.
-- **Runs fully local** — embeddings, vector search, and storage all happen on-disk with no API keys and no network calls (see [Offline mode](#offline-mode)).
-- **Two ways in** — MCP over stdio for agent tool calls, REST over HTTP for everything else (dashboards, scripts, curl).
+- **Runs locally** — embeddings, vector search, and storage all happen on disk with no API keys. The network is used once, to download the embedding model (never with `--embeddings hashed`, see [Offline mode](#offline-mode)), and for objection receivers you configure, which must be loopback unless a sink opts in with `allowRemote`.
+- **Several ways in** — MCP over stdio for agent tool calls, REST over HTTP for dashboards and scripts, and CLI commands for the notary, the gate and ledger verification.
 
 ## Features
 
@@ -29,11 +33,34 @@ Point it at a JSONL log, and it gives your agent stack a semantic memory: entiti
 - **Provider Adapters** — `jsonl`, `claude-code`, `anthropic`, `openai`, `generic`, auto-detected from the first lines written (a log created empty waits for its first line)
 - **Resumable Ingestion** — a per-log checkpoint commits with each message, so a restart picks up where the last run stopped instead of re-reading the log (see [Restarts and log rotation](#restarts-and-log-rotation))
 - **Two Query Surfaces** — MCP over stdio, REST over HTTP (GraphQL: roadmap)
+- **Asserted truth ledger** — signed tombstones (TBs) and unverified assertions (UVs) with evidence, in an append-only, hash-chained ledger whose statuses are derived from links (see [Asserted Truth Layer](#asserted-truth-layer-tbuv-v2))
+- **Agent and operator profiles** — the default `agent` MCP profile drafts and never signs; signing, overrides, rulings and wiki import live in the `operator` profile, the REST notary routes and `stenographer notarize` (see [Notarization, identity and the threat model](#notarization-identity-and-the-threat-model))
+- **Ledger verification** — `stenographer verify` re-checks the hash chain and every derived status; `start` refuses a ledger that fails (see [Ledger integrity](#ledger-integrity))
+- **Team wiki** — ledgers sync through append-only, hash-chained JSONL in [truth format v2](./spec/truth-format/README.md), which short-hand, smallchat and smallchat-swift also read (see [Team wiki](#team-wiki-the-truth-format))
+- **Real-time objections** — when assistant output asserts a tombstoned literal, an objection with the TB as its exhibit: recorded in shadow by default, delivered to Claude Code, smallchat or a webhook with `--objections deliver` (see [Real-time objections](#real-time-objections))
 - **Pre-dispatch gate** — `stenographer gate`, a Claude Code `PreToolUse` hook that denies a Write, Edit or Bash call reintroducing a tombstoned literal before it runs, with the TB as the exhibit (see [Pre-dispatch gate](#pre-dispatch-gate))
+- **OpenAPPA integration** — a policy battery for every MCP tool, and a context provider that tells OpenAPPA's annotators which TB literals a proposed call asserts (see [OpenAPPA battery](#openappa-battery) and [OpenAPPA context provider](#openappa-context-provider))
+
+## Guarantees and where they stop
+
+Each guarantee below states the property that is enforced, and where it stops. The linked sections give the details.
+
+| Guarantee | What is enforced | Where it stops |
+|---|---|---|
+| **Agents draft, people sign** | In the `agent` profile (the default), no MCP tool mints an active TB, signs with a person's name, or overrides, strikes, dismisses or rules. Those tools aren't served there, and the ledger refuses a resolution that would mint a TB. | Anything that runs as the operator's user can act as the operator: read `STENOGRAPHER_NOTARY_SECRET` or the REST token, edit the MCP config to `--profile operator`, write the SQLite file, or drive `stenographer notarize` through a pseudo-terminal. `--allow-agent-assert` lets the agent assert TBs under its own identity. ([Threat model](#notarization-identity-and-the-threat-model)) |
+| **Server-bound identity** | Agent-profile writes carry `--agent-identity` (default `agent:<MCP client name>`) and the server's session id; tool arguments can't name anyone. | Operator paths take the signer's name from the caller. `--signer-registry` is an allowlist, not authentication: whoever reaches an operator path can use any listed person's name. Key-based signing is planned for 1.x. |
+| **Contempt of corpus** | A verification, signature or refutation is refused when its actor shares the target's author, signer, drafter or session, comparing identities after Unicode normalization and case-folding. | It compares names and sessions. One person writing under two unlisted names isn't caught. |
+| **Append-only, tamper-evident ledger** | Entries are inserted, never updated. Status is derived from links. Every entry is hash-chained (SHA-256 over RFC 8785 JSON), and `stenographer verify` (and `start`, before serving) detects an entry or link that was edited, reordered, or inserted or deleted anywhere but the end, and a cached status its links don't justify. | Deleting the newest entries, or rewriting from some entry on and recomputing every later hash, is caught only by comparing with a head hash kept outside the state file. The chain shows *that* the ledger changed, not *who* wrote an entry. ([Ledger integrity](#ledger-integrity)) |
+| **Idempotent ingestion** | A log line and everything derived from it commit in one SQLite transaction with the log's checkpoint, so a restart resumes after the last applied line and re-reading a line derives nothing twice. | Within one state database. Ids for formats without their own (`openai`, `anthropic`, `generic`) hash the log path, offset and line, so the same line in a different file is a different message. ([Restarts](#restarts-and-log-rotation)) |
+| **Objections and the gate** | Only TBs that declare `literals` object. Matching is by exact token within a clause, over what a tool call asserts. The gate in `enforce` mode denies a matching Write, Edit, MultiEdit, NotebookEdit or Bash call within its time budget. | Precision over recall: paraphrases, values computed at runtime, content a tool's input doesn't carry, and shell commands the classifier misreads get through. Objections arrive after the write; the gate is a guardrail against accidents, not a security boundary, and anyone who can edit `settings.json` can remove it. ([Pre-dispatch gate](#pre-dispatch-gate)) |
+| **Team wiki** | Import is all-or-nothing and admits each line like a live write. A TB lands as truth only when it is a hash-chained v2 line and signed (by a listed signer, with a registry). The chain shows lines unchanged and complete up to the last one read. | The chain doesn't show who wrote a line, or that trailing lines were removed. Without a registry, any accountable name is accepted. ([Team wiki](#team-wiki-the-truth-format)) |
+| **REST access** | Every route checks the `Host` (DNS rebinding), a cross-site `Origin`, and a bearer token, and binds to 127.0.0.1 by default. | A process running as you can read the token file. `--rest-insecure` drops the token. ([REST API](#rest-api-daemon-mode-or---rest-port)) |
+| **OpenAPPA battery** | In an OpenAPPA-protected session, every ledger write but a draft needs a trusted session, and acts in a person's name need that person's approval. | Only with OpenAPPA 0.30.0 and the battery installed. The REST API and the terminal notary are outside it. ([OpenAPPA battery](#openappa-battery)) |
+| **Extraction quality** | Precision and recall on a labeled corpus are floored in CI (0.95 / 0.90). | The corpus is a 46-turn development set, not a benchmark. Extraction is pattern-based. |
 
 ## Requirements
 
-- Node.js >= 20
+- Node.js >= 22
 
 ## Install
 
@@ -44,20 +71,38 @@ npm install @stenographer/core
 ## Quick Start
 
 ```bash
-# Tail a conversation log and serve MCP over stdio
-npx stenographer start ./conversation.jsonl
+# Tail a conversation log and serve MCP over stdio (agent profile)
+npx -y @stenographer/core start ./conversation.jsonl
 
-# Daemon mode: also serve the REST API on :8787
-npx stenographer start ./conversation.jsonl ./state.db --mode daemon
+# Daemon mode: also serve the REST API on :8787 (bearer token in ./rest-token)
+npx -y @stenographer/core start ./conversation.jsonl ./state.db --mode daemon
 
 # Watch a directory of Claude Code session logs
-npx stenographer start ~/.claude/projects/myproj --mode watch --adapter claude-code
+npx -y @stenographer/core start ~/.claude/projects/myproj --mode watch --adapter claude-code
 
 # Index a completed log once (no file watcher)
-npx stenographer start ./finished.jsonl --mode catchup
+npx -y @stenographer/core start ./finished.jsonl --mode catchup
 
 # Fully offline (no model download)
-npx stenographer start ./conversation.jsonl --embeddings hashed
+npx -y @stenographer/core start ./conversation.jsonl --embeddings hashed
+
+# Check the truth ledger's hash chain and statuses
+npx -y @stenographer/core verify ./stenographer.db
+```
+
+Once `@stenographer/core` is installed, the binary is `stenographer` (`node_modules/.bin/stenographer`). An unscoped `npx stenographer` runs a different npm package.
+
+In an MCP client config (Claude Code's `.mcp.json`, for example):
+
+```json
+{
+  "mcpServers": {
+    "stenographer": {
+      "command": "npx",
+      "args": ["-y", "@stenographer/core", "start", "./conversation.jsonl", "./stenographer.db"]
+    }
+  }
+}
 ```
 
 ### CLI Options
@@ -103,6 +148,8 @@ Vectors from two embedders aren't comparable, so the state database records the 
 
 ## MCP Tools
 
+A server runs one profile (`--profile`): `agent` (the default) serves 20 tools, 21 with `--allow-agent-assert`, and `operator` serves 28. The index tools below are served in both.
+
 | Tool | Description |
 |------|-------------|
 | `get_recent_messages` | Get N most recent messages |
@@ -111,11 +158,11 @@ Vectors from two embedders aren't comparable, so the state database records the 
 | `get_decisions` | Get active (non-superseded) decisions |
 | `get_decision_history` | Full decision history including superseded versions |
 | `get_decision_chain` | Walk one supersession chain, oldest → current |
-| `get_corrections` | Get all corrections/tombstones |
+| `get_corrections` | Get the index's supersession tombstones (closed decisions; not ledger TBs) |
 | **`search_conversation`** | **GraphRAG hybrid search: fused vector, entity-graph and recency ranks** (`k` ≤ 200) |
 | `search_similar` | Pure vector search over the persistent index (`k` ≤ 200) |
 | `get_context_frame` | Entities, active decisions and recent messages within a token budget |
-| `get_status` | Statistics, vector backend, mode |
+| `get_status` | Statistics, version, vector backend, embedder, mode, profile and agent identity, objection stats |
 
 ### Truth-layer tools (TB/UV v2)
 
@@ -225,7 +272,7 @@ What gets mined is a heuristic (Tier 0 patterns), applied sentence by sentence t
 
 ## Asserted Truth Layer (TB/UV v2)
 
-The tombstone pipeline is split into **detection** (automatic, proposal-only) and **assertion** (accountable, signed). Machines detect; authors assert — no inferred write ever lands as truth.
+The tombstone pipeline is split into **detection** (automatic, proposal-only) and **assertion** (accountable, signed). Machines detect; authors assert. Detectors (supersession, wiki reconciliation, proposal intake) only file `PROPOSAL`s, which become truth when someone signs them. The one exception is `backfill_legacy_tombstones`, an operator tool that turns 0.x auto-closed supersessions into TBs authored by `migration`, unsigned, without literals (so they never object), and queryable as second-class.
 
 Five record types live in one append-only, hash-chained ledger (`truth_entries`, exported to wiki JSONL):
 
@@ -241,17 +288,17 @@ The ledger also writes `MARKER` entries about itself; today the only one is `cha
 
 **Evidence.** A `command` a caller says it ran, with the output it says it saw, is a claim: it is recorded as `claimed-command`. Only a check stenographer executed itself would be recorded as `command` and sign for itself, and 1.0 ships no runner — so every resolution that mints a TB needs a person's signature and a promotion ruling.
 
-**Override protocol** (force semantics, enforced at the storage layer): flipping an active TB requires either a contesting UV (`contests` — TB becomes `contested` but stays truth) or a proven addendum with evidence (`overrides`). Refuting a contest closes that contest only: an overridden TB stays overridden. There is no third path, and no path at all for anonymous writes — generic identities (`system`, `assistant`, …) and identities with control characters are rejected at the schema level, and `migration` and `detector:*` are reserved for the backfill and detector paths, as author and as signer.
+**Override protocol** (force semantics): flipping an active TB requires either a contesting UV (`contests` — TB becomes `contested` but stays truth) or a proven addendum with evidence (`overrides`). Refuting a contest closes that contest only: an overridden TB stays overridden. The ledger's admission check enforces this on every append, live writes and wiki imports alike: there is no third path, and no path for anonymous writes. Generic identities (`system`, `assistant`, …) and identities with control characters are rejected, and `migration` and `detector:*` are reserved for the backfill and detector paths, as author and as signer. A program that writes the SQLite file directly bypasses the admission check; `stenographer verify` reports the change unless the writer recomputed the hash chain (see [Ledger integrity](#ledger-integrity)).
 
-**Contempt of corpus**: corroboration must be provenance-independent. A `verifies`/`signs`/`refutes` whose actor — the resolver *and* any signer — shares the author, signer, drafter or agent session of its target is rejected at write time — three subagents affirming their parent's UV is one opinion wearing three hats. Identities compare canonically (Unicode NFKC, invisible characters removed, trimmed, case-folded), so `Alice`, ` alice ` and `ａｌｉｃｅ` are one person. Refuting a contest can return its TB to active, so the TB's own author, signer or drafter can't be the one to refute it (conceding, by verifying the contest, is allowed).
+**Contempt of corpus**: corroboration must be provenance-independent (by name and session; it can't tell one person using two unlisted names). A `verifies`/`signs`/`refutes` whose actor — the resolver *and* any signer — shares the author, signer, drafter or agent session of its target is rejected at write time — three subagents affirming their parent's UV is one opinion wearing three hats. Identities compare canonically (Unicode NFKC, invisible characters removed, trimmed, case-folded), so `Alice`, ` alice ` and `ａｌｉｃｅ` are one person. Refuting a contest can return its TB to active, so the TB's own author, signer or drafter can't be the one to refute it (conceding, by verifying the contest, is allowed).
 
-**Rollout** is governed by `truthMode`:
+**Rollout** is governed by `truthMode` (`StenographerConfig.truthMode`; `stenographer start` has no flag for it and runs `shadow`):
 - `shadow` (default, Phase 0): auto-close keeps working *and* every detection lands as a proposal — observe quality, tune.
 - `assert` (Phase 1): auto-close is disabled; detection is proposal-only, and signing a proposal is what closes the superseded decision. `backfill_legacy_tombstones` migrates pre-assertion supersessions as queryably second-class TBs (`author: migration`).
 
 Downstream consumers get the confidence type in every result, with the consumption rules embedded in the tool descriptions: active TB = ground truth; contested TB = truth with a visible asterisk; open UV = **flag, don't block**; refuted/overridden = history, never citable.
 
-**Proposal intake** (`importProposalDrafts`): external tools — today [short-hand](https://github.com/johnnyclem/short-hand)'s compactor, which exports its L4 candidate invariants and detected corrections as draft JSONL — can file candidates into the ledger. Every line lands as a `PROPOSAL` under a detector identity (`detector:short-hand`); there is no external write path to TB or UV, the detector cannot sign its own intake, and `targetRef` dedupe makes re-imports idempotent. This is the Option B seam from the TB/UV v2 handoff (§13 Q6): format-level interop, no code dependency in either direction. Lines are the suite's PROPOSAL envelope from [truth format v2](./spec/truth-format/README.md#the-proposal-envelope) — `{schemaVersion: 2, seq, type: "PROPOSAL", id, ts, author, kind: "tb"|"uv", draft, targetRef, signal: {source: "compaction-candidate"|"agent"|"detector:<name>"}, prevHash, hash}`, hash-chained like a wiki file and filed once per id, whatever became of it. The older dialects are still read: short-hand's bare `{kind, draft, signal: {source: "compaction-candidate"}}`, and the unversioned envelope with `signal.source: "shorthand-compaction"`. The envelope's own id, author, source and hash are kept under `meta.intake` for traceability; authorship stays with the detector identity.
+**Proposal intake** (`importProposalDrafts`, a library function; no MCP tool or CLI command runs it in 1.0): external tools — today [short-hand](https://github.com/johnnyclem/short-hand)'s compactor, which exports its L4 candidate invariants and detected corrections as draft JSONL — can file candidates into the ledger. Every line lands as a `PROPOSAL` under a detector identity (`detector:short-hand`); intake never writes a TB or UV itself, the detector cannot sign its own intake, and `targetRef` dedupe makes re-imports idempotent. This is the Option B seam from the TB/UV v2 handoff (§13 Q6): format-level interop, no code dependency in either direction. Lines are the suite's PROPOSAL envelope from [truth format v2](./spec/truth-format/README.md#the-proposal-envelope) — `{schemaVersion: 2, seq, type: "PROPOSAL", id, ts, author, kind: "tb"|"uv", draft, targetRef, signal: {source: "compaction-candidate"|"agent"|"detector:<name>"}, prevHash, hash}`, hash-chained like a wiki file and filed once per id, whatever became of it. The older dialects are still read: short-hand's bare `{kind, draft, signal: {source: "compaction-candidate"}}`, and the unversioned envelope with `signal.source: "shorthand-compaction"`. The envelope's own id, author, source and hash are kept under `meta.intake` for traceability; authorship stays with the detector identity.
 
 ### Notarization, identity and the threat model
 
@@ -432,36 +479,41 @@ The context frame (`get_context_frame`, `GET /context-frame`) keeps every sectio
 ┌─────────────────────────────────────────────────────────────┐
 │            JSONL Log File(s) — any supported format          │
 └─────────────────────────┬───────────────────────────────────┘
-                          │ tail (live/catchup/watch/daemon)
+                          │ tail -F (live/catchup/watch/daemon)
                           ▼
 ┌─────────────────────────────────────────────────────────────┐
-│              Tailer + Provider Adapter (auto-detected)       │
+│     Tailer + Provider Adapter (auto-detected), checkpoints   │
 └─────────────────────────┬───────────────────────────────────┘
                           ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                  Core Engine (StenographerAPI)               │
 │  Importance Detector → Structure Extraction → Embedder      │
 │  Decision supersession (tombstones, provenance chains)      │
-│  GraphRAG retriever (entity graph; vectors via sqlite-vec)  │
+│  GraphRAG retriever (fused vector, entity and recency ranks)│
+│  Objection detector (TB literals) → delivery (deliver mode) │
 └─────────────────────────┬───────────────────────────────────┘
                           ▼
 ┌─────────────────────────────────────────────────────────────┐
-│      SQLite: messages, decisions, tombstones, entities,      │
-│      relations + sqlite-vec persistent vector index          │
+│  SQLite (WAL, versioned): messages, decisions, tombstones,   │
+│  entities, relations, checkpoints, sqlite-vec index,         │
+│  truth ledger (hash-chained), objections, delivery state     │
 └─────────────────────────┬───────────────────────────────────┘
                           ▼
-┌──────────────────────────────┬──────────────────────────────┐
-│        MCP Server (stdio)    │     REST API (daemon)        │
-└──────────────────────────────┴──────────────────────────────┘
+┌──────────────────┬──────────────────┬───────────────────────┐
+│ MCP (stdio),     │ REST API         │ CLI: notarize, verify,│
+│ agent | operator │ (daemon / port)  │ gate (PreToolUse hook)│
+└──────────────────┴──────────────────┴───────────────────────┘
 ```
 
 ## Roadmap
 
-- **The Agent Stack** — warm-state handoff to [short-hand](https://github.com/johnnyclem/short-hand) (compaction), [smallchat](https://github.com/johnnyclem/smallchat) (tool dispatch), [agentvault](https://github.com/johnnyclem/agentvault) (deployment). This is a design target, not shipped code — see `wiki/` for the ground-truth/roadmap split and [`docs/ecosystem/`](./docs/ecosystem/executive-summary.md) for a source-verified evaluation of what's actually wired today.
+- **The Agent Stack** — what is wired today, all at the format and transport level (no code dependency in either direction): objections reach agents, and drafts reach the notary, through [smallchat](https://github.com/johnnyclem/smallchat)'s channel bridge; [short-hand](https://github.com/johnnyclem/short-hand)'s compactor files candidates through proposal intake; and short-hand, smallchat and smallchat-swift read the ledger through [truth format v2](./spec/truth-format/README.md). Still a design target: a warm-state handoff to short-hand, and anything with [agentvault](https://github.com/johnnyclem/agentvault). [`docs/ecosystem/`](./docs/ecosystem/executive-summary.md) has the cross-repo evaluation.
+- **Key-based notarization** — the notary signs with a key the server doesn't hold, and a notary-only mode that doesn't index, so the notary secret can live outside the process an agent's MCP host spawns (STENO-T-21)
+- **MCP 2026-07-28** — stenographer uses `@modelcontextprotocol/sdk` 1.x and advertises only what it negotiates; serving the stateless 2026-07-28 revision means moving to the SDK's v2 packages
 - **Tier 1.5 extraction** — local model (Gemma) for high-importance messages, gated by `extractionThreshold`
 - **GraphQL** query surface
 - **Neo4j** persistent graph backend (Cypher builders ship today: `buildVectorCypher`, `buildGraphCypher`)
-- **Agent profiles** — per-agent-type importance weights
+- **Per-agent importance weights** — importance and extraction tuned per agent type
 
 ## Development
 
@@ -473,7 +525,7 @@ npm run lint    # tsc --noEmit
 npm run test:openappa   # OpenAPPA battery checks; skipped without an appa binary
 ```
 
-Tests live in [`test/`](./test), covering the core engine, GraphRAG retriever, embeddings, importance scoring, extraction precision on a labeled corpus, provider adapters, the tailer, the SQLite store, the REST API, and an indexing-time bound. Two tests need the MiniLM weights on disk and are skipped otherwise; set `STENOGRAPHER_TEST_MODEL_CACHE` to a transformers.js cache directory to run them.
+Tests live in [`test/`](./test), covering the core engine, ingestion across restarts, the tailer, provider adapters, extraction precision on a labeled corpus, embeddings and embedder pinning, GraphRAG retrieval, importance scoring, the SQLite store and its migrations, the REST API and its access checks, the truth ledger (authority model, notary, hash chain and `verify`, truth format v2 fixtures, wiki interop, intake), objections and their delivery, the gate, the OpenAPPA battery and context route, and an indexing-time bound. Two tests need the MiniLM weights on disk and are skipped otherwise; set `STENOGRAPHER_TEST_MODEL_CACHE` to a transformers.js cache directory to run them. CI runs lint, tests, build and `test:openappa` on Node 22 and 24.
 
 ## Contributing
 

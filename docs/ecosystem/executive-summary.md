@@ -13,6 +13,8 @@ and
 [`docs/ecosystem/engineering-guide.md`](https://github.com/johnnyclem/AgentVault/blob/main/docs/ecosystem/engineering-guide.md);
 it does not repeat their AgentVault-internal analysis.
 
+**Updated for stenographer 1.0.0 (2026-10).** Statements about stenographer's own code are corrected where 1.0 changed them: it now has format- and transport-level wiring to smallchat, short-hand and OpenAPPA, serves up to 29 MCP tools in two profiles, and can act on a session when configured to (objection delivery, the pre-dispatch gate). Claims about the other repos are left as they were evaluated on 2026-07-01.
+
 ## The four projects, one line each
 
 | Project | Role (per the four-layer thesis) | Confidence |
@@ -34,11 +36,12 @@ Short-Hand   →  working memory  (compacts raw history into an LLM-sized contex
 ```
 
 From Stenographer's own source, the "memory" label is accurate for what's actually shipped:
-Stenographer is a real, tested, passive observer — it tails JSONL logs, extracts entities/decisions,
-embeds messages, and answers queries over an append-only SQLite store. It does not dispatch tools,
-compact context, or execute anything. It never generates its own text or actions, which matches
-"passive observer" precisely — there's no code path in this repo that writes back to the
-conversation it watches.
+Stenographer tails JSONL logs, extracts entities/decisions, embeds messages, and answers queries
+over a local SQLite store. It does not dispatch tools, compact context, or execute anything.
+Since 1.0 it is passive by default rather than always: with `--objections deliver` it pushes
+objections into the watched session (Claude Code channel notifications, smallchat's channel bridge,
+webhooks), and the opt-in `stenographer gate` hook can deny a tool call. It still never generates
+conversation text of its own.
 
 **Correction:** the AgentVault-side guide's data-flow diagram places Short-Hand strictly downstream
 of Stenographer ("Stenographer → warm state → Short-Hand → context → SmallChat → execution →
@@ -48,15 +51,16 @@ exists today in either repo.
 
 ## Key findings, from this repo's vantage
 
-1. **Zero code-level ecosystem wiring in Stenographer.** A case-insensitive search across
-   `src/`, `cli/`, and `test/` for `agentvault`, `smallchat`, `stenograph`, `short-hand`, and
-   `shorthand` returns no hits outside `README.md` and `wiki/*.md`. `package.json` has no
-   dependency on any sibling project. There is no `agentvault` or `smallchat` adapter in
-   `src/indexer/adapters.ts` (the adapter registry is `jsonl`, `claude-code`, `anthropic`, `openai`,
-   `generic` — five, not four; the README's "Provider Adapters" list is accurate). This confirms,
-   from the opposite direction, what the AgentVault-side guide found when it searched *its* repo for
-   Stenographer references: the "ecosystem" is a shared design philosophy and a set of markdown
-   files, not a shipped integration, **on both sides of every edge in the diagram.**
+1. **Format- and transport-level wiring, no code dependency.** (Corrected for 1.0; this finding
+   originally read "zero code-level ecosystem wiring".) `package.json` still has no dependency on
+   any sibling project, and there is no `agentvault` or `smallchat` log adapter (the adapter registry
+   is `jsonl`, `claude-code`, `anthropic`, `openai`, `generic`). But 1.0 does wire to its
+   neighbours through formats and HTTP: objections and proposal notices go to smallchat's channel
+   bridge (`src/truth/delivery.ts`); short-hand's compactor files candidates through proposal intake
+   (`src/truth/intake.ts`); the ledger exports [truth format v2](../../spec/truth-format/README.md),
+   which short-hand, smallchat and smallchat-swift read; the gate files objections under smallchat's
+   canonical call digest (`smallchat.call.v1`); and `integrations/openappa/` plus `POST /appa/context`
+   integrate with OpenAPPA. Nothing connects stenographer to AgentVault.
 
 2. **The Short-Hand↔Stenographer edge is asserted by neither repo's code, and the specific
    "language middleware" claim in the runbook does not match Short-Hand's current README.** This
@@ -71,11 +75,13 @@ exists today in either repo.
    downgraded from "documented integration" to "plausible pairing with no adapter code on either
    side, and no README claim of readiness on Short-Hand's side either."
 
-3. **Stenographer's own MCP tool and REST surfaces match what the AgentVault-side guide assumed.**
-   The AgentVault engineering guide's description of 13 MCP-ish tools (11, actually — see the table
-   in the companion engineering guide) and REST routes (`/status`, `/messages`, `/entities`,
-   `/search`, `/graphrag`, etc.) lines up with `src/mcp/server.ts` and `src/api/rest.ts` as they
-   exist today. No corrections needed there.
+3. **Stenographer's own MCP tool and REST surfaces have grown past what the AgentVault-side guide
+   assumed.** (Corrected for 1.0.) The guide described 13 MCP-ish tools; 0.1.0-alpha had 11. 1.0
+   serves up to 29 in two profiles: 20 in the default `agent` profile (the 11 index tools, six
+   truth-ledger reads, `propose_tombstone`, `assert_uv` and `resolve_uv`) and 28 in the `operator` profile (signing, overrides, rulings,
+   wiki import/export). The REST read routes (`/status`, `/messages`, `/entities`, `/search`,
+   `/graphrag`, etc.) are still there, joined by `/flags`, `/proposals`, the notary `POST` routes
+   and `POST /appa/context`, and every route needs a bearer token and an allowed `Host`.
 
 4. **Maturity signal check on the two repos this session could reach publicly:**
    Short-Hand shows 0 stars, no published release, and — notably — its GitHub default branch

@@ -9,38 +9,48 @@ Short-Hand are drawn from public READMEs, GitHub repo pages, and AgentVault's ow
 and
 [executive summary](https://github.com/johnnyclem/AgentVault/blob/main/docs/ecosystem/executive-summary.md).
 
+**Updated for stenographer 1.0.0 (2026-10).** The component table, tool and REST surfaces, data
+flow and verdicts below are corrected where 1.0 changed stenographer's code; line numbers are
+dropped because they no longer hold. Claims about the other repos are left as evaluated on
+2026-07-01.
+
 ## 1. Component reference — Stenographer (verified, this repo)
 
 | Component | File | Role |
 |---|---|---|
 | Core engine (`StenographerAPI` impl) | `src/core/stenographer.ts` | Owns lifecycle, modes, indexing pipeline, all query methods |
-| CLI/MCP server entry | `src/mcp/server.ts` | Wraps the engine in 11 MCP tools over stdio; also the `runCLI` entry point |
-| REST server | `src/api/rest.ts` | Thin `node:http` layer exposing the same query surface over HTTP |
-| CLI shim | `cli/index.ts` | `stenographer start\|init` — parses subcommand, delegates to `runCLI` |
+| CLI/MCP server entry | `src/mcp/server.ts` | Wraps the engine in MCP tools over stdio, one profile per server (`agent`: 20 tools, `operator`: 28); also the `runCLI` entry point |
+| REST server | `src/api/rest.ts`, `src/api/auth.ts` | `node:http` layer exposing the query surface, the notary routes and the OpenAPPA context route, behind a bearer token and a `Host` allowlist |
+| CLI shim | `cli/index.ts` | `stenographer start\|proposals\|notarize\|verify\|gate` — parses the subcommand and delegates |
 | Provider adapters | `src/indexer/adapters.ts` | `jsonl`, `claude-code`, `anthropic`, `openai`, `generic`; auto-detected via `detectAdapter` |
 | Tailer | `src/indexer/tailer.ts` | File-tail primitive + `JsonlAdapter`/`LogAdapter` interface |
 | Importance scoring | `src/indexer/importance.ts` | Three-signal model: state delta (45%), reference frequency (25%), trajectory discontinuity (30%) |
-| Embeddings | `src/indexer/embeddings.ts` | `all-MiniLM-L6-v2` via `@huggingface/transformers`, offline hashed-lexical fallback |
-| GraphRAG retriever | `src/indexer/graphrag.ts` | Entity-graph traversal + vector merge/re-rank |
-| Persistence | `src/store/index.ts` | `better-sqlite3` + `sqlite-vec` KNN index, brute-force cosine fallback |
+| Embeddings | `src/indexer/embeddings.ts` | `all-MiniLM-L6-v2` via `@huggingface/transformers`, or the offline hashed-lexical embedder; the state database is pinned to one, and the fallback to hashed is opt-in (`--embeddings auto`) |
+| GraphRAG retriever | `src/indexer/graphrag.ts` | Reciprocal rank fusion of vector, entity-graph and recency ranks; returns messages only |
+| Persistence | `src/store/index.ts`, `src/store/migrations.ts` | `better-sqlite3` + `sqlite-vec` KNN index (brute-force cosine fallback), WAL, versioned migrations, ingest checkpoints |
+| Truth ledger | `src/truth/` | Hash-chained TB/UV ledger (`ledger.ts`, `chain.ts`, `status.ts`), notary paths, objections and their delivery, wiki import/export (truth format v2), proposal intake, and the `PreToolUse` gate (`gate.ts`) |
 | Types / public contract | `src/types.ts` | `StenographerAPI`, `ConversationMessage`, `Decision`, `Tombstone`, `EntityNode`, `EntityRelation`, `StenographerConfig` |
 
-### MCP tool surface (`src/mcp/server.ts:53-138`)
+### MCP tool surface (`src/mcp/server.ts`)
 
-`get_recent_messages`, `get_entities`, `get_relations`, `get_decisions`, `get_decision_history`,
-`get_decision_chain`, `get_corrections`, `search_conversation`, `search_similar`,
-`get_context_frame`, `get_status` — **11 tools**, matching the README's table exactly.
-(The AgentVault-side engineering guide's summary said "13 MCP tools"; the actual count in this
-repo's source is 11 — a minor correction, noted here so it doesn't propagate further.)
+The index tools `get_recent_messages`, `get_entities`, `get_relations`, `get_decisions`,
+`get_decision_history`, `get_decision_chain`, `get_corrections`, `search_conversation`,
+`search_similar`, `get_context_frame` and `get_status` (11, the whole 0.1.0-alpha surface) are
+served in both profiles, with six truth-ledger reads. The `agent` profile (default) adds
+`propose_tombstone`, `assert_uv` and `resolve_uv` (20 tools; `assert_tombstone` too with
+`--allow-agent-assert`). The `operator` profile adds the notary and judicial tools and wiki
+import/export instead (28 tools). The README's tables list them all.
 
-### REST surface (`src/api/rest.ts:6-16, 72-146`)
+### REST surface (`src/api/rest.ts`)
 
 `GET /status`, `/messages`, `/entities`, `/relations`, `/decisions`, `/decisions/history`,
-`/decisions/:id/chain`, `/tombstones`, `/search`, `/graphrag`, `/context-frame` — read-only, no
-auth, `node:http` only (no framework dependency). Only served in `daemon` mode or when
+`/decisions/:id/chain`, `/tombstones`, `/search`, `/graphrag`, `/context-frame`, `/flags`,
+`/proposals`, plus `POST /proposals/:id/notarize`, `POST /proposals/:id/dismiss` (with
+`X-Notary-Secret`) and `POST /appa/context` (read-only). Every route needs a bearer token and an
+allowed `Host`. `node:http` only (no framework dependency). Only served in `daemon` mode or when
 `--rest-port` is passed.
 
-### Modes (`src/core/stenographer.ts:69-` and `cli/index.ts:36-40`)
+### Modes (`src/core/stenographer.ts`)
 
 `live` (tail + serve), `catchup` (index once, no watcher), `watch` (directory of `*.jsonl`, one
 session per file), `daemon` (live + REST, default port 8787).
@@ -57,17 +67,20 @@ Provider adapter (auto-detected: jsonl/claude-code/anthropic/openai/generic)
    │
    ▼
 Core engine: importance scoring → structure extraction (entities/decisions/corrections) → embed
+   │                                   └─ objection detector (TB literals) ─→ delivery (deliver mode)
+   ▼
+SQLite (messages, decisions, tombstones, entities, relations, checkpoints, truth ledger,
+        objections) + sqlite-vec vector index
    │
    ▼
-SQLite (messages, decisions, tombstones, entities, relations) + sqlite-vec vector index
-   │
-   ▼
-MCP (stdio)  ──┬──  REST (daemon mode)
+MCP (stdio, agent | operator)  ──┬──  REST (daemon mode)  ──┬──  CLI: notarize, verify, gate
 ```
 
-This loop is entirely self-contained. Nothing in it calls out to Short-Hand, SmallChat, or
-AgentVault, and nothing in those three repos' public docs describes calling into Stenographer via
-a shipped client — see Key Finding 1 in the executive summary.
+The indexing loop is self-contained: it calls no sibling code. In 1.0 two edges leave it, both
+configured by the operator: objection and proposal delivery POSTs to smallchat's channel bridge
+(or a webhook), and the ledger's wiki export and proposal intake exchange truth format v2 files
+with short-hand and smallchat. Nothing calls out to AgentVault — see Key Finding 1 in the
+executive summary.
 
 **As diagrammed by the AgentVault-side guide (aspirational, unchanged by this evaluation):**
 
@@ -86,10 +99,10 @@ either changes.
 
 | Claim (AgentVault-side guide) | Verdict | Detail |
 |---|---|---|
-| "13 MCP tools" | **Refuted (minor)** | Actual count is 11. See `src/mcp/server.ts:53-138`. |
-| REST daemon on port 8787 with `/status`, `/messages`, `/entities`, `/search`, `/graphrag` | **Confirmed** | `src/api/rest.ts`; default port set in `src/core/stenographer.ts:31` (`DEFAULT_DAEMON_REST_PORT = 8787`). |
-| Decision tombstone/supersession semantics, append-only | **Confirmed** | `src/core/stenographer.ts` supersede logic + `DEFAULT_SUPERSEDE_THRESHOLD = 0.45` at line 30, calibrated against MiniLM as described. |
-| Local `all-MiniLM-L6-v2` embeddings, offline fallback | **Confirmed** | `src/indexer/embeddings.ts`. |
+| "13 MCP tools" | **Refuted (minor)** | 0.1.0-alpha had 11. 1.0 serves 20 (`agent` profile) or 28 (`operator`), 29 distinct. See `src/mcp/server.ts`. |
+| REST daemon on port 8787 with `/status`, `/messages`, `/entities`, `/search`, `/graphrag` | **Confirmed** | `src/api/rest.ts`; default port `DEFAULT_DAEMON_REST_PORT = 8787` in `src/core/stenographer.ts`. Since 1.0 every route needs a bearer token. |
+| Decision tombstone/supersession semantics, append-only | **Confirmed** | `src/core/stenographer.ts` supersede logic. Since 1.0 the threshold is per embedder (MiniLM 0.45, hashed 0.75), calibrated on `test/fixtures/supersession-pairs.json`. |
+| Local `all-MiniLM-L6-v2` embeddings, offline fallback | **Confirmed, with a 1.0 change** | `src/indexer/embeddings.ts`. The fallback to hashed is opt-in (`--embeddings auto`); a model that can't load is an error. |
 | Five modes: `live`, `catchup`, `watch`, `daemon`, + adapter auto-detect | **Partially refuted (wording)** | Four *modes* (`live`/`catchup`/`watch`/`daemon`); adapter auto-detection is a fifth *feature*, not a fifth mode. Functionally accurate, just miscategorized in the AgentVault-side summary. |
 | Zero references to Stenographer in AgentVault's repo | **Consistent** (this repo can't verify AgentVault's source, but the converse holds: zero references to AgentVault in this repo either) | Confirms the relationship is symmetric — neither side has built the bridge. |
 | Stenographer positioned as "the memory" layer | **Confirmed as an accurate label for current scope** | No dispatch, no compaction, no execution logic anywhere in `src/`. |

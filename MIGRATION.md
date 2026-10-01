@@ -1,4 +1,44 @@
-# Migrating to 1.0
+# Migrating from 0.1.0-alpha.x to 1.0
+
+1.0 is a major release. Most of its breaking changes close audit findings about the truth ledger's authority model, ingestion across restarts and REST exposure; the [CHANGELOG](CHANGELOG.md) lists each one with its finding id. This guide says what to change, in the order to do it.
+
+## Upgrade checklist
+
+1. **Run Node.js 22 or newer**, and use the scoped package name. See [Runtime, package and CLI](#runtime-package-and-cli).
+2. **Back up the state database.** Stop stenographer and copy `stenographer.db`. The first 1.0 start migrates it in place, and a 0.x build can't open it afterwards. See [State database: automatic migration, then verify](#state-database-automatic-migration-then-verify).
+3. **Start with the embedder you used before.** If an offline machine may have fallen back to hashed embeddings under 0.x, add `--reembed` to the first start. See [Extraction and retrieval](#extraction-and-retrieval).
+4. **Verify the ledger** with `npx -y @stenographer/core verify ./stenographer.db`, and keep the head hash it prints somewhere other than the state file.
+5. **Agent MCP configs:** remove `--require-notary` and drop identity arguments (`author`, `signedBy`, `proposedBy`, `dismissedBy`, `agentSessionId`) from agent tool calls. Optionally set `--agent-identity`. See [Agent MCP configs](#agent-mcp-configs).
+6. **Notary UIs and scripts** that sign, dismiss, override, strike, rule, assert TBs, or import and export the wiki over MCP: point them at a `--profile operator` server, the REST notary routes, or `stenographer notarize`. Consider a `--signer-registry`. See [Tools that moved to the operator profile](#tools-that-moved-to-the-operator-profile).
+7. **REST clients:** send `Authorization: Bearer <token>` (from `<state dir>/rest-token` or `STENOGRAPHER_REST_TOKEN`), and add `--rest-allow-host` for any `Host` name other than loopback. See [REST, delivery and session identity](#rest-delivery-and-session-identity).
+8. **Webhook receivers:** verify the Standard Webhooks headers instead of `X-Stenographer-Signature`, use a secret of at least 24 bytes, and configure the final URL (redirects now fail). See [Webhook signatures](#rest-delivery-and-session-identity).
+9. **Wiki files:** move them into the wiki directory (`--wiki-dir`, default `wiki/` next to the state file), call the tools with `file` instead of `path`, and give each writer a file of its own. v1 files are still read, but their TBs arrive as proposals. See [Team wiki: truth format v2](#team-wiki-truth-format-v2).
+10. **Session ids:** anything keyed on `session_<ms>` now sees the harness's session id or the log's basename. See [Session identity](#session-identity).
+11. **Library users:** read the *Library users* notes in each section below.
+
+## Runtime, package and CLI
+
+- **Node.js 22 or newer** (`engines.node` is `>=22`). Node 20 reached end of life in April 2026. CI runs Node 22 and 24.
+- **Run the scoped package.** Use `npx -y @stenographer/core <command>`, or `stenographer <command>` once `@stenographer/core` is installed. `npx stenographer` is a different npm package.
+- **`stenographer init` is removed.** It printed a hint and set nothing up. Start with `stenographer start <log-path> [state-path]`; for the pre-dispatch gate, add the hook from the README's "Pre-dispatch gate".
+
+## State database: automatic migration, then verify
+
+Nothing to run by hand. The first time a 1.0 command opens a pre-1.0 state file, it migrates it in place: `start`, `notarize` and `proposals` run the versioned migrations (`PRAGMA user_version` 0 → 4), and `verify` performs the ledger's part. The migration:
+
+- adds `ingest_checkpoints`, the schema v3 message columns, `index_meta` (the embedder pin), and rebuilds the vector index from the stored embeddings ([Ingestion](#ingestion-checkpoints-deterministic-ids), [Extraction and retrieval](#extraction-and-retrieval));
+- hash-chains the existing truth entries as they are, behind a `chained-at-migration` marker, and re-derives every status from links ([Existing state files](#existing-state-files));
+- rekeys the `objections` table per session ([Objections](#objections-and-the-pre-dispatch-gate));
+- switches the database to WAL mode, so `-wal` and `-shm` files appear next to it. Copy all three when you move a live database, or stop stenographer first.
+
+Then check it:
+
+```bash
+npx -y @stenographer/core verify ./stenographer.db          # exit 0 intact, 1 integrity failure, 2 could not run
+npx -y @stenographer/core verify ./stenographer.db --json   # the same report, machine-readable
+```
+
+Record the head hash it prints outside the state file (a commit, a ticket). A truncated or rewritten ledger won't reproduce it. From now on `stenographer start` runs the same check and refuses to serve a ledger that fails it; `--skip-verify` serves it anyway while you investigate. Every 1.0 opener refuses a database written by a newer stenographer instead of touching it.
 
 ## Truth layer: profiles, identity and notarization
 
