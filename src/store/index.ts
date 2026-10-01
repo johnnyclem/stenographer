@@ -27,6 +27,10 @@ export interface StateStoreOptions {
   dimensions?: number;
 }
 
+/** Everything but the embedding blob, for reads that don't need vectors. */
+const MESSAGE_COLUMNS_WITHOUT_EMBEDDING = `id, session_id, role, content, timestamp, importance_state_delta,
+  importance_reference_freq, importance_trajectory_disc, importance_total, entity_ids, tags, tool_calls, seq`;
+
 /** sqlite-vec's cap on k in one KNN query. */
 const VEC_MAX_K = 4096;
 
@@ -218,8 +222,7 @@ export class StateStore {
   // ─────────────────────────────────────────────────────────
 
   getCheckpoint(source: string): IngestCheckpoint | null {
-    const row = this.db
-      .prepare('SELECT * FROM ingest_checkpoints WHERE source = ?')
+    const row = this.statement('SELECT * FROM ingest_checkpoints WHERE source = ?')
       .get(resolve(source)) as any;
     if (!row) return null;
     return {
@@ -236,8 +239,7 @@ export class StateStore {
   }
 
   saveCheckpoint(checkpoint: Omit<IngestCheckpoint, 'updatedAt'>): void {
-    this.db
-      .prepare(`
+    this.statement(`
         INSERT INTO ingest_checkpoints (source, dev, inode, head_hash, head_length, offset, seq,
           session_id, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -422,11 +424,21 @@ export class StateStore {
     }
   }
 
+  /** A message's position in the ingest order. */
+  getMessageSeq(id: string): number | null {
+    const row = this.statement('SELECT seq FROM messages WHERE id = ?').get(id) as { seq: number } | undefined;
+    return row?.seq ?? null;
+  }
+
   /** Every indexed message (optionally one session's), in ingest order. */
-  *iterateMessages(sessionId: string | null): IterableIterator<IndexedMessage> {
+  *iterateMessages(
+    sessionId: string | null,
+    options: { embeddings?: boolean } = {}
+  ): IterableIterator<IndexedMessage> {
+    const columns = options.embeddings === false ? MESSAGE_COLUMNS_WITHOUT_EMBEDDING : '*';
     const stmt = sessionId
-      ? this.db.prepare('SELECT * FROM messages WHERE session_id = ? ORDER BY seq ASC')
-      : this.db.prepare('SELECT * FROM messages ORDER BY seq ASC');
+      ? this.db.prepare(`SELECT ${columns} FROM messages WHERE session_id = ? ORDER BY seq ASC`)
+      : this.db.prepare(`SELECT ${columns} FROM messages ORDER BY seq ASC`);
     const rows = (sessionId ? stmt.iterate(sessionId) : stmt.iterate()) as IterableIterator<any>;
     for (const row of rows) yield this.rowToMessage(row);
   }
@@ -437,8 +449,7 @@ export class StateStore {
    * time for several formats. Embeddings are left out.
    */
   getRecentMessages(sessionId: string | null, n: number): IndexedMessage[] {
-    const columns = `id, session_id, role, content, timestamp, importance_state_delta, importance_reference_freq,
-      importance_trajectory_disc, importance_total, entity_ids, tags, tool_calls, seq`;
+    const columns = MESSAGE_COLUMNS_WITHOUT_EMBEDDING;
     const stmt = sessionId
       ? this.statement(`SELECT ${columns} FROM messages WHERE session_id = ? ORDER BY seq DESC LIMIT ?`)
       : this.statement(`SELECT ${columns} FROM messages ORDER BY seq DESC LIMIT ?`);
@@ -558,7 +569,7 @@ export class StateStore {
     decision: { id: string; description: string; sourceMessageId?: string; timestamp?: string }
   ): void {
     // Ids are derived from the source line: a re-derived decision is the same row
-    const stmt = this.db.prepare(`
+    const stmt = this.statement(`
       INSERT OR IGNORE INTO decisions (id, session_id, description, timestamp, source_message_id)
       VALUES (?, ?, ?, ?, ?)
     `);
@@ -578,8 +589,7 @@ export class StateStore {
    * "this died". The chain is walkable via superseded_by.
    */
   supersedeDecision(oldId: string, newId: string): void {
-    this.db
-      .prepare('UPDATE decisions SET superseded = 1, superseded_by = ? WHERE id = ?')
+    this.statement('UPDATE decisions SET superseded = 1, superseded_by = ? WHERE id = ?')
       .run(newId, oldId);
   }
 
@@ -590,8 +600,8 @@ export class StateStore {
 
   getActiveDecisions(sessionId: string | null): IndexedDecision[] {
     const stmt = sessionId
-      ? this.db.prepare('SELECT * FROM decisions WHERE session_id = ? AND superseded = 0 ORDER BY timestamp ASC')
-      : this.db.prepare('SELECT * FROM decisions WHERE superseded = 0 ORDER BY timestamp ASC');
+      ? this.statement('SELECT * FROM decisions WHERE session_id = ? AND superseded = 0 ORDER BY timestamp ASC')
+      : this.statement('SELECT * FROM decisions WHERE superseded = 0 ORDER BY timestamp ASC');
 
     const rows = sessionId ? stmt.all(sessionId) : stmt.all();
     return rows.map(this.rowToDecision);
@@ -665,7 +675,7 @@ export class StateStore {
     supersededDecisionId?: string;
     timestamp?: string;
   }): void {
-    const stmt = this.db.prepare(`
+    const stmt = this.statement(`
       INSERT OR IGNORE INTO tombstones (id, session_id, superseded, corrected_to, reason, timestamp,
         source_message_id, superseded_decision_id)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -706,7 +716,7 @@ export class StateStore {
   // ─────────────────────────────────────────────────────────
 
   upsertEntity(entity: EntityNode): void {
-    const stmt = this.db.prepare(`
+    const stmt = this.statement(`
       INSERT INTO entities (id, type, value, first_seen, last_seen, ref_count)
       VALUES (?, ?, ?, ?, ?, 1)
       ON CONFLICT(id) DO UPDATE SET
@@ -718,7 +728,7 @@ export class StateStore {
   }
 
   upsertRelation(relation: EntityRelation): void {
-    const stmt = this.db.prepare(`
+    const stmt = this.statement(`
       INSERT INTO entity_relations (entity_from, entity_to, relation, first_seen, last_seen)
       VALUES (?, ?, ?, ?, ?)
       ON CONFLICT(entity_from, entity_to, relation) DO UPDATE SET

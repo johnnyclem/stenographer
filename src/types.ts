@@ -5,6 +5,7 @@
 
 import { z } from 'zod';
 import type { ObjectionSinkConfig } from './truth/delivery.js';
+import type { Embedder } from './indexer/embeddings.js';
 
 // ─────────────────────────────────────────────────────────────
 // Message Schema (input from JSONL tailer)
@@ -206,6 +207,8 @@ export interface StenographerConfig {
    * the default model with a loud fallback to hashed.
    */
   embeddingModel?: string;
+  /** An embedder instance to use instead of `embeddingModel` (library use). */
+  embedder?: Embedder;
   /**
    * The state database is pinned to the embedder that wrote its vectors,
    * and refuses to open under another. Set this to re-embed every stored

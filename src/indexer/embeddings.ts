@@ -295,6 +295,72 @@ export async function createEmbedder(
 }
 
 // ─────────────────────────────────────────────────────────────
+// What a message is embedded as
+// ─────────────────────────────────────────────────────────────
+
+const TOOL_ARG_CHARS = 200;
+const TOOL_CALL_CHARS = 600;
+
+/**
+ * The text a message is embedded as: its content plus a compact rendering
+ * of its tool calls (name and arguments), so "which files did we edit" or
+ * "which command did we run" can find them. '' when there is nothing.
+ */
+export function embeddingText(message: {
+  content: string;
+  toolCalls?: Array<{ name: string; input: Record<string, unknown> }>;
+}): string {
+  const calls = (message.toolCalls ?? []).map((call) => {
+    const args = Object.entries(call.input ?? {})
+      .map(([key, value]) => {
+        const text = typeof value === 'string' ? value : JSON.stringify(value);
+        return `${key}: ${text === undefined ? '' : text.slice(0, TOOL_ARG_CHARS)}`;
+      })
+      .join(', ');
+    return `${call.name}(${args})`.slice(0, TOOL_CALL_CHARS);
+  });
+  return [message.content, ...calls].filter((part) => part.trim()).join('\n');
+}
+
+export interface ChunkOptions {
+  /** Characters per window (~200-250 MiniLM tokens of English prose). */
+  size?: number;
+  overlap?: number;
+  /** Windows per message; text past them is not embedded. */
+  maxChunks?: number;
+}
+
+/**
+ * Overlapping windows over a long text, broken at whitespace. MiniLM reads
+ * about 256 tokens and silently drops the rest, so a long message embedded
+ * whole is findable only by its opening lines; each window is embedded on
+ * its own and a message scores as its best window.
+ */
+export function chunkText(text: string, options: ChunkOptions = {}): string[] {
+  const size = options.size ?? 1000;
+  const overlap = options.overlap ?? 200;
+  const maxChunks = options.maxChunks ?? 64;
+  if (text.length <= size) return [text];
+
+  const chunks: string[] = [];
+  let start = 0;
+  while (start < text.length && chunks.length < maxChunks) {
+    let end = Math.min(text.length, start + size);
+    if (end < text.length) {
+      const space = text.lastIndexOf(' ', end);
+      if (space > start + size / 2) end = space;
+    }
+    chunks.push(text.slice(start, end));
+    if (end >= text.length) break;
+    let next = Math.max(end - overlap, start + 1);
+    const space = text.indexOf(' ', next);
+    if (space !== -1 && space < end) next = space + 1;
+    start = next;
+  }
+  return chunks;
+}
+
+// ─────────────────────────────────────────────────────────────
 // Simple in-memory vector store (Tier 0, no external DB)
 // ─────────────────────────────────────────────────────────────
 

@@ -16,6 +16,8 @@ import { GraphRAGRetriever, type QueryContext, type RetrievedChunk } from '../in
 import {
   createEmbedder,
   cosineSimilarity,
+  chunkText,
+  embeddingText,
   describeEmbedder,
   sameEmbedder,
   type Embedder,
@@ -120,7 +122,11 @@ export class Stenographer implements StenographerAPI {
     this.sessionId = `session_${Date.now()}`;
     this.store = new StateStore(config.statePath || './stenographer.db');
     this.detector = new ImportanceDetector();
-    this.retriever = new GraphRAGRetriever();
+    // Vector candidates come from the persistent index (chunks, session partitions)
+    this.retriever = new GraphRAGRetriever(undefined, {
+      vectorSearch: (embedding, k, sessionId) =>
+        this.store.searchSimilar(embedding, k, sessionId).map(({ message, score }) => ({ id: message.id, score })),
+    });
     this.supersedeThreshold = config.supersedeThreshold ?? DEFAULT_SUPERSEDE_THRESHOLD;
     this.truthMode = config.truthMode ?? 'shadow';
     this.objectionMode = config.objectionMode ?? 'shadow';
@@ -235,7 +241,7 @@ export class Stenographer implements StenographerAPI {
    */
   private async openEmbedder(): Promise<Embedder> {
     const pinned = this.store.getMeta<EmbedderIdentity>(EMBEDDER_META_KEY);
-    const embedder = await createEmbedder(this.config.embeddingModel, { pinned });
+    const embedder = this.config.embedder ?? (await createEmbedder(this.config.embeddingModel, { pinned }));
     const identity = embedder.identity;
     const legacy = !pinned && this.store.hasEmbeddings();
 
@@ -289,33 +295,32 @@ export class Stenographer implements StenographerAPI {
     );
   }
 
-  /** A message's vectors: none for a message with no text to embed. */
+  /**
+   * A message's vectors, one per window of its content and tool calls;
+   * none when there's nothing to embed. A vector with no direction (text
+   * with no features) is dropped: it would score the same against every
+   * query.
+   */
   private async embedMessage(
-    msg: { content: string },
+    msg: { content: string; toolCalls?: ConversationMessage['toolCalls'] },
     embedder: Embedder = this.embedder!
   ): Promise<number[][]> {
-    if (!msg.content.trim()) return [];
-    return [await embedder.embed(msg.content)];
+    const text = embeddingText(msg);
+    if (!text.trim()) return [];
+    const vectors: number[][] = [];
+    for (const chunk of chunkText(text)) {
+      const vector = await embedder.embed(chunk);
+      if (vector.some((v) => v !== 0)) vectors.push(vector);
+    }
+    return vectors;
   }
 
-  /** Rebuilds the in-memory GraphRAG index from the store. */
+  /** Rebuilds the in-memory GraphRAG graph (messages, mentions, entities) from the store. */
   private async hydrateRetriever(): Promise<void> {
     // Collect first: the store's cursor must not stay open across an await
     const pending: Promise<void>[] = [];
-    for (const m of this.store.iterateMessages(this.scope)) {
-      if (m.embedding.length === 0) continue;
-      pending.push(
-        this.retriever.indexMessage(
-          {
-            id: m.id,
-            role: m.role as ConversationMessage['role'],
-            content: m.content,
-            timestamp: m.timestamp,
-            sessionId: m.sessionId,
-          },
-          m.embedding
-        )
-      );
+    for (const m of this.store.iterateMessages(this.scope, { embeddings: false })) {
+      pending.push(this.retriever.indexMessage(toConversationMessage(m), undefined, retrieverInfo(m)));
     }
     await Promise.all(pending);
     for (const entity of this.store.getEntities(this.scope)) {
@@ -462,7 +467,9 @@ export class Stenographer implements StenographerAPI {
         checkpoint();
       });
       // Now in this session's scope, which the startup hydration didn't cover
-      if (moved && indexed.embedding.length > 0) await this.retriever.indexMessage(msg, indexed.embedding);
+      if (moved) {
+        await this.retriever.indexMessage({ ...toConversationMessage(indexed), sessionId }, undefined, retrieverInfo(indexed));
+      }
       return;
     }
 
@@ -562,7 +569,11 @@ export class Stenographer implements StenographerAPI {
     });
 
     // The in-memory graph follows the committed record
-    await this.retriever.indexMessage(msg, embedding);
+    await this.retriever.indexMessage({ ...msg, sessionId }, embedding, {
+      entityIds: nodes.map((n) => n.id),
+      importance: score.total,
+      seq: this.store.getMessageSeq(msg.id) ?? undefined,
+    });
     for (const node of nodes) {
       this.retriever.indexEntity(node);
     }
@@ -888,48 +899,70 @@ export class Stenographer implements StenographerAPI {
     return this.store.searchSimilar(embedding, k, this.scope).map(({ message }) => toConversationMessage(message));
   }
 
-  /** Hybrid GraphRAG search (vector + entity graph traversal). */
+  /**
+   * Hybrid GraphRAG search: messages ranked by reciprocal rank fusion of
+   * vector similarity, entity-graph evidence, recency and importance.
+   */
   async searchGraphRAG(ctx: QueryContext): Promise<RetrievedChunk[]> {
-    return this.retriever.search(ctx);
+    await this.ensureEmbedder();
+    return this.retriever.search({ ...ctx, sessionId: ctx.sessionId ?? this.scope ?? undefined });
   }
 
+  /**
+   * A markdown frame of the current state for an LLM, within `tokenBudget`
+   * (estimated at 4 characters per token) across every section. Each
+   * section has a share of the budget — recent messages 50%, decisions 35%,
+   * entities 15% — and what one leaves unused passes to the others. Within
+   * a section, items get room in priority order: the newest message, then
+   * the rest of the recent window by importance; the newest decisions; the
+   * most-referenced entities. Messages and decisions are shown in order.
+   */
   async buildContextFrame(tokenBudget: number): Promise<string> {
-    const messages = this.store.getRecentMessages(this.scope, 10).reverse();
-    const decisions = this.store.getActiveDecisions(this.scope);
-    const entities = this.store.getEntities(this.scope);
+    const limit = Math.max(0, Math.floor(tokenBudget)) * CHARS_PER_TOKEN;
+    const recent = this.store.getRecentMessages(this.scope, FRAME_MESSAGE_WINDOW); // newest first
+    const decisions = this.store.getActiveDecisions(this.scope); // oldest first
+    const entities = this.store
+      .getEntities(this.scope)
+      .sort((a, b) => b.references - a.references || b.lastSeen.localeCompare(a.lastSeen));
 
-    const parts: string[] = [];
+    const sections: FrameSection[] = [
+      {
+        header: '## Entities',
+        items: entities.map((e) => `- ${clip(e.value, FRAME_ENTITY_CHARS)} (${e.type})`),
+        priority: entities.map((_, i) => i),
+        share: 0.15,
+      },
+      {
+        header: '## Decisions',
+        items: decisions.map((d) => `- ${clip(d.description, FRAME_ITEM_CHARS)}`),
+        priority: decisions.map((_, i) => decisions.length - 1 - i),
+        share: 0.35,
+      },
+      {
+        header: '## Recent Messages',
+        // Shown oldest first
+        items: [...recent].reverse().map((m) => `${m.role}: ${clip(embeddingText(m), FRAME_ITEM_CHARS)}`),
+        priority: recent
+          .map((m, age) => ({ age, importance: m.importanceScore.total }))
+          .sort((a, b) => (a.age === 0 ? -1 : b.age === 0 ? 1 : b.importance - a.importance || a.age - b.age))
+          .map(({ age }) => recent.length - 1 - age),
+        share: 0.5,
+      },
+    ];
 
-    // Add entities (most compact)
-    if (entities.length > 0) {
-      parts.push(`## Entities\n${entities.map((e) => `- ${e.value} (${e.type})`).join('\n')}`);
-    }
+    // Fill order: messages, decisions, entities — by share, then leftovers
+    const fillOrder = [sections[2], sections[1], sections[0]];
+    let remaining = limit;
+    for (const section of fillOrder) remaining -= fillSection(section, Math.min(remaining, Math.floor(limit * section.share)));
+    for (const section of fillOrder) remaining -= fillSection(section, remaining);
 
-    // Add decisions
-    if (decisions.length > 0) {
-      parts.push(`## Decisions\n${decisions.map((d) => `- ${d.description}`).join('\n')}`);
-    }
-
-    // Add recent messages (most expensive)
-    let currentTokens = estimateTokens(parts.join('\n'));
-    const recentMessages: string[] = [];
-
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const msg = messages[i];
-      const msgText = `\n${msg.role}: ${msg.content.slice(0, 200)}`;
-      const msgTokens = estimateTokens(msgText);
-
-      if (currentTokens + msgTokens > tokenBudget) break;
-
-      recentMessages.unshift(msgText);
-      currentTokens += msgTokens;
-    }
-
-    if (recentMessages.length > 0) {
-      parts.push(`## Recent Messages${recentMessages.join('')}`);
-    }
-
-    return parts.join('\n\n');
+    return sections
+      .filter((section) => section.chosen && section.chosen.size > 0)
+      .map((section) => {
+        const shown = [...section.chosen!].sort((a, b) => a - b).map((i) => section.items[i]);
+        return [section.header, ...shown].join('\n');
+      })
+      .join('\n\n');
   }
 
   async getStatus(): Promise<{
@@ -1341,6 +1374,10 @@ export class Stenographer implements StenographerAPI {
   }
 }
 
+function retrieverInfo(m: IndexedMessage): { entityIds: string[]; importance: number; seq?: number } {
+  return { entityIds: m.entityIds, importance: m.importanceScore.total, seq: m.seq };
+}
+
 function toConversationMessage(m: IndexedMessage): ConversationMessage {
   return {
     id: m.id,
@@ -1372,7 +1409,37 @@ function isAfter(a: string, b: string): boolean {
   return Number.isFinite(ta) && Number.isFinite(tb) && ta > tb;
 }
 
-function estimateTokens(text: string): number {
-  // Rough heuristic: ~4 chars per token
-  return Math.ceil(text.length / 4);
+// Context frame: ~4 characters per token
+const CHARS_PER_TOKEN = 4;
+const FRAME_MESSAGE_WINDOW = 20;
+const FRAME_ITEM_CHARS = 200;
+const FRAME_ENTITY_CHARS = 48;
+
+interface FrameSection {
+  header: string;
+  items: string[];
+  /** Item indexes, most deserving of room first. */
+  priority: number[];
+  share: number;
+  chosen?: Set<number>;
+}
+
+/** Adds the section's items that fit in `allowance` characters, in priority order; returns what they cost. */
+function fillSection(section: FrameSection, allowance: number): number {
+  const chosen = (section.chosen ??= new Set());
+  let spent = 0;
+  for (const index of section.priority) {
+    if (chosen.has(index)) continue;
+    // The first item also pays for the header and the blank line before it
+    const cost = section.items[index].length + 1 + (chosen.size === 0 ? section.header.length + 2 : 0);
+    if (cost > allowance - spent) continue;
+    chosen.add(index);
+    spent += cost;
+  }
+  return spent;
+}
+
+function clip(text: string, max: number): string {
+  const flat = text.replace(/\s+/g, ' ').trim();
+  return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
 }

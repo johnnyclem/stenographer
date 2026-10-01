@@ -29,6 +29,10 @@ import { NOTARY_SECRET_HEADER, notarySecretMatches } from '../truth/notary.js';
 import type { ProposalBody } from '../truth/types.js';
 
 const MAX_BODY_BYTES = 64 * 1024;
+/** Upper bounds for list sizes: larger requests are clamped, not refused. */
+const MAX_K = 200;
+const MAX_MESSAGES = 1000;
+const MAX_DEPTH = 5;
 
 export class RestServer {
   private engine: Stenographer;
@@ -103,7 +107,7 @@ export class RestServer {
         return;
 
       case '/messages': {
-        const n = intParam(url, 'n', 10);
+        const n = intParam(url, 'n', 10, MAX_MESSAGES);
         sendJson(res, 200, await this.engine.getRecentMessages(n));
         return;
       }
@@ -155,7 +159,7 @@ export class RestServer {
           sendJson(res, 400, { error: 'Missing query parameter: q' });
           return;
         }
-        sendJson(res, 200, await this.engine.searchSimilar(q, intParam(url, 'k', 5)));
+        sendJson(res, 200, await this.engine.searchSimilar(q, intParam(url, 'k', 5, MAX_K)));
         return;
       }
 
@@ -170,8 +174,8 @@ export class RestServer {
           200,
           await this.engine.searchGraphRAG({
             query: q,
-            k: intParam(url, 'k', 5),
-            graphDepth: intParam(url, 'depth', 2),
+            k: intParam(url, 'k', 5, MAX_K),
+            graphDepth: intParam(url, 'depth', 2, MAX_DEPTH, 0),
           })
         );
         return;
@@ -283,11 +287,18 @@ async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> 
   return parsed as Record<string, unknown>;
 }
 
-function intParam(url: URL, name: string, fallback: number): number {
+/** An integer query parameter: `fallback` when absent or below `min`, clamped to `max`. */
+function intParam(
+  url: URL,
+  name: string,
+  fallback: number,
+  max: number = Number.MAX_SAFE_INTEGER,
+  min: number = 1
+): number {
   const raw = url.searchParams.get(name);
   if (!raw) return fallback;
   const parsed = Number.parseInt(raw, 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+  return Number.isFinite(parsed) && parsed >= min ? Math.min(parsed, max) : fallback;
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {

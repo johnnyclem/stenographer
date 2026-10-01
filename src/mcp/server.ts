@@ -128,15 +128,16 @@ export class StenographerServer {
         {
           name: 'search_conversation',
           description:
-            'Search the conversation semantically using GraphRAG - hybrid vector + graph search. ' +
+            'Search the conversation with GraphRAG: messages ranked by reciprocal rank fusion of vector ' +
+            'similarity, entity-graph evidence, recency and importance (the evidence is in each result\'s meta). ' +
             'Results include relevant truth-ledger entries (per truthFilter, default "current"). ' +
             CONSUMPTION_RULES,
           inputSchema: {
             type: 'object',
             properties: {
               query: { type: 'string', description: 'Search query' },
-              k: { type: 'number', description: 'Number of results', default: 5 },
-              graph_depth: { type: 'number', description: 'Graph traversal depth', default: 2 },
+              k: { type: 'integer', description: 'Number of results (1-200)', default: 5, minimum: 1, maximum: 200 },
+              graph_depth: { type: 'integer', description: 'Graph traversal depth (0-5)', default: 2, minimum: 0, maximum: 5 },
               truthFilter: {
                 type: 'string',
                 enum: ['current', 'all', 'contested'],
@@ -153,13 +154,15 @@ export class StenographerServer {
             type: 'object',
             properties: {
               query: { type: 'string', description: 'Search query' },
-              k: { type: 'number', description: 'Number of results', default: 5 },
+              k: { type: 'integer', description: 'Number of results (1-200)', default: 5, minimum: 1, maximum: 200 },
             },
           },
         },
         {
           name: 'get_context_frame',
-          description: 'Build a context frame within a token budget for the next LLM call',
+          description:
+            'Build a context frame for the next LLM call: entities, active decisions and recent messages, ' +
+            'all within the token budget (estimated at 4 characters per token)',
           inputSchema: {
             type: 'object',
             properties: {
@@ -577,7 +580,7 @@ export class StenographerServer {
   private async callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
     switch (name) {
       case 'get_recent_messages':
-        return this.engine.getRecentMessages((args.n as number) || 10);
+        return this.engine.getRecentMessages(intArg(args.n, 10, MAX_MESSAGES));
 
       case 'get_entities':
         return this.engine.getEntities();
@@ -602,8 +605,8 @@ export class StenographerServer {
 
       case 'search_conversation': {
         const query = (args.query as string) || '';
-        const k = (args.k as number) || 5;
-        const graphDepth = (args.graph_depth as number) || 2;
+        const k = intArg(args.k, 5, MAX_K);
+        const graphDepth = intArg(args.graph_depth, 2, MAX_DEPTH, 0);
         const truthFilter = (args.truthFilter as TruthFilter) || 'current';
         const results = await this.engine.searchGraphRAG({ query, k, graphDepth });
         const truth = await this.engine.searchTruth(query, k, truthFilter);
@@ -611,7 +614,7 @@ export class StenographerServer {
       }
 
       case 'search_similar':
-        return this.engine.searchSimilar((args.query as string) || '', (args.k as number) || 5);
+        return this.engine.searchSimilar((args.query as string) || '', intArg(args.k, 5, MAX_K));
 
       case 'get_context_frame':
         return this.engine.buildContextFrame((args.budget as number) || 2000);
@@ -813,6 +816,17 @@ export class StenographerServer {
 // ─────────────────────────────────────────────────────────────
 
 const MODES: StenographerMode[] = ['live', 'catchup', 'watch', 'daemon'];
+
+/** Upper bounds for list sizes: larger requests are clamped, not refused. */
+const MAX_K = 200;
+const MAX_MESSAGES = 1000;
+const MAX_DEPTH = 5;
+
+/** An integer argument clamped to [min, max]; `fallback` when absent or not a number. */
+function intArg(value: unknown, fallback: number, max: number, min: number = 1): number {
+  const n = typeof value === 'number' ? Math.floor(value) : Number.parseInt(String(value ?? ''), 10);
+  return Number.isFinite(n) ? Math.max(min, Math.min(n, max)) : fallback;
+}
 
 export async function runCLI(args: string[]): Promise<void> {
   const { positionals, values } = parseArgs({
