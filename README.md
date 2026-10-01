@@ -28,6 +28,7 @@ Point it at a JSONL log, and it gives your agent stack a semantic memory: entiti
 - **Four Modes** — `live`, `catchup`, `watch` (a directory of session logs), `daemon` (live + REST API)
 - **Provider Adapters** — `jsonl`, `claude-code`, `anthropic`, `openai`, `generic`, auto-detected from file content
 - **Two Query Surfaces** — MCP over stdio, REST over HTTP (GraphQL: roadmap)
+- **Pre-dispatch gate** — `stenographer gate`, a Claude Code `PreToolUse` hook that denies a Write, Edit or Bash call reintroducing a tombstoned literal before it runs, with the TB as the exhibit (see [Pre-dispatch gate](#pre-dispatch-gate))
 
 ## Requirements
 
@@ -270,7 +271,7 @@ Teams share truth through JSONL files in a wiki directory (`--wiki-dir`), in [tr
 
 ### Real-time objections
 
-§11 rules on the record after the fact; objections reach the same court earlier — while the transcript is still being written. One detector (*assertion-contradicts-TB*) reads the stream stenographer already tails, backed by an in-memory cache of active TBs, and records an objection whenever **assistant output** asserts a **tombstoned literal**: its prose, and what its tool calls assert (the content of a Write, the new side of an Edit, MultiEdit or NotebookEdit, the parts of a shell command that write something). Searches and reads (Grep, Glob, Read, `grep`, `rg`, `git log -S`), commit messages and the old side of an edit are not read: an agent cleaning up a dead value has to be able to look for it.
+§11 rules on the record after the fact; objections reach the same court earlier — while the transcript is still being written. One detector (*assertion-contradicts-TB*) reads the stream stenographer already tails, backed by an in-memory cache of active TBs, and records an objection whenever **assistant output** asserts a **tombstoned literal**: its prose, and what its tool calls assert (the content of a Write, the new side of an Edit, MultiEdit or NotebookEdit, the parts of a shell command that write something). Searches and reads (Grep, Glob, Read, `grep`, `rg`, `git log -S`), commit messages and the old side of an edit are not read: an agent cleaning up a dead value has to be able to look for it. The [pre-dispatch gate](#pre-dispatch-gate) runs the same matcher before a tool call executes.
 
 Only TBs that declare `literals` can object — an objection can only cite what the record actually contains:
 
@@ -297,6 +298,59 @@ Every objection ships the objection, the exhibit (the full TB, plus any contesti
 | Harnesses without interrupts | `--objection-webhook <url>` → `POST {type: "stenographer.objections", objections: [...]}`, signed `X-Stenographer-Signature: sha256=<hmac>` | Once a batch of 3 is pending |
 
 Delivery state is durable: a partial batch survives a restart, failed deliveries retry, and an objection the judge already ruled on is dropped from the queue. Webhook URLs must be loopback unless a sink sets `allowRemote`, since objections carry transcript lines. Watch mode skips the MCP channel because one connection can't be mapped to the many sessions it watches, so use a smallchat channel or a webhook there. In watch mode each session is named after its log file (`<session-id>.jsonl` → `<session-id>`), which for Claude Code is the session id, so `meta.session_ids` on a channel event is what smallchat's messenger routes by. Stenographer itself still never writes into a conversation: it emits to receivers the operator configured, and they decide what to do.
+
+### Pre-dispatch gate
+
+Objections arrive after the agent has written the dead value. `stenographer gate` stops it before the call runs: it is a Claude Code `PreToolUse` hook that reads the hook's JSON on stdin, takes only what the call asserts (Write `content`; Edit, MultiEdit and NotebookEdit new side; the writing parts of a Bash `command`; never Read, Grep or Glob inputs, never `old_string`), and checks it against the literals of active and contested TBs with the same matcher as live objections.
+
+- **`--mode enforce`**: a hit denies the call (`permissionDecision: "deny"`). The reason tells the agent which TB it contradicts (id, claim, `dead → current`, signer, any contesting UV), quotes the line, and names the objection filed for it, which is on `/flags` like any other.
+- **`--mode shadow`** (default): a hit is filed as a shadow objection (or, when the gate can't write, reported on stderr and in `--log`, which gets one JSON line per hit or error) and the call proceeds.
+- When the gate allows a call it prints nothing, so the call goes through Claude Code's normal permission flow. The gate never grants a permission.
+
+Add it to `.claude/settings.json` (project) or `~/.claude/settings.json` (user):
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit|NotebookEdit|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "npx -y @stenographer/core gate --state \"$CLAUDE_PROJECT_DIR/stenographer.db\" --mode shadow --log \"$CLAUDE_PROJECT_DIR/stenographer-gate.log\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+The hook runs on every matched tool call. `npx -y` resolves the package each time; with `npm install -D @stenographer/core`, use `"$CLAUDE_PROJECT_DIR/node_modules/.bin/stenographer" gate …` instead (about a quarter of a second per call in our measurement: Node 22, startup included, 1,000 literals, a 100 KB write). Point `--state` at the state file your `stenographer start` uses. The gate opens it read-only for TBs and writes only to the objections table, on a hit. Or use `--wiki <file>` to read TBs from a team wiki file. Status is folded per the truth format, and only signed, active or contested TBs count. In that mode there is nowhere to file objections or read rulings.
+
+**Budget.** After startup the gate decides within `--timeout-ms` (default 2000). The value must be below Claude Code's hook timeout, which is 60 s by default; the snippet sets `"timeout": 10`, in seconds. Keep the budget well below the hook's `timeout`: Node startup counts against the hook's timeout, not against the gate's budget. If the gate runs past its budget or fails (no state file, a locked database, input it can't read), `--on-error` decides. The default is `allow` in shadow mode and `deny` in enforce mode. A gate that allows on error exits 1, so Claude Code reports the error without blocking the call.
+
+**Overruling a denial.** If the dead value is intended (a migration test, a fixture), a person overrules the objection named in the denial (`rule_on_objection` in the operator profile, or the messenger). The ruling is scoped to that TB and that exact call, by the suite's canonical call digest of the tool name and its input (`smallchat.call.v1`). Retrying the same call then passes, in any session. Any change to the input is a new call. A sustained objection keeps denying that call, and no second objection is filed. With `--wiki`, the only way past a denial is to override or strike the TB.
+
+**Rolling out: shadow, then enforce.**
+
+1. Run in shadow mode. Every would-be denial is filed as a shadow objection (`list_objections` with `includeShadow`, `get_status` → `objections`).
+2. Have a person rule on them. A sustained objection means the gate caught a real reintroduction. An overruled one is a false positive.
+3. Tune the literals behind the overruled ones: give a bare value a `subject`, narrow a `dead` that's too common, or override TBs that no longer hold. Check a literal with `findLiteralHits` against real snippets before you sign it.
+4. Switch to `--mode enforce` once the sustain rate is where you want it, and you've decided whether a broken gate should block (`--on-error deny`, the enforce default) or let calls through (`--on-error allow`).
+
+It composes with other `PreToolUse` hooks (for example OpenAPPA's policy hook): a deny from any of them blocks the call.
+
+**What the gate does not cover.** It is a guardrail against reintroducing a stale fact by accident. It is not a security boundary against an agent working around it.
+
+- Paraphrases ("the old budget"), values built at runtime (`30` computed or concatenated), and values split across lines or fields.
+- Content a tool's input doesn't carry. This includes a script that writes the value (`./set-budget.sh`), `cp` of a file that contains it, a download, and an MCP tool whose input fields don't look like content. Unknown tools are read through common content field names (`content`, `new_string`, `file_text`, `code`, patches by their added lines). Pass `--tools` to choose which tools the gate reads.
+- Shell commands are classified, not parsed: `eval`, `find -exec`, aliases and command substitution can hide a write, or show one that isn't there.
+- Only the first 1,048,576 characters of each field are read.
+- Prose. The gate sees tool calls only; live objections cover what the agent says.
+- Anyone who can edit `settings.json` can remove the hook.
 
 ## GraphRAG Search
 

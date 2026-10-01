@@ -1,8 +1,9 @@
 /**
  * Stenographer — the tombstoned-literal matcher (§12)
  *
- * One matcher for the live objection engine (objections.ts) and anything
- * else that has to agree with it on what asserts a dead literal.
+ * One matcher, shared by the live objection engine (objections.ts) and the
+ * pre-dispatch gate (gate.ts), so the transcript and the hook agree on what
+ * asserts a dead literal.
  *
  * All active literals compile into one Aho-Corasick automaton over their
  * dead values: a text is read once, however many literals there are, and

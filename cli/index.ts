@@ -22,6 +22,11 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
     const { runVerifyCLI } = await import('../dist/index.js');
     process.exitCode = await runVerifyCLI(args);
   },
+  gate: async (args) => {
+    // Runs on every tool call: load only the gate, not the indexer and models
+    const { runGateCLI } = await import('../dist/truth/gate.js');
+    process.exitCode = await runGateCLI(args);
+  },
   init: async (args) => {
     const [name = 'stenographer'] = args;
     console.log(`Initializing ${name}...`);
@@ -49,6 +54,15 @@ Usage:
                                                         and every status re-derived from links
                                                         (exit 0 intact, 1 integrity failure,
                                                         2 could not run)
+  stenographer gate [--state <path> | --wiki <file>] [--mode shadow|enforce]
+                    [--timeout-ms <n>] [--on-error allow|deny]
+                    [--tools <list>] [--log <file>]
+                                                        Claude Code PreToolUse hook: reads the
+                                                        hook JSON on stdin and checks what the
+                                                        call asserts against active TB literals
+                                                        (enforce: deny on a hit; shadow, the
+                                                        default: record and allow). See README,
+                                                        "Pre-dispatch gate"
   stenographer init [name]                              Initialize a new project
   stenographer -h, --help                               Show help
 
@@ -107,6 +121,20 @@ Options (start):
       --skip-verify        serve even if the truth ledger fails its integrity
                            check (by default start refuses; see
                            'stenographer verify')
+
+Options (gate):
+      --state <path>       state file to read TBs from (read-only) and file
+                           objections in (default: ./stenographer.db)
+      --wiki <file>        read TBs from a wiki JSONL file instead (nowhere
+                           to file objections or read rulings)
+      --mode <mode>        shadow | enforce  (default: shadow)
+      --timeout-ms <n>     budget after startup, below the hook timeout
+                           (default: 2000; at most 59999)
+      --on-error <what>    allow | deny when the gate can't decide in budget
+                           or fails (default: allow in shadow, deny in enforce)
+      --tools <list>       comma-separated tool names to read, or *
+                           (default: Write,Edit,MultiEdit,NotebookEdit,Bash)
+      --log <file>         append a JSON line per hit or error
 
 Examples:
   stenographer start ./conversation.jsonl

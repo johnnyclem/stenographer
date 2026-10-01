@@ -1,0 +1,14 @@
+{
+  "session_id": "8f1c2a7e-5b2d-4c1e-9a0b-3d4e5f6a7b8c",
+  "transcript_path": "/home/dev/.claude/projects/-home-dev-app/8f1c2a7e-5b2d-4c1e-9a0b-3d4e5f6a7b8c.jsonl",
+  "cwd": "/home/dev/app",
+  "permission_mode": "default",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Edit",
+  "tool_input": {
+    "file_path": "/home/dev/app/src/config.ts",
+    "old_string": "export const LOG_BUDGET = 30;",
+    "new_string": "export const LOG_BUDGET = 100;"
+  },
+  "tool_use_id": "toolu_01EditFix"
+}

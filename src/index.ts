@@ -95,7 +95,10 @@ export {
   assertedText,
   compileTombstones,
   ensureObjectionSchema,
+  findGateRuling,
+  gateMessageId,
   type CompiledTombstones,
+  type GateCall,
   type Objection,
   type ObjectionMode,
   type ObjectionStatus,
@@ -110,6 +113,23 @@ export {
   type MatchOptions,
 } from './truth/literal-matcher.js';
 export { assertingFields, shellAssertingText, addedLines, type AssertedField } from './truth/asserting.js';
+export {
+  evaluateGate,
+  runGateCLI,
+  wikiMatchableTombstones,
+  callDigest,
+  harnessToolId,
+  GateTimeoutError,
+  CLAUDE_CODE_HOOK_TIMEOUT_MS,
+  DEFAULT_GATE_TIMEOUT_MS,
+  DEFAULT_GATE_TOOLS,
+  type GateMode,
+  type GateOnError,
+  type GateOptions,
+  type GateHit,
+  type GateResult,
+  type GateIO,
+} from './truth/gate.js';
 export {
   ObjectionDispatcher,
   createSinkTransport,

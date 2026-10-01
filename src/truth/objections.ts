@@ -14,7 +14,8 @@
  * only in assistant output (generated code and concrete plans), and only
  * what a tool call asserts: the new side of an edit, a written file, a
  * shell command that writes (asserting.ts). Not searches, not commit
- * messages, not paraphrases. The matcher lives in literal-matcher.ts.
+ * messages, not paraphrases. The matcher (literal-matcher.ts) is shared
+ * with the pre-dispatch gate (gate.ts).
  *
  * Objections themselves are operational state, not truth: the log lives
  * beside the ledger, and only the *ruling* on an objection enters the
@@ -53,6 +54,19 @@ export interface Objection {
   /** False for shadow-mode objections: recorded and rulable, never emitted on /flags. */
   delivered: boolean;
   rulingId: string | null;
+  /** Set when the pre-dispatch gate raised it, before the call ran. */
+  gate?: GateCall;
+}
+
+/** The tool call a gate objection was raised against. */
+export interface GateCall {
+  toolName: string;
+  /** The harness's id for the call, when the hook input carries one. */
+  toolUseId: string | null;
+  /** Canonical call digest (smallchat.call.v1) of the tool and its input: what a ruling is scoped to. */
+  digest: string;
+  /** The input field that asserted the literal, e.g. `content`, `command`. */
+  field: string;
 }
 
 export interface ObjectionStats {
@@ -135,6 +149,7 @@ export function ensureObjectionSchema(db: Database.Database): void {
   }
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_objections_key ON objections(session_id, tb_id, dead);
+    CREATE INDEX IF NOT EXISTS idx_objections_message ON objections(message_id, tb_id);
   `);
 }
 
@@ -233,7 +248,8 @@ export class ObjectionLog {
     tb: TbEntry,
     literal: TombstonedLiteral,
     hit: { line: string; source: string },
-    delivered: boolean
+    delivered: boolean,
+    gate?: GateCall
   ): Objection | null {
     const contestedBy =
       tb.body.status === 'contested'
@@ -251,6 +267,7 @@ export class ObjectionLog {
       exhibit: { tombstone: tb, contestedBy },
       transcriptLine: hit.line,
       source: hit.source,
+      ...(gate ? { gate } : {}),
     };
 
     const result = this.db
@@ -262,6 +279,44 @@ export class ObjectionLog {
       .run(id, createdAt, sessionId, messageId, tb.id, literal.dead, JSON.stringify(record), delivered ? 1 : 0);
     // Re-tailing the same message is idempotent
     return result.changes > 0 ? this.get(id) : null;
+  }
+
+  // ───────────────────────────────────────────────────────────
+  // The pre-dispatch gate (gate.ts)
+  // ───────────────────────────────────────────────────────────
+
+  /**
+   * Records an objection the gate raised against a tool call before it ran.
+   * Its message id is `gate:<digest>`, so retrying the same call (same tool,
+   * same input) in the same session finds the objection already on file:
+   * the existing one is returned, not a second one raised.
+   */
+  raiseAtGate(input: {
+    sessionId: string;
+    tb: TbEntry;
+    literal: TombstonedLiteral;
+    line: string;
+    call: GateCall;
+    delivered: boolean;
+  }): Objection {
+    const messageId = gateMessageId(input.call.digest);
+    const source = `tool:${input.call.toolName}`;
+    const hit = { line: input.line, source };
+    const raised = this.record(input.sessionId, messageId, input.tb, input.literal, hit, input.delivered, input.call);
+    if (raised) return raised;
+    const row = this.db
+      .prepare('SELECT * FROM objections WHERE session_id = ? AND message_id = ? AND tb_id = ? AND dead = ?')
+      .get(input.sessionId, messageId, input.tb.id, input.literal.dead);
+    return rowToObjection(row);
+  }
+
+  /**
+   * The ruling a person made on a gate objection against this TB for this
+   * exact call (tool and input, by digest), in any session: the latest
+   * sustained or overruled one, or null if none was ruled on.
+   */
+  gateRuling(tbId: string, digest: string): Objection | null {
+    return findGateRuling(this.db, tbId, digest);
   }
 
   get(id: string): Objection | null {
@@ -330,7 +385,29 @@ function rowToObjection(row: any): Objection {
     status: row.status,
     delivered: row.delivered === 1,
     rulingId: row.ruling_id ?? null,
+    ...(record.gate ? { gate: record.gate } : {}),
   };
 }
 
 const settledKey = (tbId: string, dead: string): string => `${tbId}\u0000${dead}`;
+
+/** The message id a gate objection is filed under: the call's digest. */
+export const gateMessageId = (digest: string): string => `gate:${digest}`;
+
+/**
+ * The latest sustained or overruled gate objection for (TB, call digest),
+ * read straight from the objections table (null if there is none, or no
+ * table yet). Works on a read-only connection.
+ */
+export function findGateRuling(db: Database.Database, tbId: string, digest: string): Objection | null {
+  const table = db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'objections'`).get();
+  if (!table) return null;
+  const row = db
+    .prepare(`
+      SELECT * FROM objections
+      WHERE message_id = ? AND tb_id = ? AND status IN ('sustained', 'overruled')
+      ORDER BY id DESC LIMIT 1
+    `)
+    .get(gateMessageId(digest), tbId);
+  return row ? rowToObjection(row) : null;
+}
