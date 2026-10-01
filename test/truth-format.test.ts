@@ -218,11 +218,34 @@ function buildFixtures(): Map<string, string> {
       targetRef: 'decision_17',
       signal: { source: 'detector:supersession', score: 0.71 },
     },
+    // Another writer's draft for line 1's target, with values this version doesn't define
+    {
+      id: '01J9PROPTB0000000000000001',
+      type: 'PROPOSAL',
+      ts: T(23),
+      author: 'agent:claude-code',
+      kind: 'tb',
+      draft: {
+        claim: 'MAX_RETRIES 3 is dead; it is 7.',
+        evidence: [{ kind: 'url', ref: 'https://example.com/runbook#retries' }],
+        literals: [{ subject: 'MAX_RETRIES', dead: '3', current: '7' }],
+      },
+      targetRef: 'shorthand:tombstone:msg_0101',
+      signal: { source: 'human-review' },
+      agentSessionId: 'sess_7f3a',
+    },
   ]);
   files.set('valid/proposals.jsonl', jsonl(proposals));
   files.set(
     'valid/proposals.expected.json',
-    json(proposals.map((l, i) => ({ line: i + 1, outcome: 'filed', kind: parse(l).kind === 'tb' ? 'tombstone' : 'uv' })))
+    json(
+      proposals.map((l, i) => ({
+        line: i + 1,
+        outcome: 'filed',
+        kind: parse(l).kind === 'tb' ? 'tombstone' : 'uv',
+        ...(i === 3 ? { unknown: ["signal.source 'human-review'", "evidence kind 'url'"] } : {}),
+      }))
+    )
   );
 
   // valid/unknown.jsonl: what a newer writer may send; readers keep it and fail closed
@@ -507,8 +530,12 @@ describe('valid/proposals.jsonl: the suite PROPOSAL envelope', () => {
     const ledger = fresh();
     const result = importProposalDrafts(ledger, { lines: fixture });
     expect(result.errors).toEqual([]);
-    const want = expected<Array<{ line: number; kind: string }>>('fixtures/valid/proposals.expected.json');
+    const want = expected<Array<{ line: number; kind: string; unknown?: string[] }>>('fixtures/valid/proposals.expected.json');
     expect(result.filed.map((p: ProposalEntry) => p.body.kind)).toEqual(want.map((w) => w.kind));
+    // Each envelope is filed, even two for one target; unknown values are kept and listed
+    expect(result.filed.map((p: ProposalEntry) => (p.body.meta?.intake as { unknown?: string[] }).unknown)).toEqual(
+      want.map((w) => w.unknown)
+    );
     expect(importProposalDrafts(ledger, { lines: fixture })).toMatchObject({ filed: [], deduped: fixture.length });
     // A wiki import refuses them: proposals never travel in a wiki stream
     expect(importWikiEntries(fresh(), { lines: fixture }).committed).toBe(false);

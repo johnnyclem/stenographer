@@ -188,7 +188,7 @@ One envelope for every proposal in the suite: short-hand's and smallchat's compa
 - `kind` is `tb` (draft: `claim`, `evidence`, `literals?`) or `uv` (draft: `assertion`, `basis`, `verifyBy`, `contests?`).
 - `signal.source` is `compaction-candidate`, `agent`, or `detector:<name>`.
 - A proposals file is a hash-chained stream like a wiki file, with one writer.
-- Stenographer's intake files each line as an open `PROPOSAL` that only a person can turn into truth, and keeps the envelope's `id`, `author`, `signal.source` and `hash` under `meta.intake`. A line is filed once: re-importing it, after it was signed or dismissed too, files nothing.
+- Stenographer's intake files each line as an open `PROPOSAL` that only a person can turn into truth, and keeps the envelope's `id`, `author`, `signal.source` and `hash` under `meta.intake`. A line is filed once, by its `id`: re-importing it, after it was signed or dismissed too, files nothing, and envelopes that share a `targetRef` are each filed. A `signal.source`, evidence kind or `verifyBy` kind it doesn't know is kept as written and listed under `meta.intake.unknown`.
 - The older bare short-hand line (`{kind: "tombstone", draft, signal, targetRef?}`) and the `shorthand-compaction` source are still read, and no longer written.
 
 ## Version 1 lines and upgrading
@@ -209,7 +209,7 @@ v1 couldn't carry status changes, and a 0.x full export rewrote the file, which 
 | `signers.json` | The signer registry the fixtures assume: `{"signers": [{id, role}]}`. |
 | `valid/ledger.jsonl` | One ledger's stream. It covers a TB with literals and `claimed-command` evidence, an open UV, a contest, an addendum that verifies the contest and overrides the TB, the superseding TB, a strike, an agent's UV refuted by a person, and a notarized agent draft whose `signs` link names a proposal that didn't travel, with a TRANSITION after each change. Every line passes the schema, every hash recomputes, and the lines chain. |
 | `valid/ledger.expected.json` | The fold: `{id: {type, status, current}}` for every TB and UV. |
-| `valid/proposals.jsonl`, `proposals.expected.json` | A PROPOSAL envelope stream and the kind each line files as. |
+| `valid/proposals.jsonl`, `proposals.expected.json` | A PROPOSAL envelope stream and the kind each line files as. Two envelopes share a `targetRef` (each is filed), and one carries an unknown `signal.source` and evidence kind (filed; `unknown` lists them as stenographer records them). |
 | `valid/unknown.jsonl`, `unknown.expected.json` | What a newer writer may send: an unknown field, unknown statuses, an unknown evidence kind and `verifyBy` kind. `fold` is what readers compute, failing closed. `import` is what stenographer does with each line. |
 | `valid/routing.jsonl`, `routing.expected.json` | Valid lines stenographer doesn't simply take as truth, each imported on its own: `inserted` (with the resulting `status`), `proposal` (with a `reason`), or `held`. |
 | `v1/legacy.jsonl`, `legacy.expected.json` | 0.x lines and their outcomes. The v2 schema refuses them; the codec reads them as version 1. |

@@ -698,11 +698,13 @@ export class TruthLedger {
    */
   addProposal(
     body: Omit<ProposalBody, 'status' | 'dismissedBy' | 'dismissReason'>,
-    ctx: WriteContext
+    ctx: WriteContext,
+    /** `reuseOpen: false` files a new proposal even when an open one matches (the intake dedupes envelopes by id). */
+    opts: { reuseOpen?: boolean } = {}
   ): ProposalEntry {
     const author = this.accountable(ctx.author, 'proposal author', { allowDetector: true });
 
-    if (body.targetRef) {
+    if (body.targetRef && opts.reuseOpen !== false) {
       const existing = this.findOpenProposal({
         kind: body.kind,
         targetRef: body.targetRef,

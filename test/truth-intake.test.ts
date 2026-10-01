@@ -1,4 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { StateStore } from '../src/store/index.js';
 import { importProposalDrafts, COMPACTION_DETECTOR } from '../src/truth/intake.js';
 import { wikiLineHash } from '../src/truth/wiki.js';
@@ -239,9 +242,83 @@ describe('the suite PROPOSAL envelope (truth format v2)', () => {
     expect(broken.errors).toMatchObject([{ line: 2, error: expect.stringMatching(/chain broken/) }]);
   });
 
-  it('refuses a kind or signal source the envelope does not define', () => {
-    const lines = stream({ ...tb, kind: 'tombstone' }, { ...uv, id: '01J9PROPUV0000000000000002', signal: { source: 'shorthand-compaction' } });
+  it('refuses a kind the envelope does not define, with a readable message', () => {
+    const lines = stream({ ...tb, kind: 'tombstone' });
     const { errors } = importProposalDrafts(store.truth, { lines });
-    expect(errors.map((e) => e.line)).toEqual([1, 2]);
+    expect(errors).toMatchObject([{ line: 1 }]);
+    expect(errors[0].error).not.toMatch(/\n|^\[/);
+  });
+
+  // F2: envelopes were batched by targetRef into one open proposal under the
+  // intake's author, so a second envelope for the same target was dropped.
+  it('files every envelope once by its id, even when envelopes share a targetRef', () => {
+    const p1 = { ...tb, id: '01J9PROPTB0000000000000011', draft: { ...tb.draft, claim: 'MAX_RETRIES 3 is dead' }, targetRef: 'cfg:MAX_RETRIES' };
+    const p2 = {
+      ...tb,
+      id: '01J9PROPTB0000000000000012',
+      author: 'agent:claude-code',
+      draft: { ...tb.draft, claim: 'MAX_RETRIES 5 is dead; it is 7' },
+      targetRef: 'cfg:MAX_RETRIES',
+      signal: { source: 'agent' },
+    };
+    const lines = stream(p1, p2);
+    const result = importProposalDrafts(store.truth, { lines });
+    expect(result).toMatchObject({ deduped: 0, errors: [] });
+    expect(result.filed.map((p) => [p.body.draft.claim, p.body.meta?.intake])).toEqual([
+      ['MAX_RETRIES 3 is dead', expect.objectContaining({ id: p1.id, author: 'detector:short-hand' })],
+      ['MAX_RETRIES 5 is dead; it is 7', expect.objectContaining({ id: p2.id, author: 'agent:claude-code' })],
+    ]);
+    expect(store.truth.listProposals('open')).toHaveLength(2);
+    expect(importProposalDrafts(store.truth, { lines })).toMatchObject({ filed: [], deduped: 2 });
+  });
+
+  // F3: the spec says readers MUST NOT reject a line for an unknown evidence
+  // or verifyBy kind or proposal signal.source; a proposal is never truth.
+  it('files a line with values it does not know, recording them for the notary', () => {
+    const lines = stream(
+      { ...tb, id: '01J9PROPTB0000000000000021', signal: { source: 'human-review' } },
+      { ...uv, id: '01J9PROPUV0000000000000022', draft: { ...uv.draft, verifyBy: { kind: 'query', value: 'SELECT 1' } } },
+      { ...tb, id: '01J9PROPTB0000000000000023', targetRef: 'other', draft: { ...tb.draft, evidence: [{ kind: 'url', ref: 'https://example.com' }] } },
+      { ...uv, id: '01J9PROPUV0000000000000024', signal: { source: 'shorthand-compaction' } }
+    );
+    const result = importProposalDrafts(store.truth, { lines });
+    expect(result.errors).toEqual([]);
+    expect(result.filed.map((p) => (p.body.meta?.intake as { unknown?: string[] }).unknown)).toEqual([
+      ["signal.source 'human-review'"],
+      ["verifyBy kind 'query'"],
+      ["evidence kind 'url'"],
+      ["signal.source 'shorthand-compaction'"],
+    ]);
+    expect(result.filed[1].body.draft).toMatchObject({ verifyBy: { kind: 'query', value: 'SELECT 1' } });
+    expect(result.filed[2].body.draft).toMatchObject({ evidence: [{ kind: 'url', ref: 'https://example.com' }] });
+    expect(store.truth.getTruth('all')).toHaveLength(0);
+  });
+});
+
+// F4: the spec says readers skip blank lines and count them in line numbers.
+describe('intake line numbers', () => {
+  let store: StateStore;
+  let dir: string;
+  beforeEach(() => {
+    store = new StateStore(':memory:');
+    dir = mkdtempSync(join(tmpdir(), 'steno-intake-'));
+  });
+  afterEach(() => {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('counts blank lines in a file, and skips them', () => {
+    const path = join(dir, 'proposals.jsonl');
+    writeFileSync(path, `\n\n${uvDraftLine()}\n{"not":"valid"}\n`);
+    const result = importProposalDrafts(store.truth, { path });
+    expect(result.filed).toHaveLength(1);
+    expect(result.errors.map((e) => e.line)).toEqual([4]);
+  });
+
+  it('skips blank lines passed as lines', () => {
+    const result = importProposalDrafts(store.truth, { lines: ['', uvDraftLine(), '  ', '{"not":"valid"}'] });
+    expect(result.filed).toHaveLength(1);
+    expect(result.errors.map((e) => e.line)).toEqual([4]);
   });
 });

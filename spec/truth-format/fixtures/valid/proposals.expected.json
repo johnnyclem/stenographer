@@ -13,5 +13,14 @@
     "line": 3,
     "outcome": "filed",
     "kind": "uv"
+  },
+  {
+    "line": 4,
+    "outcome": "filed",
+    "kind": "tombstone",
+    "unknown": [
+      "signal.source 'human-review'",
+      "evidence kind 'url'"
+    ]
   }
 ]

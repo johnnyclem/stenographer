@@ -4,8 +4,9 @@
  * Consumes candidate-truth JSONL emitted by an external compactor
  * (short-hand's `exportProposalDrafts`). Every line is filed as a
  * PROPOSAL — the intake has no path to TB or UV, so external tools can
- * only ever propose. Dedupe rides on `addProposal`'s targetRef batching:
- * re-importing the same export is idempotent while the proposals stay open.
+ * only ever propose. A v2 envelope is filed once by its id; the older
+ * dialects dedupe on `addProposal`'s targetRef batching, so re-importing
+ * the same export is idempotent while the proposals stay open.
  *
  * The detector identity that files these drafts is accountable in the
  * ledger sense (it names the pipeline), but it can never sign them —
@@ -22,7 +23,7 @@
 import { readFileSync } from 'node:fs';
 import { z } from 'zod';
 import { TruthLedger, type WriteContext } from './ledger.js';
-import { EvidenceSchema, TombstonedLiteralSchema, VerifyBySchema, type ProposalEntry } from './types.js';
+import { EVIDENCE_KINDS, EvidenceSchema, TombstonedLiteralSchema, VerifyBySchema, type ProposalEntry } from './types.js';
 import { checkWikiChain, decodeWikiLine, type DecodedWikiLine } from './wiki.js';
 
 /** Default author for drafts arriving from a short-hand compactor. */
@@ -83,45 +84,88 @@ const ProposalDraftLineSchema = z.discriminatedUnion('kind', [
   }),
 ]);
 
-/** The v2 envelope's own fields, after decodeWikiLine checked the line's structure and hash. */
-const V2SignalSchema = z
-  .object({
-    source: z.string().refine((s) => s === 'compaction-candidate' || s === 'agent' || /^detector:.+/.test(s), {
-      message: "signal.source is 'compaction-candidate', 'agent' or 'detector:<name>'",
-    }),
-    detail: z.string().optional(),
-  })
-  .passthrough();
-const ProposalEnvelopeV2Schema = z.discriminatedUnion('kind', [
-  z.object({ kind: z.literal('tb'), draft: TombstoneDraftSchema, signal: V2SignalSchema }).passthrough(),
-  z.object({ kind: z.literal('uv'), draft: UvDraftSchema, signal: V2SignalSchema }).passthrough(),
+/**
+ * The v2 envelope's own fields, after decodeWikiLine checked the line's
+ * structure and hash. Open where the spec says readers must be: an unknown
+ * `signal.source`, evidence kind or `verifyBy` kind is kept as written and
+ * recorded under `meta.intake.unknown` — a proposal is never truth, and a
+ * person sees it before anything is signed.
+ */
+const V2SignalSchema = z.object({ source: z.string().min(1), detail: z.string().optional() }).passthrough();
+const OpenEvidenceSchema = z.union([
+  EvidenceSchema,
+  z.object({ kind: z.string().min(1), ref: z.string().min(1), detail: z.string().optional() }).passthrough(),
 ]);
+const OpenVerifyBySchema = z.union([
+  VerifyBySchema,
+  z.object({ kind: z.string().min(1), value: z.string().min(1), detail: z.string().optional() }).passthrough(),
+]);
+const ProposalEnvelopeV2Schema = z.discriminatedUnion('kind', [
+  z
+    .object({
+      kind: z.literal('tb'),
+      draft: TombstoneDraftSchema.extend({ evidence: z.array(OpenEvidenceSchema).min(1) }),
+      signal: V2SignalSchema,
+    })
+    .passthrough(),
+  z.object({ kind: z.literal('uv'), draft: UvDraftSchema.extend({ verifyBy: OpenVerifyBySchema }), signal: V2SignalSchema }).passthrough(),
+]);
+type ProposalEnvelopeV2 = z.infer<typeof ProposalEnvelopeV2Schema>;
+
+const VERIFY_BY_KINDS: readonly string[] = VerifyBySchema.shape.kind.options;
+
+/** The values in a v2 envelope this stenographer doesn't define. */
+function unknownValues(envelope: ProposalEnvelopeV2): string[] {
+  const out: string[] = [];
+  const source = envelope.signal.source;
+  if (source !== 'compaction-candidate' && source !== 'agent' && !/^detector:.+/.test(source)) {
+    out.push(`signal.source '${source}'`);
+  }
+  if (envelope.kind === 'tb') {
+    for (const e of envelope.draft.evidence) {
+      if (!(EVIDENCE_KINDS as readonly string[]).includes(e.kind)) out.push(`evidence kind '${e.kind}'`);
+    }
+  } else if (!VERIFY_BY_KINDS.includes(envelope.draft.verifyBy.kind)) {
+    out.push(`verifyBy kind '${envelope.draft.verifyBy.kind}'`);
+  }
+  return out;
+}
+
+/** An error as one readable line (zod's own message is a JSON dump). */
+function messageOf(err: unknown): string {
+  if (err instanceof z.ZodError) {
+    return err.issues.map((i) => (i.path.length > 0 ? `${i.path.join('.')}: ${i.message}` : i.message)).join('; ');
+  }
+  return err instanceof Error ? err.message : String(err);
+}
 
 export interface IntakeResult {
   /** Newly filed open proposals. */
   filed: ProposalEntry[];
-  /** Lines that matched an already-open proposal for the same target. */
+  /** Lines already filed: a v2 envelope with this id, or (older dialects) an open proposal for the same target. */
   deduped: number;
   errors: Array<{ line: number; error: string }>;
 }
 
 /**
  * Files each draft line as a PROPOSAL. Malformed lines are reported and
- * skipped; the rest of the intake proceeds.
+ * skipped; the rest of the intake proceeds. Blank lines are skipped, and
+ * counted in the line numbers errors report.
  */
 export function importProposalDrafts(
   ledger: TruthLedger,
   input: { path?: string; lines?: string[] },
   ctx?: Partial<WriteContext>
 ): IntakeResult {
-  const lines =
-    input.lines ?? readFileSync(input.path!, 'utf8').split('\n').filter((l) => l.trim().length > 0);
+  const lines = (input.lines ?? readFileSync(input.path!, 'utf8').split('\n'))
+    .map((text, i) => ({ text, line: i + 1 }))
+    .filter(({ text }) => text.trim().length > 0);
 
   const result: IntakeResult = { filed: [], deduped: 0, errors: [] };
   const seen = new Set(ledger.listProposals('open').map((p) => p.id));
 
   // v2 envelope lines are hash-chained: check the chain before filing any of them
-  const v2 = lines.map((text): DecodedWikiLine | null => {
+  const v2 = lines.map(({ text }): DecodedWikiLine | null => {
     try {
       return JSON.parse(text)?.schemaVersion === 2 ? decodeWikiLine(text) : null;
     } catch {
@@ -133,14 +177,16 @@ export function importProposalDrafts(
   for (let i = 0; i < lines.length; i++) {
     let draft: z.infer<typeof ProposalDraftLineSchema> & { hash?: string };
     let v2Source: string | null = null;
+    let unknown: string[] = [];
     try {
-      const raw = JSON.parse(lines[i]);
+      const raw = JSON.parse(lines[i].text);
       if (raw?.schemaVersion === 2) {
-        const decoded = decodeWikiLine(lines[i]);
+        const decoded = decodeWikiLine(lines[i].text);
         if (decoded.type !== 'PROPOSAL') throw new Error(`a ${decoded.type} line is not a proposal`);
         if (broken.has(i)) throw new Error(broken.get(i));
         const envelope = ProposalEnvelopeV2Schema.parse(raw);
         v2Source = envelope.signal.source;
+        unknown = unknownValues(envelope);
         draft = {
           kind: envelope.kind === 'tb' ? 'tombstone' : 'uv',
           draft: envelope.draft,
@@ -157,11 +203,12 @@ export function importProposalDrafts(
         draft = ProposalDraftLineSchema.parse(raw);
       }
     } catch (err) {
-      result.errors.push({ line: i + 1, error: err instanceof Error ? err.message : String(err) });
+      result.errors.push({ line: lines[i].line, error: messageOf(err) });
       continue;
     }
 
-    // A v2 envelope is filed once, whatever became of it: its id is the dedupe key
+    // A v2 envelope is filed once, whatever became of it: its id is the dedupe
+    // key, not its target (envelopes from several writers can share one)
     const targetRef = draft.targetRef ?? (v2Source && draft.id ? `intake:${draft.id}` : null);
     if (v2Source && draft.id && ledger.proposalsFor(targetRef!).some((p) => (p.body.meta?.intake as { id?: string } | undefined)?.id === draft.id)) {
       result.deduped++;
@@ -184,6 +231,7 @@ export function importProposalDrafts(
                   ...(draft.id ? { id: draft.id } : {}),
                   ...(draft.author ? { author: draft.author } : {}),
                   ...(draft.hash ? { hash: draft.hash } : {}),
+                  ...(unknown.length > 0 ? { unknown } : {}),
                 },
               },
             }
@@ -194,7 +242,8 @@ export function importProposalDrafts(
         provenance: draft.provenance ?? { kind: 'manual' },
         agentSessionId: ctx?.agentSessionId ?? draft.agentSessionId ?? null,
         timestamp: ctx?.timestamp ?? draft.ts,
-      }
+      },
+      { reuseOpen: !v2Source }
     );
 
     if (seen.has(proposal.id)) {
