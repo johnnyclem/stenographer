@@ -1,0 +1,23 @@
+{
+  "description": "Labeled decision pairs for calibrating each embedder's supersede threshold: `rewrite` pairs restate one decision with a new value (should supersede), `distinct` pairs are unrelated decisions from one conversation (must not). Measured 2026-09-30: hashed scores distinct pairs 0.04-0.56 and rewrites 0.84-0.93; all-MiniLM-L6-v2 scores distinct pairs 0.04-0.44 and rewrites 0.57-0.94.",
+  "pairs": [
+    ["distinct", "use postgres for the main database", "use redis for the session cache"],
+    ["distinct", "use postgres for the main database", "use jest for the unit tests"],
+    ["distinct", "use tailwind for styling", "use react for the frontend"],
+    ["distinct", "use JWT for auth tokens", "use bcrypt for password hashing"],
+    ["distinct", "set the retry limit to 3", "set the request timeout to 30 seconds"],
+    ["distinct", "use postgres for storage", "deploy on fridays after standup"],
+    ["distinct", "use pnpm workspaces for this monorepo", "use vitest for the unit tests"],
+    ["distinct", "use the payment gateway client with a circuit breaker", "use redis for the session store"],
+    ["distinct", "use opossum for the circuit breaker", "use redis for the session store"],
+    ["distinct", "keep the 30s timeout", "use redis for the session store"],
+    ["distinct", "use a monorepo for the frontend and backend", "use docker compose for local development"],
+    ["rewrite", "use postgres for the main database", "use sqlite for the main database"],
+    ["rewrite", "use postgres for the main database", "use mysql for the main database"],
+    ["rewrite", "set the log budget to 30", "set the log budget to 100"],
+    ["rewrite", "use port 5432 for the postgres database", "use port 5433 for the postgres database"],
+    ["rewrite", "use postgres 14 for the database", "use postgres 16 for the database"],
+    ["rewrite", "use jest for the unit tests", "use vitest for the unit tests"],
+    ["rewrite", "the api timeout is 30 seconds", "the api timeout is 60 seconds"]
+  ]
+}

@@ -20,13 +20,14 @@ Point it at a JSONL log, and it gives your agent stack a semantic memory: entiti
 
 ## Features
 
-- **GraphRAG Search** — hybrid vector similarity + entity-graph traversal, merged and re-ranked in one query
-- **Real Local Embeddings** — `all-MiniLM-L6-v2` via `@huggingface/transformers` (~25MB model, downloaded once, runs fully locally, no API keys). Offline hashed-lexical fallback when the model can't load, or opt in explicitly with `--embeddings hashed`
-- **Persistent Vector Index** — `sqlite-vec` KNN index in the same SQLite file as everything else (brute-force cosine fallback if the extension can't load)
-- **Importance Scoring** — a three-signal model (state delta, reference frequency, trajectory discontinuity) flags which messages matter, so retrieval and context-framing can prioritize signal over noise
-- **Decision Supersession (Tombstones)** — decisions are append-only; a newer decision or an "actually, …" correction closes the old record onto its successor, keeping full provenance
+- **GraphRAG Search** — messages ranked by reciprocal rank fusion of vector similarity, entity-graph evidence and recency, with an importance prior; the graph evidence comes back with each result
+- **Real Local Embeddings** — `all-MiniLM-L6-v2` via `@huggingface/transformers` (~25MB model, downloaded once, runs fully locally, no API keys), or the offline hashed-lexical embedder with `--embeddings hashed`. The state database is pinned to the embedder that wrote it (see [Offline mode](#offline-mode))
+- **Persistent Vector Index** — `sqlite-vec` KNN index (cosine, partitioned by session, long messages in overlapping windows) in the same SQLite file as everything else (brute-force cosine fallback if the extension can't load)
+- **Importance Scoring** — a three-signal model (state delta, reference frequency, trajectory discontinuity) scores each message; GraphRAG search uses it as a ranking prior and context frames use it to choose which recent messages get room
+- **Decision Supersession (Tombstones)** — decisions are append-only; a newer decision or an "actually, …" correction closes the old record onto its successor, keeping full provenance. Only what people and the assistant said is mined: tool output, harness records, subagent transcripts and compaction summaries are indexed and searchable, but never read as decisions
 - **Four Modes** — `live`, `catchup`, `watch` (a directory of session logs), `daemon` (live + REST API)
-- **Provider Adapters** — `jsonl`, `claude-code`, `anthropic`, `openai`, `generic`, auto-detected from file content
+- **Provider Adapters** — `jsonl`, `claude-code`, `anthropic`, `openai`, `generic`, auto-detected from the first lines written (a log created empty waits for its first line)
+- **Resumable Ingestion** — a per-log checkpoint commits with each message, so a restart picks up where the last run stopped instead of re-reading the log (see [Restarts and log rotation](#restarts-and-log-rotation))
 - **Two Query Surfaces** — MCP over stdio, REST over HTTP (GraphQL: roadmap)
 - **Pre-dispatch gate** — `stenographer gate`, a Claude Code `PreToolUse` hook that denies a Write, Edit or Bash call reintroducing a tombstoned literal before it runs, with the TB as the exhibit (see [Pre-dispatch gate](#pre-dispatch-gate))
 
@@ -65,11 +66,13 @@ npx stenographer start ./conversation.jsonl --embeddings hashed
 |------|--------|---------|-------------|
 | `-m, --mode` | `live` \| `catchup` \| `watch` \| `daemon` | `live` | `live`: tail a file and serve MCP. `catchup`: index a completed file, then serve. `watch`: watch a directory for `*.jsonl` session logs. `daemon`: live + REST API |
 | `-a, --adapter` | `jsonl` \| `claude-code` \| `anthropic` \| `openai` \| `generic` | auto-detect | Log format adapter |
-| `-e, --embeddings` | model name \| `hashed` | `Xenova/all-MiniLM-L6-v2` | Transformer model, or the offline lexical embedder (see [Offline mode](#offline-mode)) |
+| `-e, --embeddings` | model name \| `hashed` \| `auto` | `Xenova/all-MiniLM-L6-v2` | Transformer model (fails to start if it can't load), the offline lexical embedder, or `auto`: the embedder the state database is pinned to, else the default model with a loud fallback to hashed (see [Offline mode](#offline-mode)) |
+| `--reembed` | — | off | Re-embed every stored message and truth entry under the chosen embedder before starting. Needed to switch a state database to another embedder |
+| `--supersede-threshold` | number in (0, 1] | per embedder: MiniLM `0.45`, hashed `0.75` | Cosine similarity at which a new decision supersedes an active one (see [Decision Supersession](#decision-supersession)) |
 | `--rest-port` | port number | `8787` in daemon mode, off otherwise | Serve the REST API on this port |
 | `--objections` | `off` \| `shadow` \| `deliver` | `shadow` | Real-time objections to tombstoned literals (see [Real-time objections](#real-time-objections)) |
 | `--objection-channel` | URL (repeatable) | — | smallchat channel bridge to push each objection to as it's raised. Secret from `SMALLCHAT_CHANNEL_SECRET` |
-| `--objection-webhook` | URL (repeatable) | — | Webhook for harnesses that can't be interrupted: objections arrive in batches. HMAC key from `STENOGRAPHER_WEBHOOK_SECRET` |
+| `--objection-webhook` | URL (repeatable) | — | Webhook for harnesses that can't be interrupted: objections arrive in batches. Standard Webhooks signing key from `STENOGRAPHER_WEBHOOK_SECRET` (at least 24 bytes) |
 | `--objection-batch-size` | number | `3` | Batch size for `--objection-webhook` |
 | `--no-mcp-channel` | — | — | Don't push objections to the attached MCP client as Claude Code channel events |
 | `--profile` | `agent` \| `operator` | `agent` | Which MCP tools are served. `agent`: read tools plus drafting (`propose_tombstone`, `assert_uv`, a `resolve_uv` that can't mint TBs). `operator`: the judicial and destructive tools, for a notary UI or CLI a person drives — never an agent. See [Notarization, identity and the threat model](#notarization-identity-and-the-threat-model) |
@@ -77,14 +80,26 @@ npx stenographer start ./conversation.jsonl --embeddings hashed
 | `--allow-agent-assert` | — | off | Single-user opt-out: the agent profile also serves `assert_tombstone`, signed by the agent identity (never a person's name). Off, every agent-authored TB is notarized by a person |
 | `--signer-registry` | path | — | JSON allowlist of signers and roles; operator paths (MCP operator profile, REST notary routes, `stenographer notarize`) accept only listed identities in a role that may act, and wiki import takes TBs and overrides only from listed signers |
 | `--wiki-dir` | directory | `wiki/` next to the state file | Where `export_wiki_entries` and `import_wiki_entries` read and write. Files are named relative to it; absolute paths, `..`, symlinks out of it, non-`.jsonl` names and the state file are refused (see [Team wiki](#team-wiki-the-truth-format)) |
-| `--rest-host` | hostname/IP | `127.0.0.1` | Interface for the REST API to bind to. The API has no authentication, so it stays loopback-only unless you explicitly opt into wider exposure (e.g. `0.0.0.0` behind a trusted network boundary) |
+| `--rest-host` | hostname/IP | `127.0.0.1` | Interface for the REST API to bind to. The API serves transcripts, so it stays loopback-only unless you explicitly opt into wider exposure (e.g. `0.0.0.0` behind a trusted network boundary) |
+| `--rest-allow-host` | host name (repeatable) | — | Also answer to this `Host` name. Loopback names and `--rest-host` always are; anything else gets 421 (see [REST API](#rest-api-daemon-mode-or---rest-port)) |
+| `--rest-insecure` | — | off | Serve REST without a bearer token. Host and Origin checks still apply |
 | `--skip-verify` | — | off | Serve even if the truth ledger fails its integrity check. By default `start` runs the same check as `stenographer verify` and refuses to serve a ledger that fails it (see [Ledger integrity](#ledger-integrity)) |
 
 Positional args: `stenographer start <log-path> [state-path]` — `state-path` defaults to `./stenographer.db`.
 
+### Restarts and log rotation
+
+Each log has a checkpoint in the state database: the byte offset after the last indexed line, plus what identifies the file (device/inode and a hash of its first 4 KB). The checkpoint is written in the same SQLite transaction as the message and everything derived from it (entities, decisions, supersessions, proposals, objections), so after a crash or restart a line has either been applied completely or not at all, and indexing resumes right after the last applied line. A log keeps its session id across restarts.
+
+Scope of the idempotency: within one state database, a line whose message id and content are already indexed is skipped for every derived record, whether it is re-read after a truncate-and-rewrite or copied into another session's log (the message moves to the newer session; nothing is re-derived). Decisions and supersession tombstones get ids hashed (128-bit) from the line they came from, and so do messages whose format has no id of its own (`openai`, `anthropic`, `generic`): log path, byte offset and line content. Two identical `continue` turns therefore stay two messages.
+
+The tailer holds back a partially written line until its newline arrives (`catchup` indexes a final unterminated line but leaves the checkpoint before it). It strips a UTF-8 BOM. It waits for a log that doesn't exist yet. When a log is deleted it waits for the log to reappear (in `watch` mode it drops that session), and it follows the path through a rename rotation or atomic replace after draining the old file. If the file is truncated or rewritten, it reads it again from the top, where the lines it has already indexed are skipped. State databases record their schema version (`PRAGMA user_version`), migrate in place on start and run in WAL mode.
+
 ### Offline mode
 
-By default, Stenographer downloads a ~25MB embedding model on first run and does everything else locally after that — no ongoing network calls, no API keys, ever. If you need to skip even that one-time download, pass `--embeddings hashed` to use an offline hashed-lexical embedder instead; the same fallback kicks in automatically if the transformer model fails to load.
+By default, Stenographer downloads a ~25MB embedding model on first run and does everything else locally after that — no ongoing network calls, no API keys, ever. If you need to skip even that one-time download, pass `--embeddings hashed` to use an offline hashed-lexical embedder instead. Hashed search is lexical (shared words and spellings), not semantic.
+
+Vectors from two embedders aren't comparable, so the state database records the embedder that wrote it (model, width, version) and refuses to open under a different one, naming both. To switch, restart with the new `--embeddings` and `--reembed`, which recomputes every stored message and truth-entry vector. A model that fails to load is an error, not a silent switch to hashed. If you want the fallback, `--embeddings auto` opts in: it uses the embedder the database is already pinned to, or tries the default model and falls back to hashed with a warning on stderr (the database is then pinned to hashed). `get_status` and `GET /status` report the embedder in use.
 
 ## MCP Tools
 
@@ -97,9 +112,9 @@ By default, Stenographer downloads a ~25MB embedding model on first run and does
 | `get_decision_history` | Full decision history including superseded versions |
 | `get_decision_chain` | Walk one supersession chain, oldest → current |
 | `get_corrections` | Get all corrections/tombstones |
-| **`search_conversation`** | **GraphRAG hybrid semantic search** |
-| `search_similar` | Pure vector search over the persistent index |
-| `get_context_frame` | Build token-budgeted context |
+| **`search_conversation`** | **GraphRAG hybrid search: fused vector, entity-graph and recency ranks** (`k` ≤ 200) |
+| `search_similar` | Pure vector search over the persistent index (`k` ≤ 200) |
+| `get_context_frame` | Entities, active decisions and recent messages within a token budget |
 | `get_status` | Statistics, vector backend, mode |
 
 ### Truth-layer tools (TB/UV v2)
@@ -141,13 +156,47 @@ GET /proposals?status=open&kind=tombstone
 
 POST /proposals/:id/notarize  {notary, edits?}      X-Notary-Secret required
 POST /proposals/:id/dismiss   {dismissedBy, reason} X-Notary-Secret required
+POST /appa/context            OpenAPPA consult (kind: context), read-only
 ```
 
-There's no authentication on the GET routes, so the server binds to `127.0.0.1` by default — pass `--rest-host` if you deliberately want it reachable from elsewhere. The notary routes check `notary`/`dismissedBy` like any operator path: canonicalized, never anonymous or reserved, and a registered person when `--signer-registry` is set (otherwise `422`).
+**Access.** The routes serve transcripts, including any secret someone pasted into a session, so every request is checked before anything is read:
+
+- **Host** must be `localhost`, `127.0.0.1`, `[::1]`, the `--rest-host`, or a `--rest-allow-host` name; anything else gets `421`. This stops DNS rebinding, where a web page points its own hostname at 127.0.0.1 and reads the API as its own origin.
+- **Origin**, when a browser sends one, must be on one of those hosts (`403` otherwise).
+- **`Authorization: Bearer <token>`** is required on every route (`401` otherwise). The token is `STENOGRAPHER_REST_TOKEN` when set (at least 16 characters); otherwise stenographer generates one on first run into `rest-token` next to the state database, with mode 0600, prints that path on startup, and reuses it. `--rest-insecure` drops the token requirement (the Host and Origin checks stay). If the state database lives inside a repository, add `rest-token` to its `.gitignore`.
+
+The notary routes need the bearer token and `X-Notary-Secret`. The token keeps out web pages, other users and other machines. It doesn't keep out processes running as you, which can read the token file, so treat it like the notary secret (see [the threat model](#notarization-identity-and-the-threat-model)). The notary routes check `notary`/`dismissedBy` like any operator path: canonicalized, never anonymous or reserved, and a registered person when `--signer-registry` is set (otherwise `422`).
+
+The server binds to `127.0.0.1` by default. Pass `--rest-host` if you deliberately want it reachable from elsewhere, plus `--rest-allow-host` for the name clients use.
+
+Query parameters are validated: a malformed one (`k=abc`, `n=0`, an unknown `status`) gets `400`, and oversized counts are clamped (`k` ≤ 200, `n` ≤ 1,000, `depth` ≤ 5, `limit` ≤ 1,000, `budget` ≤ 100,000). The MCP tools clamp to the same bounds.
+
+### OpenAPPA context provider
+
+[OpenAPPA](https://github.com/archestra-ai/openappa) asks configured context providers about each proposed tool call before its annotator labels the call. `POST /appa/context` implements consult protocol v1 for `kind: "context"`. It takes `{version: 1, kind: "context", name, declaration: {}, artifact: {tool, arguments, cwd?}}` and answers `{version: 1, answer}`. The answer is `null` when the ledger has nothing to say. Otherwise it is `{about, hits}`, with one hit per tombstoned literal found in the arguments:
+
+```json
+{ "tb_id": "01J…", "subject": "LOG_BUDGET", "dead": "30", "current": "100",
+  "claim": "LOG_BUDGET 30 is dead; the budget is 100", "signer": "johnnyclem", "author": "johnnyclem",
+  "status": "active", "argument": "command", "line": "printf 'LOG_BUDGET=30\\n' >> .env",
+  "contested_by": [] }
+```
+
+Matching is the objection detector's: exact tokens, a subject next to its value, lines that also name the current value skipped, and the old side of an edit (`old_string`, …) ignored. A contested TB lists the open UVs that dispute it, with their authors. The answer is facts for the annotator, not a label. Whether a hit matters is the policy's call. The route is read-only and uses the same bearer token.
+
+OpenAPPA's runtime also listens on `127.0.0.1:8787` by default, so run the daemon on another port next to it (for example `--rest-port 8789`) and point the binding there:
+
+```toml
+[externals.context.stenographer]
+url = "http://127.0.0.1:8789/appa/context"
+token_env = "APPA_STENOGRAPHER_TOKEN"   # the contents of <state dir>/rest-token
+```
+
+OpenAPPA asks context providers only for calls that need a new annotation, and only annotators read the answer, so this informs labeling. It doesn't block a call by itself; `stenographer gate` does. Bind it to a battery or annotator rule, never to a bare root rule for a built-in tool (see [`integrations/openappa/`](./integrations/openappa/README.md#do-not-bind-stenographer-annotators-to-broad-root-rules)).
 
 ## Importance Scoring
 
-Every indexed message gets a three-signal importance score, used to prioritize what surfaces in search results and context frames:
+Every indexed message gets a three-signal importance score (stored with it). GraphRAG search adds it as a small prior to the fused rank, enough to lift a decision or correction over an equally relevant remark but not over a more relevant message, and the context frame gives room to the most important of the recent messages after the newest one. Pure vector search (`search_similar`) doesn't use it.
 
 | Signal | Weight | What it captures |
 |--------|--------|-------------------|
@@ -170,7 +219,9 @@ produces:
 - decision B (sqlite): active, `sourceMessageId: m3`
 - a tombstone: what was superseded, what corrected it, why, and the triggering message
 
-Matching uses embedding similarity (`supersedeThreshold`, default 0.45, calibrated for MiniLM: rewrites of the same decision score ~0.46–0.94, unrelated decisions ~0.06). `get_decision_chain` walks any chain oldest → current.
+Matching uses embedding similarity at a threshold calibrated per embedder on [`test/fixtures/supersession-pairs.json`](./test/fixtures/supersession-pairs.json): MiniLM `0.45` (rewrites of one decision score 0.57–0.94, unrelated decisions 0.04–0.44) and hashed `0.75` (rewrites 0.84–0.93, unrelated 0.04–0.56). Other transformer models get 0.45 until you calibrate them with `--supersede-threshold`. Of two matching versions, the one with the later timestamp closes the other, whichever was indexed first. In `watch` mode, matching spans every session in the state database (each conversation is its own log); other modes match within the log's session. `get_decision_chain` walks any chain oldest → current.
+
+What gets mined is a heuristic (Tier 0 patterns), applied sentence by sentence to user and assistant prose only, without code blocks, quoted lines or harness blocks. Each sentence yields at most one decision or correction. "Use X instead of Y", "X rather than Y", "X, not Y" and "not X but Y" record X as current and Y as what it replaces, unless the phrase is inside a quotation. Questions, first-person tool narration ("I'll use the Read tool to …") and narration of the next step ("Let me X instead of Y") are skipped. Claude Code tool results become role `tool` (tagged `tool_result`), and `isMeta`, slash-command, `isSidechain` and `isCompactSummary` records are tagged `meta`, `sidechain` and `compact_summary`. All of them stay searchable. Precision and recall are measured in CI on a labeled corpus ([`test/fixtures/extraction-corpus.json`](./test/fixtures/extraction-corpus.json), floors 0.95 and 0.90). It's a small development set, not a benchmark.
 
 ## Asserted Truth Layer (TB/UV v2)
 
@@ -226,16 +277,16 @@ People sign, notarize, dismiss, override, strike and rule; agents draft and asse
 **The notary flow.**
 
 1. **Drafted.** `propose_tombstone` files a `PROPOSAL` marked `requiresNotary`, authored by the agent identity. `targetRef` dedupes only against the same agent's open drafts (the result says `dedupedInto`); it never folds a draft into someone else's proposal.
-2. **Raised.** The draft goes to the same receivers as objections — smallchat's channel bridge (`meta.kind: "proposal"`, with a `notarize_url`) and operator webhooks (`type: "stenographer.proposal"`) — never to the attached MCP client, which is the drafter. It's also printed to stderr and stays in `GET /proposals?status=open`.
+2. **Raised.** The draft goes to the same receivers as objections — smallchat's channel bridge (`meta.kind: "proposal"`, with a `notarize_url`) and operator webhooks (`type: "stenographer.proposal"`) — never to the attached MCP client, which is the drafter. It's also printed to stderr and stays in `GET /proposals?status=open`. Notices escape control characters and bidi overrides in whatever the agent wrote (as `\u001b`, `\r`, …), so a claim can't conceal or overwrite itself in a terminal or chat.
 3. **Notarized.** A person approves or declines it through a path the agent profile doesn't serve:
-   - REST `POST /proposals/:id/notarize` / `dismiss` with `X-Notary-Secret` — the secret in `STENOGRAPHER_NOTARY_SECRET`, shared with your approval UI (smallchat) and not with agents. Unset, the routes answer 403.
+   - REST `POST /proposals/:id/notarize` / `dismiss` with `X-Notary-Secret` — the secret in `STENOGRAPHER_NOTARY_SECRET`, shared with your approval UI (smallchat) and not with agents — and the REST bearer token, like every route. Unset, the notary routes answer 403.
    - `sign_proposal` / `dismiss_proposal` on an `--profile operator` server.
    - `stenographer notarize <id> --as <name> [--state <path>] [--signer-registry <path>]` (or `--decline "<reason>"`), which needs an interactive terminal and typing back a random code it prints there.
 4. **Minted.** The TB is signed by the notary, keeps the draft's literals (so it can object immediately), and links back to the draft. Contempt of corpus still applies: the drafting identity can't notarize its own draft.
 
 **What this protects, and what it doesn't.** The property: an agent whose only access to the ledger is an agent-profile MCP connection cannot mint an active TB, attach a person's name to anything, or neutralize a signed TB or an objection (override, strike, dismiss, rule). It can contest a TB with a UV, which marks the TB contested and leaves it truth. The boundary is the MCP connection:
 
-- **Anything that can run commands or read files as the operator's user is the operator.** It can read `STENOGRAPHER_NOTARY_SECRET` from the environment of the process serving REST — usually the agent-spawned MCP server itself, configured in the agent host's MCP config — edit that config to `--profile operator`, open the SQLite file directly, or drive `stenographer notarize` through a pseudo-terminal (`script`, `expect`): the typed code stops blind or pre-scripted approval, not a program that reads the terminal. Separating those needs OS-level separation: run the agent as another user or in a sandbox without access to the operator's config, environment, state file and terminal. Editing the SQLite file shows up in `stenographer verify` unless the editor recomputes the chain from the edit on; only a head hash kept outside the file catches that (see [Ledger integrity](#ledger-integrity)).
+- **Anything that can run commands or read files as the operator's user is the operator.** It can read `STENOGRAPHER_NOTARY_SECRET` from the environment of the process serving REST — usually the agent-spawned MCP server itself, configured in the agent host's MCP config — and the REST token from `<state dir>/rest-token`, edit that config to `--profile operator`, open the SQLite file directly, or drive `stenographer notarize` through a pseudo-terminal (`script`, `expect`): the typed code stops blind or pre-scripted approval, not a program that reads the terminal. Separating those needs OS-level separation: run the agent as another user or in a sandbox without access to the operator's config, environment, state file and terminal. Editing the SQLite file shows up in `stenographer verify` unless the editor recomputes the chain from the edit on; only a head hash kept outside the file catches that (see [Ledger integrity](#ledger-integrity)).
 - **The signer registry is an allowlist, not authentication.** Whoever reaches an operator path can use any listed person's name; the registry stops typos, unlisted names, and agent identities on person-only acts. Key-based signing, where the notary signs with a key the server doesn't hold, is planned for 1.x.
 - Without `--signer-registry`, operator paths accept any non-anonymous, non-reserved name, and `--agent-identity` accepts any non-reserved identity the operator configures.
 
@@ -287,7 +338,7 @@ v1 is precision over recall: exact tokens (`30` never matches `300` or `1.30`), 
 
 Every objection ships the objection, the exhibit (the full TB, plus any contesting UVs), and the transcript line. A person rules via `rule_on_objection` (operator profile; the session an objection was raised against can't rule on it): **sustained** lands as an ordinary `RULING` (`kind: objection`) corroborating the TB; **overruled** is signal. The **sustain rate** (`get_status` → `objections`) is the tuning dial — a falling rate means tighten the matcher.
 
-`--objections shadow` (default) records objections without emitting them, so they can be shadow-judged against real MR catches; `deliver` pushes them (below) and serves them on `GET /flags` (poll with the last id as `since`); `off` disables the detector. Catch-up replays are always recorded as shadow.
+`--objections shadow` (default) records objections without emitting them, so they can be shadow-judged against real MR catches; `deliver` pushes them (below) and serves them on `GET /flags` (poll with the last id as `since`); `off` disables the detector. Replays are always recorded as shadow, in every mode: only lines appended after stenographer started, or lines in a session log that appeared after it started, are delivered. Whatever a log already held at startup is history, including lines written while stenographer was stopped.
 
 **Delivery (webhooks).** In `deliver` mode, objections are pushed to every configured receiver:
 
@@ -295,9 +346,15 @@ Every objection ships the objection, the exhibit (the full TB, plus any contesti
 |---|---|---|
 | Claude Code (built-in channel) | The attached MCP client gets `notifications/claude/channel`; stenographer declares the `claude/channel` capability | As discovered |
 | smallchat agent-to-agent messaging | `--objection-channel <url>` → `POST <url>/event` on smallchat's channel bridge (`X-Channel-Secret`), relayed into the agent's session | As discovered |
-| Harnesses without interrupts | `--objection-webhook <url>` → `POST {type: "stenographer.objections", objections: [...]}`, signed `X-Stenographer-Signature: sha256=<hmac>` | Once a batch of 3 is pending |
+| Harnesses without interrupts | `--objection-webhook <url>` → `POST {type: "stenographer.objections", objections: [...]}`, signed per [Standard Webhooks](https://www.standardwebhooks.com/) | Once a batch of 3 is pending, or after the oldest has waited 5 minutes |
 
-Delivery state is durable: a partial batch survives a restart, failed deliveries retry, and an objection the judge already ruled on is dropped from the queue. Webhook URLs must be loopback unless a sink sets `allowRemote`, since objections carry transcript lines. Watch mode skips the MCP channel because one connection can't be mapped to the many sessions it watches, so use a smallchat channel or a webhook there. In watch mode each session is named after its log file (`<session-id>.jsonl` → `<session-id>`), which for Claude Code is the session id, so `meta.session_ids` on a channel event is what smallchat's messenger routes by. Stenographer itself still never writes into a conversation: it emits to receivers the operator configured, and they decide what to do.
+**Signatures.** Webhooks (objections and proposals) carry `webhook-id`, `webhook-timestamp` (Unix seconds) and `webhook-signature: v1,<base64 HMAC-SHA256 of "<id>.<timestamp>.<body>">`, keyed by `STENOGRAPHER_WEBHOOK_SECRET`. Any Standard Webhooks verifier can check them. A `whsec_<base64>` secret is used decoded; any other secret is used as its UTF-8 bytes (`new Webhook(secret, { format: "raw" })` in the reference library), and it must be at least 24 bytes. The id is stable across retries of the same delivery, so receivers can deduplicate, and the signed timestamp lets them refuse replays.
+
+**Retries.** Delivery state is durable: a partial batch survives a restart, and an objection the judge already ruled on is dropped from the queue. Retries are per objection and per receiver. A network error, a 5xx, 408 or 429 backs off (15 s, doubling, at most an hour). A redirect or any other 4xx dead-letters the objection for that receiver at once, and so does an 8th failed attempt. Either way, the objections behind it keep flowing. A batch refused as a whole is retried one objection at a time. `get_status` counts dead letters under `objections.deadLettered`. Channel notices cap each line at 2,000 characters; the full record is one `list_objections` call away. Redirects are never followed, so a receiver can't forward the body and its secret elsewhere. Logs and tool results name a receiver by scheme, host and port only, because chat webhooks keep their token in the path or query.
+
+Webhook URLs must be loopback unless a sink sets `allowRemote`, since objections carry transcript lines. Watch mode skips the MCP channel because one connection can't be mapped to the many sessions it watches, so use a smallchat channel or a webhook there.
+
+**Session ids.** An objection's `sessionId`, and `meta.session_ids` on a channel event (what smallchat's messenger routes by), is the harness's own session id when the log records one (Claude Code's `sessionId`). Otherwise it is the log file's basename (`<name>.jsonl` → `<name>`), which for Claude Code is also the session id. The same rule holds in every mode, and the id is never minted from the clock, so it survives restarts. Stenographer itself still never writes into a conversation: it emits to receivers the operator configured, and they decide what to do.
 
 ### Pre-dispatch gate
 
@@ -354,17 +411,20 @@ It composes with other `PreToolUse` hooks (for example OpenAPPA's policy hook): 
 
 ### OpenAPPA battery
 
-[`integrations/openappa/`](./integrations/openappa/README.md) is a policy battery for [OpenAPPA](https://github.com/archestra-ai/OpenAPPA) 0.30.0, which checks a protected Claude Code session's tool calls before they run. It names every MCP tool of both profiles (`mcp/stenographer/<tool>`): transcript and ledger reads leave the session restricted to its user and `suspicious`, every ledger write but a draft (`propose_tombstone`) needs a `trusted` session, and overrides, rulings and every act signed with a person's name also need that person's approval (`hitl`). In a protected session, text from a web page or another session's transcript can't become truth through stenographer's MCP tools unless someone approves the exact call; the REST API and the terminal notary are outside it. `appa replay` traces pin the decisions; `npm run test:openappa` runs them when `appa` is installed. The README covers installing it next to OpenAPPA's claude-code battery.
+[`integrations/openappa/`](./integrations/openappa/README.md) is a policy battery for [OpenAPPA](https://github.com/archestra-ai/OpenAPPA) 0.30.0, which checks a protected Claude Code session's tool calls before they run. It names every MCP tool of both profiles (`mcp/stenographer/<tool>`): transcript and ledger reads leave the session restricted to its user and `suspicious`, every ledger write but a draft (`propose_tombstone`) needs a `trusted` session, and overrides, rulings and every act signed with a person's name also need that person's approval (`hitl`). In a protected session, text from a web page or another session's transcript can't become truth through stenographer's MCP tools unless someone approves the exact call; the REST API and the terminal notary are outside it. `appa replay` traces pin the decisions; `npm run test:openappa` runs them when `appa` is installed. The README covers installing it next to OpenAPPA's claude-code battery. Separately, the REST daemon can answer OpenAPPA's context consults with the ledger's facts about a proposed call ([OpenAPPA context provider](#openappa-context-provider)); give it a port other than the runtime's 8787.
 
 ## GraphRAG Search
 
-The `search_conversation` tool performs **hybrid retrieval**:
+The `search_conversation` tool ranks **messages** with hybrid retrieval:
 
-1. **Vector Search** — Semantic similarity on message embeddings
-2. **Entity Extraction** — Find relevant entities from query
-3. **Graph Traversal** — Expand to related entities (configurable depth)
-4. **Merge & Re-rank** — Weighted combination of vector + graph scores
-5. **Context Enrichment** — Add neighboring messages as context
+1. **Vector search**: cosine similarity over the persistent index (a long message scores as its best window), over-fetched into a candidate pool
+2. **Entity evidence**: entities the query names (whole words), expanded through the co-mention graph (`graph_depth`, default 2); messages that mention them join the pool
+3. **Reciprocal rank fusion** (K = 60) of the vector ranking, the entity ranking and a quarter-weight recency ranking, plus a small importance prior
+4. **Evidence in `meta`**: `vectorScore`, `matchedEntities`, `paths`, `importance`, and `neighbors` (the adjacent messages in the same session)
+
+Entities and paths are evidence on messages, not results of their own. Each message is embedded with its tool calls (name and arguments), so "which file did we edit" can find the edit.
+
+The context frame (`get_context_frame`, `GET /context-frame`) keeps every section within the budget (estimated at 4 characters per token). Recent messages get 50%, decisions 35% and entities 15%, and whatever a section leaves unused goes to the others. The newest message always gets room first.
 
 ## Architecture
 
@@ -382,7 +442,7 @@ The `search_conversation` tool performs **hybrid retrieval**:
 │                  Core Engine (StenographerAPI)               │
 │  Importance Detector → Structure Extraction → Embedder      │
 │  Decision supersession (tombstones, provenance chains)      │
-│  GraphRAG retriever (entity graph + in-memory vectors)      │
+│  GraphRAG retriever (entity graph; vectors via sqlite-vec)  │
 └─────────────────────────┬───────────────────────────────────┘
                           ▼
 ┌─────────────────────────────────────────────────────────────┐
@@ -413,7 +473,7 @@ npm run lint    # tsc --noEmit
 npm run test:openappa   # OpenAPPA battery checks; skipped without an appa binary
 ```
 
-Tests live in [`test/`](./test), covering the core engine, GraphRAG retriever, embeddings, importance scoring, provider adapters, the tailer, the SQLite store, and the REST API.
+Tests live in [`test/`](./test), covering the core engine, GraphRAG retriever, embeddings, importance scoring, extraction precision on a labeled corpus, provider adapters, the tailer, the SQLite store, the REST API, and an indexing-time bound. Two tests need the MiniLM weights on disk and are skipped otherwise; set `STENOGRAPHER_TEST_MODEL_CACHE` to a transformers.js cache directory to run them.
 
 ## Contributing
 

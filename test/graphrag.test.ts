@@ -30,20 +30,35 @@ describe('GraphRAGRetriever', () => {
     expect(results[0].id).toBe('m1');
   });
 
-  it('traverses relations from query entities', async () => {
+  it('brings in messages that mention entities reachable from the query, with the path as evidence', async () => {
     const retriever = new GraphRAGRetriever();
     retriever.indexEntity(entity('postgres'));
     retriever.indexEntity(entity('pgbouncer'));
     retriever.indexRelation('postgres', 'pgbouncer', 'uses');
+    await retriever.indexMessage(msg('m1', 'connection pooling sits in front of the primary'), undefined, {
+      entityIds: ['pgbouncer'],
+    });
+    await retriever.indexMessage(msg('m2', 'lunch at noon'));
 
     const results = await retriever.search({ query: 'tell me about postgres', k: 10 });
 
-    const types = results.map((r) => r.type);
-    expect(types).toContain('entity');
-    expect(types).toContain('path');
+    // Only messages are ranked; entities and paths are evidence on them
+    expect(results.every((r) => r.type === 'message')).toBe(true);
+    expect(results[0].id).toBe('m1');
+    expect(results[0].meta.matchedEntities).toEqual(['pgbouncer']);
+    // Depth 1 from the query's entity: no outgoing edge of its own to show
+    expect(results[0].meta.paths).toEqual([]);
 
-    const path = results.find((r) => r.type === 'path');
-    expect(path?.content).toContain('pgbouncer');
+    const direct = await retriever.search({ query: 'tell me about pgbouncer', k: 1 });
+    expect(direct[0].id).toBe('m1');
+  });
+
+  it('matches query entities as whole words', async () => {
+    const retriever = new GraphRAGRetriever();
+    retriever.indexEntity(entity('cache'));
+    await retriever.indexMessage(msg('m1', 'lunch at noon'), undefined, { entityIds: ['cache'] });
+    const results = await retriever.search({ query: 'is the cached value stale', k: 1 });
+    expect(results[0]?.meta.matchedEntities ?? []).toEqual([]);
   });
 
   it('deduplicates repeated relations', () => {

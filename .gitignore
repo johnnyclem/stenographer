@@ -6,5 +6,6 @@ dist-cli/
 *.log
 *.db
 *.jsonl
+rest-token
 # The truth-format golden fixtures are the published contract
 !spec/truth-format/fixtures/**/*.jsonl

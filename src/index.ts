@@ -1,9 +1,28 @@
 // Stenographer — Main Entry Point
-export { Stenographer } from './core/stenographer.js';
+export { Stenographer, EmbedderMismatchError } from './core/stenographer.js';
 export { StenographerServer, runCLI, type ToolProfile } from './mcp/server.js';
 export { RestServer } from './api/rest.js';
-export { StateStore, type StateStoreOptions } from './store/index.js';
-export { Tailer, JsonlAdapter, type LogAdapter, type TailerOptions } from './indexer/tailer.js';
+export { StateStore, type StateStoreOptions, type IngestCheckpoint } from './store/index.js';
+export {
+  Tailer,
+  JsonlAdapter,
+  logSessionId,
+  type LogAdapter,
+  type LineContext,
+  type TailerOptions,
+  type TailPosition,
+  type IngestPosition,
+} from './indexer/tailer.js';
+export { type RestServerOptions } from './api/rest.js';
+export { resolveRestToken, restTokenPath, REST_TOKEN_FILE, type RestToken } from './api/auth.js';
+export {
+  answerContextConsult,
+  ContextConsultSchema,
+  type ContextConsult,
+  type ContextAnswer,
+  type ContextHit,
+  type ContestFact,
+} from './api/appa-context.js';
 export {
   OpenAIAdapter,
   AnthropicAdapter,
@@ -13,8 +32,15 @@ export {
   getAdapter,
   detectAdapter,
   detectAdapterFromLines,
+  matchAdapterFromLines,
 } from './indexer/adapters.js';
-export { ImportanceDetector, extractStructure, extractEntities, type ExtractedStructure } from './indexer/importance.js';
+export {
+  ImportanceDetector,
+  extractStructure,
+  extractEntities,
+  assertableProse,
+  type ExtractedStructure,
+} from './indexer/importance.js';
 export {
   LocalEmbedder,
   HashedEmbedder,
@@ -23,8 +49,13 @@ export {
   VectorIndex,
   EmbeddingCache,
   cosineSimilarity,
+  sameEmbedder,
+  describeEmbedder,
   EMBEDDING_DIMENSIONS,
+  DEFAULT_EMBEDDING_MODEL,
   type Embedder,
+  type EmbedderIdentity,
+  type CreateEmbedderOptions,
 } from './indexer/embeddings.js';
 export {
   GraphRAGRetriever,
@@ -136,10 +167,21 @@ export {
   createMcpChannelTransport,
   formatObjection,
   formatObjectionBatch,
+  redactUrl,
+  webhookHeaders,
+  webhookId,
+  assertWebhookSecret,
+  DeliveryError,
   DEFAULT_OBJECTION_BATCH_SIZE,
+  DEFAULT_MAX_ATTEMPTS,
+  DEFAULT_RETRY_BASE_MS,
+  DEFAULT_MAX_BATCH_DELAY_MS,
+  MIN_WEBHOOK_SECRET_BYTES,
   type ObjectionSinkConfig,
   type ObjectionTransport,
+  type DeadLetter,
 } from './truth/delivery.js';
+export { displayText } from './truth/display.js';
 export {
   raiseForNotarization,
   formatProposalNotice,

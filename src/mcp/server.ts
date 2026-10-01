@@ -102,6 +102,11 @@ const DESTRUCTIVE: ToolAnnotations = { readOnlyHint: false, destructiveHint: tru
 const args = <T extends z.ZodRawShape>(shape: T) => z.object(shape).strict();
 const NO_ARGS = args({});
 
+/** Upper bounds for list sizes (the REST API clamps to the same): larger requests are clamped, not refused. */
+const MAX_K = 200;
+const MAX_MESSAGES = 1000;
+const MAX_DEPTH = 5;
+
 /** An integer limit: a default, clamped to [min, max] rather than handed to SQL as-is. */
 const limit = (description: string, fallback: number, max: number, min = 1) =>
   z
@@ -345,7 +350,7 @@ export class StenographerServer {
       tool({
         name: 'get_recent_messages',
         description: 'Get the N most recent messages from the conversation',
-        input: args({ n: limit('Number of messages to retrieve', 10, 500) }),
+        input: args({ n: limit('Number of messages to retrieve', 10, MAX_MESSAGES) }),
         annotations: READ_ONLY,
         run: ({ n }) => e.getRecentMessages(n),
       }),
@@ -396,13 +401,14 @@ export class StenographerServer {
       tool({
         name: 'search_conversation',
         description:
-          'Search the conversation semantically using GraphRAG - hybrid vector + graph search. ' +
+          'Search the conversation with GraphRAG: messages ranked by reciprocal rank fusion of vector ' +
+          'similarity, entity-graph evidence, recency and importance (the evidence is in each result\'s meta). ' +
           'Results include relevant truth-ledger entries (per truthFilter, default "current"). ' +
           CONSUMPTION_RULES,
         input: args({
           query: z.string().describe('Search query').default(''),
-          k: limit('Number of results', 5, 50),
-          graph_depth: limit('Graph traversal depth', 2, 5),
+          k: limit('Number of results', 5, MAX_K),
+          graph_depth: limit('Graph traversal depth', 2, MAX_DEPTH, 0),
           truthFilter: TruthFilterArg,
         }),
         annotations: READ_ONLY,
@@ -415,13 +421,15 @@ export class StenographerServer {
       tool({
         name: 'search_similar',
         description: 'Pure vector similarity search over indexed messages (persistent index)',
-        input: args({ query: z.string().describe('Search query').default(''), k: limit('Number of results', 5, 50) }),
+        input: args({ query: z.string().describe('Search query').default(''), k: limit('Number of results', 5, MAX_K) }),
         annotations: READ_ONLY,
         run: ({ query, k }) => e.searchSimilar(query, k),
       }),
       tool({
         name: 'get_context_frame',
-        description: 'Build a context frame within a token budget for the next LLM call',
+        description:
+          'Build a context frame for the next LLM call: entities, active decisions and recent messages, ' +
+          'all within the token budget (estimated at 4 characters per token)',
         input: args({ budget: limit('Token budget', 2000, 100_000) }),
         annotations: READ_ONLY,
         run: ({ budget }) => e.buildContextFrame(budget),
@@ -438,6 +446,7 @@ export class StenographerServer {
           objections: await e.getObjectionStats(),
           retriever: e.retriever.getStats(),
           vectorBackend: e.store.vectorSearchBackend,
+          embedder: e.embedderIdentity,
           sessionId: e.getSessionId(),
           mode: e.config.mode,
           profile: this.profile,
@@ -847,7 +856,11 @@ export async function runCLI(args: string[]): Promise<void> {
       adapter: { type: 'string', short: 'a' },
       'rest-port': { type: 'string' },
       'rest-host': { type: 'string' },
+      'rest-allow-host': { type: 'string', multiple: true },
+      'rest-insecure': { type: 'boolean' },
       embeddings: { type: 'string', short: 'e' },
+      reembed: { type: 'boolean' },
+      'supersede-threshold': { type: 'string' },
       objections: { type: 'string' },
       'objection-channel': { type: 'string', multiple: true },
       'objection-webhook': { type: 'string', multiple: true },
@@ -916,14 +929,27 @@ export async function runCLI(args: string[]): Promise<void> {
     })),
   ];
 
+  const supersedeThreshold =
+    values['supersede-threshold'] !== undefined ? Number(values['supersede-threshold']) : undefined;
+  if (supersedeThreshold !== undefined && !(supersedeThreshold > 0 && supersedeThreshold <= 1)) {
+    console.error(`--supersede-threshold must be a number in (0, 1], got '${values['supersede-threshold']}'`);
+    process.exit(1);
+  }
+
   const config: StenographerConfig = {
     logPath,
     statePath,
     mode,
     adapter: values.adapter as StenographerConfig['adapter'],
     embeddingModel: values.embeddings,
+    reembed: Boolean(values.reembed),
+    supersedeThreshold,
     restPort: values['rest-port'] ? Number.parseInt(values['rest-port'], 10) : undefined,
     restHost: values['rest-host'] as string | undefined,
+    // Like the other secrets, the REST token comes from the environment
+    restToken: process.env.STENOGRAPHER_REST_TOKEN || undefined,
+    restInsecure: Boolean(values['rest-insecure']),
+    restAllowedHosts: values['rest-allow-host'] as string[] | undefined,
     objectionMode,
     objectionSinks,
     objectionMcpChannel: !values['no-mcp-channel'],

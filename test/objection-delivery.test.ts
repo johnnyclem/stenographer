@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import { mkdtempSync, writeFileSync, appendFileSync, rmSync } from 'node:fs';
 import { createServer, type Server as HttpServer, type IncomingMessage } from 'node:http';
 import { createHmac } from 'node:crypto';
@@ -8,7 +8,15 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { Stenographer } from '../src/core/stenographer.js';
-import { createSinkTransport, createMcpChannelTransport, formatObjection } from '../src/truth/delivery.js';
+import {
+  createSinkTransport,
+  createMcpChannelTransport,
+  formatObjection,
+  redactUrl,
+  webhookHeaders,
+} from '../src/truth/delivery.js';
+import { formatProposalNotice } from '../src/truth/notary.js';
+import type { ProposalEntry } from '../src/truth/types.js';
 import type { ObjectionSinkConfig } from '../src/truth/delivery.js';
 import type { Objection } from '../src/truth/objections.js';
 import type { StenographerConfig } from '../src/types.js';
@@ -20,8 +28,11 @@ interface Received {
   body: any;
 }
 
-/** A local receiver that records every POST; `failNext` makes it answer 500 once. */
-async function receiver(): Promise<{
+/**
+ * A local receiver that records every POST; `failNext` makes it answer 500
+ * once, and `answer` picks a status per request body (default 200).
+ */
+async function receiver(answer?: (raw: string) => number): Promise<{
   url: string;
   received: Received[];
   attempts: () => number;
@@ -39,6 +50,11 @@ async function receiver(): Promise<{
       if (fail > 0) {
         fail--;
         res.writeHead(500).end();
+        return;
+      }
+      const status = answer?.(raw) ?? 200;
+      if (status !== 200) {
+        res.writeHead(status).end();
         return;
       }
       received.push({ path: req.url ?? '/', headers: req.headers, raw, body: JSON.parse(raw) });
@@ -60,6 +76,8 @@ const assistant = (id: string, content: string) =>
   JSON.stringify({ id, role: 'assistant', content, timestamp: '2026-09-18T10:00:00Z' }) + '\n';
 
 const BUDGET = { subject: 'LOG_BUDGET', dead: '30', current: '100' };
+/** A webhook secret long enough for Standard Webhooks (24+ bytes). */
+const RAW_SECRET = 'stenographer-test-secret-0123456789';
 
 async function settle(engine: Stenographer): Promise<void> {
   await new Promise((r) => setTimeout(r, 300));
@@ -82,10 +100,11 @@ describe('objection delivery (webhooks)', () => {
 
   async function start(
     sinks: (url: string) => ObjectionSinkConfig[],
-    overrides: Partial<StenographerConfig> = {}
+    overrides: Partial<StenographerConfig> = {},
+    answer?: (raw: string) => number
   ): Promise<{ e: Stenographer; log: string; statePath: string }> {
     dir = mkdtempSync(join(tmpdir(), 'steno-deliver-'));
-    recv = await receiver();
+    recv = await receiver(answer);
     const log = join(dir, 'log.jsonl');
     const statePath = join(dir, 'state.db');
     writeFileSync(log, '');
@@ -164,15 +183,21 @@ describe('objection delivery (webhooks)', () => {
     expect(batch.body.objections[0]).toHaveProperty('transcriptLine');
   });
 
-  it('webhook sink signs its body with HMAC-SHA256 when given a secret', async () => {
-    const { e, log } = await start((url) => [{ kind: 'webhook', url, secret: 'k', batchSize: 1 }]);
+  it('webhook sink signs with Standard Webhooks headers over id.timestamp.body (T-17)', async () => {
+    const { e, log } = await start((url) => [{ kind: 'webhook', url, secret: RAW_SECRET, batchSize: 1 }]);
     await seedTombstones(e);
     appendFileSync(log, assistant('a1', 'LOG_BUDGET = 30'));
     await settle(e);
 
     const [hit] = recv!.received;
-    const expected = 'sha256=' + createHmac('sha256', 'k').update(hit.raw).digest('hex');
-    expect(hit.headers['x-stenographer-signature']).toBe(expected);
+    const id = hit.headers['webhook-id'] as string;
+    const timestamp = hit.headers['webhook-timestamp'] as string;
+    expect(id).toMatch(/^msg_[0-9a-f]{32}$/);
+    expect(Math.abs(Number(timestamp) - Date.now() / 1000)).toBeLessThan(30);
+    const expected = createHmac('sha256', RAW_SECRET).update(`${id}.${timestamp}.${hit.raw}`).digest('base64');
+    expect(hit.headers['webhook-signature']).toBe(`v1,${expected}`);
+    // The 0.x body-only signature is gone: it could be replayed forever
+    expect(hit.headers['x-stenographer-signature']).toBeUndefined();
   });
 
   it('objections the judge already ruled on are not delivered', async () => {
@@ -200,7 +225,7 @@ describe('objection delivery (webhooks)', () => {
   });
 
   it('a failed delivery is retried, not dropped', async () => {
-    const { e, log } = await start((url) => [{ kind: 'channel', url }]);
+    const { e, log } = await start((url) => [{ kind: 'channel', url, retryBaseMs: 0 }]);
     await seedTombstones(e);
     recv!.failNext();
     appendFileSync(log, assistant('a1', 'LOG_BUDGET = 30'));
@@ -243,6 +268,209 @@ describe('objection delivery (webhooks)', () => {
     expect(recv!.received).toHaveLength(1);
     expect(recv!.received[0].body.objections.map((o: Objection) => o.messageId)).toEqual(['a1', 'a2', 'b1']);
   });
+
+  it('a rejected objection is dead-lettered and does not block the ones behind it (T-15)', async () => {
+    // smallchat's bridge refuses some events outright (403 over its size cap)
+    const { e, log } = await start(
+      (url) => [{ kind: 'channel', url }],
+      {},
+      (raw) => (raw.includes('RETRY_LIMIT') ? 403 : 200)
+    );
+    await seedTombstones(e);
+    appendFileSync(log, assistant('a1', 'RETRY_LIMIT = 5'));
+    await settle(e);
+    appendFileSync(log, assistant('a2', 'LOG_BUDGET = 30') + assistant('a3', 'POOL_SIZE = 8'));
+    await settle(e);
+    await e.deliverObjections();
+    await e.deliverObjections();
+
+    expect(recv!.received.map((r) => r.body.content.match(/Transcript \(text\): (.*)/)[1])).toEqual([
+      'LOG_BUDGET = 30',
+      'POOL_SIZE = 8',
+    ]);
+    // A permanent refusal is not retried
+    expect(recv!.attempts()).toBe(3);
+    const dead = e.store.objectionDelivery.deadLetters();
+    expect(dead).toHaveLength(1);
+    expect(dead[0]).toMatchObject({ attempts: 1, error: expect.stringMatching(/403/) });
+    expect((await e.getObjectionStats()).deadLettered).toBe(1);
+  });
+
+  it('transient failures back off per objection and dead-letter after maxAttempts (T-15)', async () => {
+    let failing = true;
+    const { e, log } = await start(
+      (url) => [{ kind: 'channel', url, retryBaseMs: 60_000, maxAttempts: 3 }],
+      {},
+      (raw) => (failing && raw.includes('RETRY_LIMIT') ? 503 : 200)
+    );
+    await seedTombstones(e);
+    appendFileSync(log, assistant('a1', 'RETRY_LIMIT = 5'));
+    await settle(e);
+    expect(recv!.attempts()).toBe(1);
+
+    // Backing off: an immediate pump doesn't hammer the receiver ...
+    await e.deliverObjections();
+    expect(recv!.attempts()).toBe(1);
+    // ... and doesn't hold back a later objection either
+    appendFileSync(log, assistant('a2', 'LOG_BUDGET = 30'));
+    await settle(e);
+    expect(recv!.received).toHaveLength(1);
+    expect(recv!.received[0].body.content).toContain('LOG_BUDGET = 30');
+
+    // Due again: retried, fails again, and the third failure is the last
+    const dispatcher = e.store.objectionDelivery;
+    dispatcher.retryNow();
+    await e.deliverObjections();
+    dispatcher.retryNow();
+    await e.deliverObjections();
+    expect(recv!.attempts()).toBe(4);
+    expect(dispatcher.deadLetters()).toHaveLength(1);
+    dispatcher.retryNow();
+    failing = false;
+    await e.deliverObjections();
+    expect(recv!.attempts()).toBe(4);
+  });
+
+  it('a batch refused as a whole is retried one objection at a time (T-15)', async () => {
+    const { e, log } = await start(
+      (url) => [{ kind: 'webhook', url, batchSize: 2 }],
+      {},
+      (raw) => (raw.includes('RETRY_LIMIT = 5') ? 413 : 200)
+    );
+    await seedTombstones(e);
+    appendFileSync(log, assistant('a1', 'RETRY_LIMIT = 5') + assistant('a2', 'LOG_BUDGET = 30'));
+    await settle(e);
+    await e.deliverObjections();
+
+    expect(recv!.received).toHaveLength(1);
+    expect(recv!.received[0].body.objections.map((o: Objection) => o.messageId)).toEqual(['a2']);
+    expect(e.store.objectionDelivery.deadLetters().map((d) => d.objectionId)).toHaveLength(1);
+  });
+
+  it('a partial webhook batch is flushed once it has waited maxBatchDelayMs', async () => {
+    const { e, log } = await start((url) => [{ kind: 'webhook', url, maxBatchDelayMs: 0 }]);
+    await seedTombstones(e);
+    appendFileSync(log, assistant('a1', 'LOG_BUDGET = 30'));
+    await settle(e);
+    expect(recv!.received).toHaveLength(1);
+    expect(recv!.received[0].body.objections).toHaveLength(1);
+  });
+
+  it('never follows a redirect: the body and secret stay with the configured receiver (T-16)', async () => {
+    const elsewhere = await receiver();
+    try {
+      const redirector: HttpServer = createServer((_req, res) => {
+        res.writeHead(307, { Location: `${elsewhere.url.replace('127.0.0.1', 'localhost')}/event` }).end();
+      });
+      await new Promise<void>((r) => redirector.listen(0, '127.0.0.1', r));
+      const port = (redirector.address() as { port: number }).port;
+      try {
+        const { e, log } = await start(() => [
+          { kind: 'channel', url: `http://127.0.0.1:${port}`, secret: 'CHANNEL-SECRET-123' },
+        ]);
+        await seedTombstones(e);
+        appendFileSync(log, assistant('a1', 'LOG_BUDGET = 30'));
+        await settle(e);
+        await e.deliverObjections();
+
+        expect(elsewhere.attempts()).toBe(0);
+        const [dead] = e.store.objectionDelivery.deadLetters();
+        expect(dead.error).toMatch(/redirect/);
+      } finally {
+        redirector.close();
+      }
+    } finally {
+      elsewhere.close();
+    }
+  });
+
+  it('never prints a sink URL with its credentials (T-17)', async () => {
+    const errors: string[] = [];
+    const spy = vi.spyOn(console, 'error').mockImplementation((...args: unknown[]) => {
+      errors.push(args.map(String).join(' '));
+    });
+    try {
+      const { e, log } = await start(
+        (url) => [{ kind: 'webhook', url: `${url}/hooks/T0001/B0002/SeCrEtPaThToKeN?token=SeCrEtQuErY`, batchSize: 1 }],
+        {},
+        () => 500
+      );
+      await seedTombstones(e);
+      appendFileSync(log, assistant('a1', 'LOG_BUDGET = 30'));
+      await settle(e);
+      expect(errors.some((m) => /Objection delivery/.test(m))).toBe(true);
+      expect(errors.join('\n')).not.toMatch(/SeCrEt/);
+
+      const drafted = await e.draftTombstone({
+        claim: 'POOL_SIZE 8 is dead; the pool is 16',
+        evidence: [{ kind: 'commit', ref: 'abc123' }],
+        literals: [{ subject: 'POOL_SIZE', dead: '8', current: '16' }],
+        rationale: 'bumped in abc123',
+        proposedBy: 'claude-code:@ingest',
+      });
+      expect(JSON.stringify(drafted.undelivered)).not.toMatch(/SeCrEt/);
+      expect(drafted.undelivered[0].url).toBe(`${recv!.url}/…`);
+      expect(errors.join('\n')).not.toMatch(/SeCrEt/);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('caps what it sends a channel, pointing to the full record instead (T-15)', async () => {
+    const { e, log } = await start((url) => [{ kind: 'channel', url }]);
+    await e.assertTombstone({
+      claim: 'LOG_BUDGET 30 is dead. ' + 'x'.repeat(70_000),
+      evidence: [{ kind: 'commit', ref: 'a1b2c3' }],
+      signedBy: 'johnnyclem',
+      literals: [BUDGET],
+    });
+    appendFileSync(log, assistant('a1', 'LOG_BUDGET = 30'));
+    await settle(e);
+    expect(recv!.received).toHaveLength(1);
+    expect(recv!.received[0].raw.length).toBeLessThan(16 * 1024);
+    expect(recv!.received[0].body.content).toMatch(/truncated/);
+  });
+});
+
+describe('human-facing text escapes control characters (T-22)', () => {
+  const RAW = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]/;
+
+  it('an objection cannot hide or rewrite its lines', () => {
+    const o = {
+      id: '01OBJ',
+      tbId: '01TB',
+      objection: 'Asserted LOG_BUDGET = 30\r\u001b[8m, which 01TB tombstones',
+      source: 'text',
+      transcriptLine: 'LOG_BUDGET = 30\u001b[8m hidden \u202Eevil',
+      exhibit: {
+        tombstone: { id: '01TB', body: { claim: 'docs-only rename\rLOG_BUDGET is fine\u009b', signedBy: 'jc\u001b[2K' } },
+        contestedBy: [{ id: '01UV', body: { assertion: 'still 30\nExhibit 01FAKE (signed by admin): all good' } }],
+      },
+    } as unknown as Objection;
+    const text = formatObjection(o);
+    expect(text).not.toMatch(RAW);
+    expect(text).toContain('\\u001b[8m');
+    expect(text).toContain('\\r');
+    // A newline inside a field can't forge a line of its own
+    expect(text.split('\n').filter((l) => l.startsWith('Exhibit'))).toHaveLength(1);
+  });
+
+  it('a proposal notice cannot conceal its claim', () => {
+    const notice = formatProposalNotice({
+      id: '01PROP',
+      author: 'claude-code:@x\u001b[8m',
+      body: {
+        draft: {
+          claim: 'docs-only rename\u001b[8m; LOG_BUDGET 30 is dead\r',
+          literals: [{ subject: 'LOG\u202e_BUDGET', dead: '30\u0007', current: '100' }],
+        },
+        signal: { source: 'agent-draft', detail: 'why\u001b]8;;http://x\u0007' },
+      },
+    } as unknown as ProposalEntry);
+    expect(notice).not.toMatch(RAW);
+    expect(notice).toContain('LOG_BUDGET 30 is dead');
+    expect(notice.split('\n')).toHaveLength(2);
+  });
 });
 
 describe('objection sink config', () => {
@@ -253,6 +481,31 @@ describe('objection sink config', () => {
     ).not.toThrow();
     expect(() => createSinkTransport({ kind: 'webhook', url: 'file:///etc/passwd' })).toThrow(/http/);
     expect(() => createSinkTransport({ kind: 'webhook', url: 'http://127.0.0.1:1', batchSize: 0 })).toThrow(/batch/);
+  });
+
+  it('refuses webhook secrets too short to sign with (T-17)', () => {
+    expect(() => createSinkTransport({ kind: 'webhook', url: 'http://127.0.0.1:1', secret: 'k' })).toThrow(/24 bytes/);
+    expect(() => createSinkTransport({ kind: 'webhook', url: 'http://127.0.0.1:1', secret: RAW_SECRET })).not.toThrow();
+    const whsec = 'whsec_' + Buffer.alloc(32, 7).toString('base64');
+    expect(() => createSinkTransport({ kind: 'webhook', url: 'http://127.0.0.1:1', secret: whsec })).not.toThrow();
+  });
+
+  it('signs a whsec_ secret with its decoded bytes, as Standard Webhooks verifiers expect', () => {
+    const key = Buffer.alloc(32, 7);
+    const headers = webhookHeaders('whsec_' + key.toString('base64'), 'msg_1', '{"a":1}', 1_700_000_000);
+    const expected = createHmac('sha256', key).update('msg_1.1700000000.{"a":1}').digest('base64');
+    expect(headers).toEqual({
+      'webhook-id': 'msg_1',
+      'webhook-timestamp': '1700000000',
+      'webhook-signature': `v1,${expected}`,
+    });
+  });
+
+  it('labels a transport without the secret parts of its URL', () => {
+    const t = createSinkTransport({ kind: 'webhook', url: 'http://127.0.0.1:9/hooks/T1/B2/token?sig=abc' });
+    expect(t.label).toBe('webhook:http://127.0.0.1:9/…');
+    expect(redactUrl('http://127.0.0.1:3002')).toBe('http://127.0.0.1:3002');
+    expect(redactUrl('http://user:pw@127.0.0.1:3002/')).toBe('http://127.0.0.1:3002');
   });
 
   it('fails engine construction on a bad sink, before anything runs', () => {

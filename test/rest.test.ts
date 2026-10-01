@@ -37,6 +37,10 @@ describe('REST API', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
+  /** Every route needs the bearer token (see rest-security.test.ts). */
+  const fetch = (url: string, init: RequestInit = {}) =>
+    globalThis.fetch(url, { ...init, headers: { Authorization: `Bearer ${engine.restToken}` } });
+
   const getJson = async (path: string) => {
     const res = await fetch(`${base}${path}`);
     return { status: res.status, body: await res.json() };
@@ -94,7 +98,7 @@ describe('REST API', () => {
   });
 
   it('binds to loopback by default, not all interfaces', () => {
-    // The REST API has no authentication — it must not default to 0.0.0.0.
+    // The REST API serves transcripts — it must not default to 0.0.0.0.
     const address = (engine as any).restServer.server.address();
     expect(address.address).toMatch(/^(127\.0\.0\.1|::1)$/);
   });

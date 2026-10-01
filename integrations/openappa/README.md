@@ -140,7 +140,12 @@ every other battery's trust requirement.
 OpenAPPA's runtime and stenographer's REST daemon both default to
 `127.0.0.1:8787`. The plugin's hooks expect the runtime there and block
 every action while it doesn't answer, so give the daemon another free
-port with `--rest-port`.
+port with `--rest-port`, such as 8789. The daemon can then also serve
+OpenAPPA's context consults (`POST /appa/context`, behind the REST bearer
+token; see the main README's "OpenAPPA context provider"): bind it as
+`[externals.context.stenographer]` with `url =
+"http://127.0.0.1:8789/appa/context"` and `token_env` naming a variable
+that holds the contents of `<state dir>/rest-token`.
 
 ## Do not bind stenographer annotators to broad root rules
 

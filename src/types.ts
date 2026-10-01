@@ -6,10 +6,22 @@
 import { z } from 'zod';
 import type { ObjectionSinkConfig } from './truth/delivery.js';
 import type { SignerRegistryFile } from './truth/identity.js';
+import type { Embedder } from './indexer/embeddings.js';
 
 // ─────────────────────────────────────────────────────────────
 // Message Schema (input from JSONL tailer)
 // ─────────────────────────────────────────────────────────────
+
+/**
+ * What a record is when it isn't first-hand prose: a tool's output
+ * (`tool_result`), harness bookkeeping such as Claude Code's isMeta caveats
+ * and slash-command echoes (`meta`), a subagent's transcript (`sidechain`),
+ * or a compaction summary (`compact_summary`). Tagged records stay
+ * searchable, but are never mined for decisions, corrections or entities.
+ */
+export const MessageTagSchema = z.enum(['tool_result', 'meta', 'sidechain', 'compact_summary']);
+
+export type MessageTag = z.infer<typeof MessageTagSchema>;
 
 export const MessageSchema = z.object({
   id: z.string(),
@@ -26,6 +38,7 @@ export const MessageSchema = z.object({
   })).optional(),
   model: z.string().optional(),
   sessionId: z.string().optional(),
+  tags: z.array(MessageTagSchema).optional(),
 });
 
 export type ConversationMessage = z.infer<typeof MessageSchema>;
@@ -107,9 +120,16 @@ export interface IndexedMessage {
   role: string;
   content: string;
   timestamp: string;
+  /** The message's vector, or its first chunk's; [] when it has no text to embed. */
   embedding: number[];
+  /** Every chunk's vector, for a message long enough to be embedded in windows. */
+  chunkEmbeddings?: number[][];
   importanceScore: ImportanceScore;
   entityIds: string[];
+  tags?: MessageTag[];
+  toolCalls?: Array<{ name: string; input: Record<string, unknown> }>;
+  /** Position in the database's ingest order: later-indexed messages have higher seq. */
+  seq?: number;
 }
 
 export interface IndexedDecision {
@@ -181,11 +201,24 @@ export interface StenographerConfig {
   /** Log format adapter; omit to auto-detect from file content. */
   adapter?: 'jsonl' | 'anthropic' | 'openai' | 'claude-code' | 'generic';
   statePath?: string;
-  /** 'hashed' for the offline lexical embedder, or a transformer model name
-   *  (default: Xenova/all-MiniLM-L6-v2; falls back to hashed if unavailable). */
+  /**
+   * 'hashed' for the offline lexical embedder; a transformer model name
+   * (default: Xenova/all-MiniLM-L6-v2), which fails to start if it can't be
+   * loaded; or 'auto': the embedder the state database is pinned to, else
+   * the default model with a loud fallback to hashed.
+   */
   embeddingModel?: string;
-  /** Cosine-similarity threshold above which a new decision/correction
-   *  supersedes an existing active decision. Default 0.6. */
+  /** An embedder instance to use instead of `embeddingModel` (library use). */
+  embedder?: Embedder;
+  /**
+   * The state database is pinned to the embedder that wrote its vectors,
+   * and refuses to open under another. Set this to re-embed every stored
+   * message and truth entry under the configured embedder at startup.
+   */
+  reembed?: boolean;
+  /** Cosine-similarity threshold at or above which a new decision/correction
+   *  supersedes an existing active decision. Default: the embedder's
+   *  calibrated threshold (MiniLM 0.45, hashed 0.75). */
   supersedeThreshold?: number;
   /**
    * TB/UV v2 rollout mode for the asserted-truth ledger:
@@ -268,11 +301,28 @@ export interface StenographerConfig {
   restPort?: number;
   /**
    * Host/interface for the REST API to bind to. Defaults to `127.0.0.1` —
-   * the API has no authentication, so it stays loopback-only unless the
+   * the API serves transcripts, so it stays loopback-only unless the
    * operator explicitly opts into wider exposure (e.g. `0.0.0.0` in a
-   * container reached only through a trusted network boundary).
+   * container reached only through a trusted network boundary). A named
+   * host is also accepted in the Host header.
    */
   restHost?: string;
+  /**
+   * Bearer token every REST request must carry (`STENOGRAPHER_REST_TOKEN`,
+   * at least 16 characters). Default: one generated on first run into
+   * `<state dir>/rest-token`, mode 0600, and reused after.
+   */
+  restToken?: string;
+  /**
+   * Serve REST without a bearer token (`--rest-insecure`). Host and Origin
+   * are still checked, so a web page can't read it by DNS rebinding.
+   */
+  restInsecure?: boolean;
+  /**
+   * Host names REST answers to besides loopback and `restHost`
+   * (`--rest-allow-host`, e.g. the name a container is reached by).
+   */
+  restAllowedHosts?: string[];
   /** Reserved for Tier-1 model-based extraction (roadmap). */
   extractionThreshold?: number;
   /** Reserved (roadmap). */

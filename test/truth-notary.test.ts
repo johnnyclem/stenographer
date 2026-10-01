@@ -17,6 +17,8 @@ const DRAFT = {
   rationale: 'config.ts was bumped in a1b2c3',
 };
 const AGENT = 'claude-code:@ingest';
+/** The REST bearer token every route requires. */
+const REST_TOKEN = 'notary-tests-rest-token-0123456789';
 
 describe('agent-drafted tombstones (ledger)', () => {
   const ledger = () => new TruthLedger(new Database(':memory:'));
@@ -108,6 +110,7 @@ describe('agent-drafted tombstones (MCP + REST)', () => {
     server = new StenographerServer({
       logPath: join(dir, 'log.jsonl'),
       statePath: ':memory:',
+      restToken: REST_TOKEN,
       mode: 'catchup',
       embeddingModel: 'hashed',
       restPort: 0,
@@ -125,7 +128,11 @@ describe('agent-drafted tombstones (MCP + REST)', () => {
   const post = (url: string, body: unknown, secret?: string) =>
     fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...(secret ? { 'X-Notary-Secret': secret } : {}) },
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${REST_TOKEN}`,
+        ...(secret ? { 'X-Notary-Secret': secret } : {}),
+      },
       body: JSON.stringify(body),
     });
 
@@ -162,7 +169,7 @@ describe('agent-drafted tombstones (MCP + REST)', () => {
       /operator tool/
     );
 
-    const inbox = await (await fetch(`${base}/proposals?status=open`)).json();
+    const inbox = await (await fetch(`${base}/proposals?status=open`, { headers: { Authorization: `Bearer ${REST_TOKEN}` } })).json();
     expect(inbox.map((p: { id: string }) => p.id)).toEqual([proposal.id]);
 
     const notarize = `${base}/proposals/${proposal.id}/notarize`;
