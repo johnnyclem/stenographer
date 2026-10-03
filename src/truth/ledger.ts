@@ -18,6 +18,7 @@ import { z } from 'zod';
 import { CHAIN_VERSION, chainRecord, recordHash, linkKey, verifyLedger, type IntegrityReport, type LedgerRow } from './chain.js';
 import { canonicalize } from './jcs.js';
 import { deriveAll, deriveStatus, deriveStruck, recordedStatus, type InboundLink } from './status.js';
+import { checkQuorum, hasAgentPrefix, literalSetKey, quorumEvidence, type AgentClassifier, type QuorumMember } from './quorum.js';
 import {
   ulid,
   canonicalIdentity,
@@ -135,9 +136,9 @@ export const LINE_ENVELOPE_FIELDS: readonly string[] = ['schemaVersion', 'seq', 
  * kept in the body's `extra` and exported again as written.
  */
 export const LINE_BODY_FIELDS: Readonly<Record<'TB' | 'UV' | 'ADDENDUM' | 'RULING', readonly string[]>> = {
-  TB: ['claim', 'evidence', 'signedBy', 'literals', 'status'],
+  TB: ['claim', 'evidence', 'signedBy', 'literals', 'quorum', 'status'],
   UV: ['assertion', 'basis', 'verifyBy', 'contests', 'status'],
-  ADDENDUM: ['evidence', 'note'],
+  ADDENDUM: ['evidence', 'note', 'quorum'],
   RULING: ['kind', 'opinion', 'target'],
 };
 
@@ -149,10 +150,26 @@ const extraFields = (type: keyof typeof LINE_BODY_FIELDS) =>
       for (const key of Object.keys(extra)) {
         if (LINE_ENVELOPE_FIELDS.includes(key) || LINE_BODY_FIELDS[type].includes(key)) {
           ctx.addIssue({ code: z.ZodIssueCode.custom, message: `'${key}' is a field a ${type} line defines, not an unknown one` });
+        } else if (key === 'quorum') {
+          // The format defines it, for TB and ADDENDUM lines only (spec, Agent quorum)
+          ctx.addIssue({ code: z.ZodIssueCode.custom, message: `a ${type} line carries no quorum: only a TB or an ADDENDUM does` });
         }
       }
     })
     .optional();
+
+/**
+ * A quorum member as stored: who, which session, when, the evidence it
+ * brought and, on an addendum, its verdict. The rules across members and
+ * the line are checkQuorum's (quorum.ts).
+ */
+const QuorumMemberSchema = z.object({
+  author: z.string(),
+  agentSessionId: z.string(),
+  ts: z.string().refine(isRfc3339DateTime, 'a quorum member\'s ts is an RFC 3339 date-time naming a real time'),
+  evidence: z.array(EvidenceSchema).min(1, 'a quorum member cites evidence'),
+  verdict: z.enum(['verified', 'refuted']).optional(),
+});
 
 // What admit() checks, per entry type. Bodies are checked as stored: the
 // same building blocks the write-time input schemas use (types.ts), without
@@ -166,6 +183,7 @@ const STORED_BODY: Partial<Record<TruthEntryType, z.ZodTypeAny>> = {
       evidence: z.array(EvidenceSchema).min(1, 'a TB requires at least one piece of evidence'),
       signedBy: z.string().nullable(),
       literals: z.array(TombstonedLiteralSchema).optional(),
+      quorum: z.array(QuorumMemberSchema).optional(),
       // Recorded by a pre-1.0 ledger or a v1 wiki line; a terminal one is a floor (status.ts)
       status: z.enum(TB_STATUSES).optional(),
       extra: extraFields('TB'),
@@ -185,6 +203,7 @@ const STORED_BODY: Partial<Record<TruthEntryType, z.ZodTypeAny>> = {
     .object({
       evidence: z.array(EvidenceSchema).min(1, 'an addendum requires at least one piece of evidence'),
       note: z.string().nullable().optional(),
+      quorum: z.array(QuorumMemberSchema).optional(),
       extra: extraFields('ADDENDUM'),
     })
     .strict(),
@@ -238,14 +257,32 @@ function formatIssues(error: z.ZodError): string {
   return error.issues.map((i) => (i.path.length > 0 ? `${i.path.join('.')}: ${i.message}` : i.message)).join('; ');
 }
 
+export interface TruthLedgerOptions {
+  /**
+   * Who is an agent, for the agent quorum (spec/truth-format, "Agent
+   * quorum"): a TB an agent signs, or an agent's resolution of a UV, needs a
+   * quorum, and an agent never overrides, strikes or rules. Default: an
+   * identity whose key starts with `agent:`. Stenographer installs one that
+   * reads its signer registry (identity.ts agentClassifier).
+   */
+  isAgent?: AgentClassifier;
+}
+
 export class TruthLedger {
   private db: Database.Database;
   /** Bumped on every write through this instance — cheap cache invalidation. */
   private writes = 0;
+  private classifyAgent: AgentClassifier;
 
-  constructor(db: Database.Database) {
+  constructor(db: Database.Database, options: TruthLedgerOptions = {}) {
     this.db = db;
+    this.classifyAgent = options.isAgent ?? hasAgentPrefix;
     this.init();
+  }
+
+  /** Whether `identity` is an agent's, by this ledger's classifier. */
+  isAgent(identity: string): boolean {
+    return typeof identity === 'string' && this.classifyAgent(identity);
   }
 
   /**
@@ -651,6 +688,7 @@ export class TruthLedger {
     if (entry.type in LINE_BODY_FIELDS && body.extra !== undefined && !opts.imported) {
       fail(`only an imported entry carries extra (a wiki line's unknown fields)`);
     }
+    this.admitAgentAct(entry, links, fail);
 
     // Links: of a type this entry writes, at an entry of the type the link means
     const typeOf = this.db.prepare('SELECT type FROM truth_entries WHERE id = ?');
@@ -687,6 +725,52 @@ export class TruthLedger {
       } else {
         fail(`link ${link.fromId} -${link.type}-> ${link.toId} is not this entry's to write`);
       }
+    }
+  }
+
+  /**
+   * Agents settle claims only together (spec/truth-format, "Agent quorum").
+   * A TB an agent signs, and an agent's ADDENDUM that verifies or refutes a
+   * UV, need a quorum that keeps rules 1–6; a quorum on any line is held to
+   * them. Overriding, striking, dismissing and every ruling stay a person's
+   * acts: an agent never authors one, alone or in a quorum. Who is an agent
+   * is this ledger's classifier's call.
+   */
+  private admitAgentAct(entry: NewEntry, links: TruthLink[], fail: (message: string) => never): void {
+    const body = entry.body as { signedBy?: unknown; evidence?: unknown; quorum?: QuorumMember[]; kind?: unknown };
+    const own = links.filter((l) => l.fromId === entry.id);
+    if ((entry.type === 'TB' || entry.type === 'ADDENDUM') && body.quorum !== undefined) {
+      const issues = checkQuorum({
+        type: entry.type,
+        author: entry.author,
+        ts: entry.createdAt,
+        evidence: body.evidence,
+        signedBy: body.signedBy,
+        quorum: body.quorum,
+        links: own,
+      });
+      if (issues.length > 0) fail(issues.join('; '));
+    }
+    if (entry.type === 'TB' && typeof body.signedBy === 'string' && this.isAgent(body.signedBy) && body.quorum === undefined) {
+      fail(
+        `a TB signed by agent '${body.signedBy}' needs a quorum: agents settle a claim only as two or more agent ` +
+          'sessions agreeing from different angles within 15 minutes, or a person signs it'
+      );
+    }
+    if (entry.type === 'ADDENDUM' && this.isAgent(entry.author)) {
+      if (own.some((l) => l.type === 'overrides')) {
+        fail(`overriding a TB is a person's act: agent '${entry.author}' can't override one, alone or in a quorum`);
+      }
+      const resolved = own.find((l) => l.type === 'verifies' || l.type === 'refutes');
+      if (resolved && body.quorum === undefined) {
+        fail(
+          `agent '${entry.author}' can't settle UV ${resolved.toId} on its own: an agent's resolution needs a quorum of two ` +
+            'or more agent sessions agreeing from different angles within 15 minutes, or a person resolves it'
+        );
+      }
+    }
+    if (entry.type === 'RULING' && this.isAgent(entry.author)) {
+      fail(`a ruling (${String(body.kind)}) is a person's act: agent '${entry.author}' can't file one`);
     }
   }
 
@@ -836,7 +920,9 @@ export class TruthLedger {
    * An agent drafts a tombstone it believes in but may not sign. The draft is
    * validated as a TB would be (evidence, literals) so the notary reviews
    * something that can actually mint, and it is marked `requiresNotary`:
-   * only a person, through the notary path, can turn it into truth.
+   * a person turns it into truth through the notary path, or agent drafts
+   * that agree mint one TB together (mintTombstoneByQuorum). One agent's
+   * draft alone never does.
    */
   draftTombstone(
     input: { claim: string; evidence: Evidence[]; literals?: TombstonedLiteral[]; rationale?: string; targetRef?: string },
@@ -964,7 +1050,7 @@ export class TruthLedger {
   }
 
   private insertTb(
-    input: { claim: string; evidence: Evidence[]; signedBy: string; literals?: TombstonedLiteral[] },
+    input: { claim: string; evidence: Evidence[]; signedBy: string; literals?: TombstonedLiteral[]; quorum?: QuorumMember[] },
     ctx: WriteContext,
     links: Array<{ toId: string; type: LinkType }> = []
   ): TbEntry {
@@ -985,6 +1071,7 @@ export class TruthLedger {
           signedBy: input.signedBy,
           // Only present when given, so literal-free TBs keep their exact shape
           ...(input.literals && input.literals.length > 0 ? { literals: input.literals } : {}),
+          ...(input.quorum ? { quorum: input.quorum } : {}),
         } satisfies Omit<TbBody, 'status'>,
       },
       TruthLedger.outbound(id, links),
@@ -1040,6 +1127,134 @@ export class TruthLedger {
   // ─────────────────────────────────────────────────────────
 
   /**
+   * What a resolution of `uvId` must meet before anything is written: the UV
+   * is open, there is evidence (parsed as a live write parses it), and the
+   * resolver is provenance-independent of the UV — and of the contested TB,
+   * when refuting a contest restores it (conceding by verifying is fine).
+   * resolveUv runs it, and so does an agent's attestation (attestations.ts),
+   * which writes nothing to the ledger on its own.
+   */
+  checkResolution(
+    uvId: string,
+    resolution: 'verified' | 'refuted',
+    evidence: Evidence[],
+    actor: { author: string; signedBy?: string | null; agentSessionId?: string | null }
+  ): { evidence: Evidence[]; uv: UvEntry; contestedTb: TbEntry | null } {
+    const parsedEvidence = evidence.map((e) => EvidenceSchema.parse(e));
+    if (parsedEvidence.length === 0) {
+      throw new TruthWriteError('resolving a UV requires evidence');
+    }
+    const uv = this.mustGetTyped<UvEntry>(uvId, 'UV');
+    if (uv.body.status !== 'open') {
+      throw new TruthWriteError(`UV ${uvId} is already ${uv.body.status}`);
+    }
+    this.requireIndependence(actor, uv, resolution === 'verified' ? 'verify' : 'refute');
+    const contestedTb = uv.body.contests ? this.mustGetTyped<TbEntry>(uv.body.contests, 'TB') : null;
+    // Refuting a contest restores the contested TB: its own authors can't be
+    // the ones to do that (conceding by verifying the contest is fine).
+    if (contestedTb && resolution === 'refuted') {
+      this.requireIndependence(actor, contestedTb, 'refute the contest against');
+    }
+    return { evidence: parsedEvidence, uv, contestedTb };
+  }
+
+  /**
+   * Settles an open UV by an agent quorum (spec/truth-format, "Agent
+   * quorum"): one ADDENDUM that verifies or refutes it, written by the agent
+   * whose attestation completed the quorum (`ctx`), carrying every member
+   * and their evidence (in member order, each item once). Every member meets
+   * the contempt rule a resolver meets. Verifying a UV that contests a TB
+   * would override that TB, which no quorum of agents does: a person does.
+   * Admission checks the quorum's rules.
+   */
+  resolveUvByQuorum(
+    uvId: string,
+    resolution: 'verified' | 'refuted',
+    quorum: QuorumMember[],
+    ctx: WriteContext & { opinion?: string }
+  ): { uv: UvEntry; addendum: AddendumEntry } {
+    const author = this.accountable(ctx.author, 'resolver');
+    const addendumId = this.tx(() => {
+      const uv = this.mustGetTyped<UvEntry>(uvId, 'UV');
+      if (uv.body.status !== 'open') {
+        throw new TruthWriteError(`UV ${uvId} is already ${uv.body.status}`);
+      }
+      const contestedTb = uv.body.contests ? this.mustGetTyped<TbEntry>(uv.body.contests, 'TB') : null;
+      if (contestedTb && resolution === 'verified') {
+        throw new NotarizationRequiredError(
+          `verifying UV ${uvId} would override TB ${contestedTb.id}: agents never override a TB, together or alone — a person does`
+        );
+      }
+      const members = quorum.map((m) => ({ ...m, evidence: m.evidence.map((e) => EvidenceSchema.parse(e)) }));
+      // Every member is a witness: none may stand behind what it settles
+      for (const m of members) {
+        this.requireIndependence(m, uv, resolution === 'verified' ? 'verify' : 'refute');
+        if (contestedTb) this.requireIndependence(m, contestedTb, 'refute the contest against');
+      }
+      const id = ulid();
+      this.append(
+        {
+          id,
+          type: 'ADDENDUM',
+          createdAt: ctx.timestamp ?? new Date().toISOString(),
+          author,
+          provenance: ctx.provenance ?? MANUAL,
+          agentSessionId: ctx.agentSessionId ?? null,
+          origin: 'local',
+          body: { evidence: quorumEvidence(members), note: ctx.opinion ?? null, quorum: members },
+        },
+        TruthLedger.outbound(id, [{ toId: uvId, type: resolution === 'verified' ? 'verifies' : 'refutes' }])
+      );
+      return id;
+    });
+    return { uv: this.getEntry(uvId) as UvEntry, addendum: this.getEntry(addendumId) as AddendumEntry };
+  }
+
+  /**
+   * Mints a TB from agent drafts that agree (spec/truth-format, "Agent
+   * quorum"): open agent drafts (`requiresNotary`, `agent-draft`) of the
+   * same set of literals. The TB is signed by its writer (`ctx.author`, the
+   * agent whose draft completed the quorum), takes the earliest draft's
+   * claim and literals and every draft's evidence, carries one quorum member
+   * per draft (its drafter, session, time and evidence), and signs each
+   * draft, closing it. Admission checks the quorum's rules.
+   */
+  mintTombstoneByQuorum(proposalIds: string[], ctx: WriteContext): TbEntry {
+    const author = this.accountable(ctx.author, 'signer');
+    return this.tx(() => {
+      const drafts = proposalIds
+        .map((id) => this.mustGetTyped<ProposalEntry>(id, 'PROPOSAL'))
+        .sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt) || (a.id < b.id ? -1 : 1));
+      let set: string | null = null;
+      for (const d of drafts) {
+        if (d.body.status !== 'open') throw new TruthWriteError(`proposal ${d.id} is already ${d.body.status}`);
+        if (d.body.kind !== 'tombstone' || !d.body.requiresNotary || d.body.signal?.source !== 'agent-draft') {
+          throw new TruthWriteError(`proposal ${d.id} is not an agent's tombstone draft`);
+        }
+        const literals = (d.body.draft.literals ?? []) as TombstonedLiteral[];
+        if (literals.length === 0) throw new TruthWriteError(`draft ${d.id} names no literals: a quorum TB carries the literals its members agree on`);
+        const key = literalSetKey(literals);
+        if (set !== null && key !== set) throw new TruthWriteError(`drafts ${drafts[0].id} and ${d.id} don't name the same set of literals`);
+        set = key;
+      }
+      if (drafts.length === 0) throw new TruthWriteError('a quorum TB needs the drafts it settles');
+      const quorum: QuorumMember[] = drafts.map((d) => ({
+        author: d.author,
+        agentSessionId: d.agentSessionId ?? '',
+        ts: d.createdAt,
+        evidence: d.body.draft.evidence as Evidence[],
+      }));
+      const earliest = drafts[0].body.draft as { claim: string; literals: TombstonedLiteral[] };
+      const literals = [...new Map(earliest.literals.map((l) => [literalSetKey([l]), l])).values()];
+      return this.insertTb(
+        { claim: earliest.claim, evidence: quorumEvidence(quorum) as Evidence[], signedBy: author, literals, quorum },
+        { ...ctx, author },
+        drafts.map((d) => ({ toId: d.id, type: 'signs' as const }))
+      );
+    });
+  }
+
+  /**
    * Resolves an open UV with an evidence-bearing ADDENDUM. Only evidence
    * stenographer executed self-signs (summary judgment); caller-submitted
    * command output is a claim (`claimed-command`), so any resolution that
@@ -1051,9 +1266,9 @@ export class TruthLedger {
    * - refuted  → the contest closes; the TB derives as active again unless
    *              another contest is open or it was overridden meanwhile
    *
-   * `allowMint: false` (the MCP agent profile) refuses any resolution that
-   * would mint a TB, so an agent cannot turn its own resolution into truth:
-   * that stays a person's call.
+   * `allowMint: false` refuses any resolution that would mint a TB. An
+   * agent's resolution needs a quorum anyway (admission), and the agent
+   * profile goes through attestations (attestations.ts), never here.
    */
   resolveUv(
     uvId: string,
@@ -1064,23 +1279,9 @@ export class TruthLedger {
     const author = this.accountable(ctx.author, 'resolver');
     const signedBy = ctx.signedBy ? this.accountable(ctx.signedBy, 'signer') : undefined;
     ctx = { ...ctx, author, signedBy };
-    const parsedEvidence = evidence.map((e) => EvidenceSchema.parse(e));
-    if (parsedEvidence.length === 0) {
-      throw new TruthWriteError('resolving a UV requires evidence');
-    }
-    const uv = this.mustGetTyped<UvEntry>(uvId, 'UV');
-    if (uv.body.status !== 'open') {
-      throw new TruthWriteError(`UV ${uvId} is already ${uv.body.status}`);
-    }
-    this.requireIndependence(ctx, uv, resolution === 'verified' ? 'verify' : 'refute');
+    const { evidence: parsedEvidence, uv, contestedTb } = this.checkResolution(uvId, resolution, evidence, ctx);
 
     const selfSigning = isSelfSigningEvidence(parsedEvidence);
-    const contestedTb = uv.body.contests ? this.mustGetTyped<TbEntry>(uv.body.contests, 'TB') : null;
-    // Refuting a contest restores the contested TB: its own authors can't be
-    // the ones to do that (conceding by verifying the contest is fine).
-    if (contestedTb && resolution === 'refuted') {
-      this.requireIndependence(ctx, contestedTb, 'refute the contest against');
-    }
     // Minting a TB happens when the resolution invalidates existing truth:
     // a verified contest overrides its TB; a refuted UV that propagated gets
     // a TB minted against the UV itself (mintTombstone carries the claim).
@@ -1439,10 +1640,11 @@ export class TruthLedger {
    * An ADDENDUM or RULING from the wiki whose links change the status of
    * entries this ledger holds (override, verify, refute, strike). Admitted
    * by the same check as every write, and by the contempt rule a live
-   * resolution meets. Status joins on the lattice, so a change whose effect
-   * is already in place (a TB overridden here first) is recorded and changes
-   * nothing. One aimed at an entry this ledger doesn't hold is 'held':
-   * nothing is written, and a later import retries it.
+   * resolution meets (its author's and each quorum member's). Status joins
+   * on the lattice, so a change whose effect is already in place (a TB
+   * overridden here first) is recorded and changes nothing. One aimed at an
+   * entry this ledger doesn't hold, or that fails the contempt rule, is
+   * 'held': nothing is written, and a later import retries it.
    */
   importChange(entry: NewEntry, links: TruthLink[]): { outcome: 'inserted' | 'unchanged' } | { outcome: 'held'; reason: string } {
     return this.atomically(() => {
@@ -1460,14 +1662,27 @@ export class TruthLedger {
           return { outcome: 'held' as const, reason: `its target ${link.toId} is not held here` };
         }
       }
-      // A resolution is corroboration: the contempt rule a live resolveUv meets
-      const actor = { author: entry.author, agentSessionId: entry.agentSessionId };
-      for (const link of links) {
-        if (link.type !== 'verifies' && link.type !== 'refutes') continue;
-        const uv = this.mustGetTyped<UvEntry>(link.toId, 'UV');
-        this.requireIndependence(actor, uv, link.type === 'verifies' ? 'verify' : 'refute');
-        const contested = link.type === 'refutes' && uv.body.contests ? this.getEntry(uv.body.contests) : null;
-        if (contested) this.requireIndependence(actor, contested, 'refute the contest against');
+      // A resolution is corroboration: the contempt rule a live resolveUv
+      // meets, for its author and for every member of its quorum. One that
+      // fails it is held, like any change this ledger can't apply.
+      const quorum = ((entry.body as { quorum?: unknown }).quorum ?? []) as QuorumMember[];
+      const actors = [
+        { author: entry.author, agentSessionId: entry.agentSessionId },
+        ...(Array.isArray(quorum) ? quorum.map((m) => ({ author: m.author, agentSessionId: m.agentSessionId })) : []),
+      ];
+      try {
+        for (const link of links) {
+          if (link.type !== 'verifies' && link.type !== 'refutes') continue;
+          const uv = this.mustGetTyped<UvEntry>(link.toId, 'UV');
+          const contested = link.type === 'refutes' && uv.body.contests ? this.getEntry(uv.body.contests) : null;
+          for (const actor of actors) {
+            this.requireIndependence(actor, uv, link.type === 'verifies' ? 'verify' : 'refute');
+            if (contested) this.requireIndependence(actor, contested, 'refute the contest against');
+          }
+        }
+      } catch (err) {
+        if (err instanceof ContemptError) return { outcome: 'held' as const, reason: err.message };
+        throw err;
       }
       this.append(entry, links, { imported: true });
       return { outcome: 'inserted' as const };

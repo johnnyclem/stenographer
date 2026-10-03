@@ -35,10 +35,12 @@ import { appendWikiFile, defaultWikiDir, readWikiFile, type WikiFileTarget } fro
 import type { TruthFilter } from '../truth/ledger.js';
 import type { Objection, ObjectionMode, ObjectionStatus, ObjectionStats } from '../truth/objections.js';
 import { createSinkTransport, type ObjectionTransport } from '../truth/delivery.js';
-import { formatProposalNotice, raiseForNotarization } from '../truth/notary.js';
+import { formatProposalNotice, formatUvNotice, raiseForNotarization, raiseUvForPerson, type UvRaise } from '../truth/notary.js';
 import { submitProposalEnvelope } from '../truth/intake.js';
 import { ContemptError } from '../truth/ledger.js';
-import { SignerRegistry, resolveIdentity, type SignerRole } from '../truth/identity.js';
+import { SignerRegistry, agentClassifier, resolveIdentity, type SignerRole } from '../truth/identity.js';
+import { settleTombstoneQuorum, type Attestation, type TombstoneQuorumProgress } from '../truth/attestations.js';
+import type { QuorumProgress } from '../truth/quorum.js';
 import type {
   Evidence,
   VerifyBy,
@@ -127,13 +129,20 @@ export class Stenographer implements StenographerAPI {
   private objectionMode: ObjectionMode;
   private sinkTransports: ObjectionTransport[];
   private signers: SignerRegistry | null;
+  private clock: () => number;
 
   constructor(config: StenographerConfig) {
     this.config = config;
     // Until a line names its harness session (Claude Code's sessionId), a
     // log's session is its basename — stable across restarts, never minted
     this.sessionId = logSessionId(config.logPath);
-    this.store = new StateStore(config.statePath || './stenographer.db');
+    this.signers = config.signerRegistry ? SignerRegistry.load(config.signerRegistry) : null;
+    this.clock = config.clock ?? Date.now;
+    // The ledger's agents (for the agent quorum): the registry's, else the
+    // `agent:` prefix, and always this server's own agent identity
+    this.store = new StateStore(config.statePath || './stenographer.db', {
+      isAgent: agentClassifier(this.signers, [config.agentIdentity]),
+    });
     this.detector = new ImportanceDetector();
     // Vector candidates come from the persistent index (chunks, session partitions)
     this.retriever = new GraphRAGRetriever(undefined, {
@@ -146,7 +155,11 @@ export class Stenographer implements StenographerAPI {
     // Validate sinks up front: a bad or non-loopback URL fails at startup,
     // not at the first objection
     this.sinkTransports = (config.objectionSinks ?? []).map(createSinkTransport);
-    this.signers = config.signerRegistry ? SignerRegistry.load(config.signerRegistry) : null;
+  }
+
+  /** Now, by the configured clock: the agent quorum's 15-minute window reads it. */
+  private now(): number {
+    return this.clock();
   }
 
   /** Session scope for queries: single session in file modes, all in watch mode. */
@@ -1111,6 +1124,10 @@ export class Stenographer implements StenographerAPI {
     dedupedInto?: string;
     raisedTo: string[];
     undelivered: Array<{ url: string; error?: string }>;
+    /** An agent's draft: where the quorum that would mint it stands (absent once it minted). */
+    quorum?: TombstoneQuorumProgress;
+    /** The TB this draft minted together with other agent sessions' drafts (spec, Agent quorum). */
+    tombstone?: TbEntry;
   }> {
     const proposedBy = this.resolveIdentity(input.proposedBy, ['agent', 'human'], 'drafter');
     const prior = input.targetRef
@@ -1127,22 +1144,32 @@ export class Stenographer implements StenographerAPI {
       author: proposedBy,
       agentSessionId: input.agentSessionId ?? null,
       embedding,
+      timestamp: new Date(this.now()).toISOString(),
     });
     // Already raised when it was first drafted — don't page the notary twice
-    if (prior && prior.id === proposal.id) {
-      return { proposal, dedupedInto: proposal.id, raisedTo: [], undelivered: [] };
+    const deduped = Boolean(prior && prior.id === proposal.id);
+    let raised: Array<{ url: string; error?: string }> = [];
+    if (!deduped) {
+      console.error(formatProposalNotice(proposal));
+      raised = await raiseForNotarization(this.config.objectionSinks ?? [], proposal, this.notarizeUrl(proposal.id));
     }
-    console.error(formatProposalNotice(proposal));
-    const results = await raiseForNotarization(
-      this.config.objectionSinks ?? [],
+    const result = {
       proposal,
-      this.notarizeUrl(proposal.id)
-    );
-    return {
-      proposal,
-      raisedTo: results.filter((r) => !r.error).map((r) => r.url),
-      undelivered: results.filter((r) => r.error),
+      ...(deduped ? { dedupedInto: proposal.id } : {}),
+      raisedTo: raised.filter((r) => !r.error).map((r) => r.url),
+      undelivered: raised.filter((r) => r.error),
     };
+    // An agent's draft may complete a quorum of agent sessions' drafts, which mints the TB
+    if (!input.agentSessionId || !this.store.truth.isAgent(proposedBy)) return result;
+    const settled = settleTombstoneQuorum(this.store.truth, proposal, {
+      author: proposedBy,
+      agentSessionId: input.agentSessionId,
+      now: this.now(),
+    });
+    if ('progress' in settled) return { ...result, quorum: settled.progress };
+    // Embedded after the fact: the minting transaction can't await the embedder
+    this.store.truth.cacheEmbedding(settled.tombstone.id, await (await this.ensureEmbedder()).embed(settled.tombstone.body.claim));
+    return { ...result, proposal: this.store.truth.getEntry(proposal.id) as ProposalEntry, tombstone: settled.tombstone };
   }
 
   /**
@@ -1271,8 +1298,6 @@ export class Stenographer implements StenographerAPI {
       opinion?: string;
       mintTombstone?: string;
       agentSessionId?: string;
-      /** False refuses any resolution that would mint a TB (the MCP agent profile). */
-      allowMint?: boolean;
     }
   ): Promise<{
     uv: UvEntry;
@@ -1292,9 +1317,89 @@ export class Stenographer implements StenographerAPI {
       opinion: opts.opinion,
       mintTombstone: opts.mintTombstone,
       agentSessionId: opts.agentSessionId ?? null,
-      allowMint: opts.allowMint,
       embedding,
     });
+  }
+
+  /**
+   * An agent's verdict on an open UV (resolve_uv in the agent profile). On
+   * its own it settles nothing: it is recorded as an attestation, and the UV
+   * settles when two or more agent sessions agree from different angles
+   * within 15 minutes (spec/truth-format, "Agent quorum"). Results:
+   * - `attested`: recorded; `quorum` says what is still missing;
+   * - `disputed`: another session's opposite verdict stands within the
+   *   window, so no quorum forms; the first dispute is raised to a person;
+   * - `raised`: a quorum verified a contest, which would override its TB:
+   *   that is raised to a person, and nothing is written to the ledger;
+   * - `settled`: the quorum's ADDENDUM resolved the UV.
+   */
+  async attestUv(
+    uvId: string,
+    resolution: 'verified' | 'refuted',
+    evidence: Evidence[],
+    opts: { author: string; agentSessionId: string; opinion?: string }
+  ): Promise<
+    | { status: 'attested'; uv: UvEntry; attestation: Attestation; quorum: QuorumProgress; detail: string }
+    | {
+        status: 'disputed';
+        uv: UvEntry;
+        attestation: Attestation;
+        dissent: Array<Pick<Attestation, 'author' | 'agentSessionId' | 'resolution' | 'createdAt'>>;
+        raisedTo: string[];
+        undelivered: Array<{ url: string; error?: string }>;
+        detail: string;
+      }
+    | { status: 'raised'; uv: UvEntry; attestation: Attestation; raisedTo: string[]; undelivered: Array<{ url: string; error?: string }>; detail: string }
+    | { status: 'settled'; uv: UvEntry; addendum: AddendumEntry }
+  > {
+    const author = this.resolveIdentity(opts.author, ['agent'], 'the attesting agent');
+    const outcome = this.store.attestations.attest(
+      { uvId, resolution, evidence, author, agentSessionId: opts.agentSessionId, note: opts.opinion ?? null },
+      this.now()
+    );
+    const raise = async (r: Omit<UvRaise, 'cause'>) => {
+      const notice = { ...r, cause: outcome.attestation.id };
+      console.error(formatUvNotice(notice));
+      const results = await raiseUvForPerson(this.config.objectionSinks ?? [], notice);
+      return { raisedTo: results.filter((x) => !x.error).map((x) => x.url), undelivered: results.filter((x) => x.error) };
+    };
+    switch (outcome.status) {
+      case 'settled':
+        return { status: 'settled', uv: outcome.uv, addendum: outcome.addendum };
+      case 'attested':
+        return {
+          status: 'attested',
+          uv: outcome.uv,
+          attestation: outcome.attestation,
+          quorum: outcome.quorum,
+          detail:
+            'Your verdict is recorded; it settles nothing on its own. The UV settles when another agent session agrees ' +
+            `from a different angle (other evidence, another kind) before ${outcome.quorum.windowEndsAt}, or when a person rules.`,
+        };
+      case 'disputed': {
+        const detail = `agent sessions disagree on UV ${uvId} within 15 minutes: no quorum forms while both verdicts stand; a person rules`;
+        return {
+          status: 'disputed',
+          uv: outcome.uv,
+          attestation: outcome.attestation,
+          dissent: outcome.dissent.map(({ author, agentSessionId, resolution, createdAt }) => ({ author, agentSessionId, resolution, createdAt })),
+          ...(outcome.raise ? await raise({ reason: 'dispute', uv: outcome.uv, detail }) : { raisedTo: [], undelivered: [] }),
+          detail,
+        };
+      }
+      case 'raised': {
+        const detail =
+          `${outcome.members.length} agent sessions verified this contest from different angles; ` +
+          `overriding TB ${outcome.tbId} needs a person`;
+        return {
+          status: 'raised',
+          uv: outcome.uv,
+          attestation: outcome.attestation,
+          ...(await raise({ reason: 'contest-verified', uv: outcome.uv, detail, tbId: outcome.tbId })),
+          detail,
+        };
+      }
+    }
   }
 
   /** The force path — fails without evidence. A person's act. */

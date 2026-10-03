@@ -73,9 +73,35 @@ export {
   NotarizationRequiredError,
   type WriteContext,
   type TruthFilter,
+  type TruthLedgerOptions,
   type NewEntry,
   type LedgerRecord,
 } from './truth/ledger.js';
+export {
+  QUORUM_WINDOW_MS,
+  QUORUM_MIN_MEMBERS,
+  AGENT_PREFIX,
+  checkQuorum,
+  chooseQuorum,
+  evidenceKey,
+  hasAgentPrefix,
+  literalSetKey,
+  quorumEvidence,
+  type AgentClassifier,
+  type QuorumCandidate,
+  type QuorumMember,
+  type QuorumProgress,
+  type QuorumSubject,
+  type QuorumVerdict,
+} from './truth/quorum.js';
+export {
+  UvAttestations,
+  ensureAttestationSchema,
+  settleTombstoneQuorum,
+  type Attestation,
+  type AttestOutcome,
+  type TombstoneQuorumProgress,
+} from './truth/attestations.js';
 export {
   verifyLedger,
   chainRecord,
@@ -193,9 +219,12 @@ export {
 export { displayText } from './truth/display.js';
 export {
   raiseForNotarization,
+  raiseUvForPerson,
   formatProposalNotice,
+  formatUvNotice,
   notarySecretMatches,
   NOTARY_SECRET_HEADER,
+  type UvRaise,
 } from './truth/notary.js';
 export { runNotaryCLI, type NotaryIO } from './truth/notary-cli.js';
 export {
@@ -203,6 +232,7 @@ export {
   SignerRegistryFileSchema,
   IdentityError,
   resolveIdentity,
+  agentClassifier,
   type SignerRegistryFile,
   type SignerRole,
 } from './truth/identity.js';

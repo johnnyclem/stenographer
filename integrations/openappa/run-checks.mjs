@@ -50,7 +50,7 @@ async function servedTools() {
   const names = new Set();
   try {
     writeFileSync(join(dir, 'log.jsonl'), '');
-    for (const config of [{}, { allowAgentAssert: true }, { profile: 'operator' }]) {
+    for (const config of [{}, { profile: 'operator' }]) {
       const server = new StenographerServer({
         logPath: join(dir, 'log.jsonl'),
         statePath: ':memory:',

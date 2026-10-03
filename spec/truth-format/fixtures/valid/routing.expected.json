@@ -26,5 +26,16 @@
     "line": 5,
     "outcome": "held",
     "note": "a refutation of a UV this ledger does not hold"
+  },
+  {
+    "line": 6,
+    "outcome": "proposal",
+    "reason": "agent-without-quorum",
+    "note": "a TB an agent signed alone: agents settle claims only as a quorum"
+  },
+  {
+    "line": 7,
+    "outcome": "held",
+    "note": "an agent's verification without a quorum"
   }
 ]

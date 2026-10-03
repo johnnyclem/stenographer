@@ -12,6 +12,7 @@
  */
 
 import { z } from 'zod';
+import type { QuorumMember } from './quorum.js';
 
 // ─────────────────────────────────────────────────────────────
 // Authorship — the stand-behind-it standard
@@ -307,6 +308,8 @@ export interface TbBody {
   status: TbStatus;
   /** Matchable dead literals — optional; only TBs carrying them can raise objections (§12). */
   literals?: TombstonedLiteral[];
+  /** The agent sessions that settled it together, when agents signed it (spec, Agent quorum). */
+  quorum?: QuorumMember[];
   extra?: ExtraFields;
 }
 
@@ -347,10 +350,11 @@ export interface ProposalBody {
   /** Engine bookkeeping (e.g. decision ids to close when signed). */
   meta?: Record<string, unknown>;
   /**
-   * Agent-drafted proposals must be notarized by a person before they mint:
-   * only the notary paths sign them (REST with the notary secret, the
-   * terminal notary, or sign_proposal in the operator profile) — never a
-   * tool in the agent profile.
+   * Agent-drafted proposals don't mint on their drafter's word: a person
+   * notarizes them (REST with the notary secret, the terminal notary, or
+   * sign_proposal in the operator profile), or two or more agent sessions'
+   * drafts of the same literals mint one TB together (the agent quorum,
+   * attestations.ts). Never one agent alone.
    */
   requiresNotary?: boolean;
   status: ProposalStatus;
@@ -363,6 +367,8 @@ export interface ProposalBody {
 export interface AddendumBody {
   evidence: Evidence[];
   note?: string | null;
+  /** The agent sessions whose agreeing verdicts it records, when agents resolved a UV (spec, Agent quorum). */
+  quorum?: QuorumMember[];
   extra?: ExtraFields;
 }
 
@@ -472,7 +478,7 @@ export const DraftEditsSchema = z
 export const CONSUMPTION_RULES = `Consumption rules by confidence type:
 - Active TB: treat as ground truth. A reviewer may block on it; a code agent may rely on it.
 - Contested TB: ground truth with a visible asterisk — cite both the TB and the contesting UV.
-- Open UV: FLAG, DON'T BLOCK. A finding grounded only in a UV is phrased as a question or heads-up, never a demanded change. If your current task would settle the UV cheaply, do so via resolve_uv.
+- Open UV: FLAG, DON'T BLOCK. A finding grounded only in a UV is phrased as a question or heads-up, never a demanded change. If your current task can check the UV, file your verdict and evidence with resolve_uv: it settles only when another agent session agrees from a different angle (other evidence, another kind) within 15 minutes, or when a person rules.
 - Refuted UV / overridden TB: retrievable for history, excluded from current-truth by default, never citable as support for a claim.`;
 
 // ─────────────────────────────────────────────────────────────

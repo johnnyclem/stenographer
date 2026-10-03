@@ -17,6 +17,7 @@ import {
   type GateOptions,
 } from '../src/truth/gate.js';
 import { assertingFields, shellAssertingText } from '../src/truth/asserting.js';
+import { wikiLineHash } from '../src/truth/wiki.js';
 import { LiteralMatcher, MatchDeadlineError } from '../src/truth/literal-matcher.js';
 import type { TbEntry } from '../src/truth/types.js';
 
@@ -287,8 +288,9 @@ describe('gate: wiki source', () => {
   it('folds statuses: overridden and struck TBs are not enforced, active ones are', () => {
     const lines = readFileSync(wiki, 'utf8').split('\n');
     const { tombstones } = wikiMatchableTombstones(lines);
-    // The LOG_BUDGET TB was overridden (seq 7); only fetchV1's carries literals and is active
-    expect(tombstones.map((t) => t.id)).toEqual(['01M1E6JK8BVGAAP733SN0VCW9W']);
+    // The LOG_BUDGET TB was overridden (seq 7); fetchV1's (notarized) and searchV1's (two agents' quorum)
+    // carry literals and are active
+    expect(tombstones.map((t) => t.id)).toEqual(['01M1E6JK8BVGAAP733SN0VCW9W', '01M1E6JK8KR7Z4VAZ1GM8KFSQT']);
 
     const write = (content: string) => ({ ...fixture('write'), tool_input: { file_path: 'a.ts', content } });
     expect(evaluateGate(write('export const LOG_BUDGET = 30;'), options({ wikiPath: wiki })).decision).toBe('allow');
@@ -298,6 +300,27 @@ describe('gate: wiki source', () => {
     expect(reasonOf(denied.output)).toContain('a person must override or strike the TB');
     expect(existsSync(statePath)).toBe(true);
     expect(objections()).toEqual([]);
+  });
+
+  it('enforces a TB an agent signed only with a quorum of agents: one agent alone settles nothing', () => {
+    const lines = readFileSync(wiki, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    const quorumTb = lines.find((l) => l.type === 'TB' && l.quorum);
+    expect(quorumTb.signedBy).toMatch(/^agent:/);
+    const rechain = (bodies: Array<Record<string, unknown>>) => {
+      let prev: string | null = null;
+      return bodies.map((body, i) => {
+        const { hash: _h, prevHash: _p, seq: _s, ...rest } = body;
+        const unhashed = { ...rest, seq: i + 1, prevHash: prev };
+        prev = wikiLineHash(unhashed);
+        return JSON.stringify({ ...unhashed, hash: prev });
+      });
+    };
+    const { quorum: _q, ...alone } = quorumTb;
+    // The writer (the last member) stays a member; the other is a person
+    const withPerson = { ...quorumTb, quorum: [{ ...quorumTb.quorum[0], author: 'kim' }, quorumTb.quorum[1]] };
+    expect(wikiMatchableTombstones(rechain([quorumTb])).tombstones.map((t) => t.id)).toEqual([quorumTb.id]);
+    expect(wikiMatchableTombstones(rechain([alone])).tombstones).toEqual([]);
+    expect(wikiMatchableTombstones(rechain([withPerson])).tombstones).toEqual([]);
   });
 
   // F10: the wiki source never checked the chain and took v1 lines as truth,

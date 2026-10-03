@@ -54,6 +54,7 @@ import { MatchDeadlineError } from './literal-matcher.js';
 import { compileTombstones, findGateRuling, ObjectionLog, type GateCall, type Objection } from './objections.js';
 import { checkWikiChain, decodeWikiLine, type DecodedWikiLine } from './wiki.js';
 import { MAX_WIKI_FILE_BYTES } from './wiki-file.js';
+import { hasAgentPrefix } from './quorum.js';
 import { TombstonedLiteralSchema, type TbEntry, type TombstonedLiteral } from './types.js';
 import { assertSchemaSupported } from '../store/migrations.js';
 
@@ -247,6 +248,10 @@ export function wikiMatchableTombstones(
     const status = statusOf(id, line.status);
     if (typeof status !== 'string' || !ACTIVE.has(status)) continue;
     if (typeof line.signedBy !== 'string' || !line.signedBy) continue;
+    // Agents settle only together: an agent's TB counts only with a quorum of agents (the codec checked its rules)
+    if (hasAgentPrefix(line.signedBy) && !(Array.isArray(line.quorum) && line.quorum.every((m: { author?: unknown }) => typeof m?.author === 'string' && hasAgentPrefix(m.author)))) {
+      continue;
+    }
     const literals = (Array.isArray(line.literals) ? line.literals : []).flatMap((l) => {
       const parsed = TombstonedLiteralSchema.safeParse(l);
       return parsed.success ? [parsed.data] : [];

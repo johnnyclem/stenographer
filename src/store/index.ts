@@ -13,6 +13,8 @@ import * as sqliteVec from 'sqlite-vec';
 import { migrate } from './migrations.js';
 import { cosineSimilarity, EMBEDDING_DIMENSIONS } from '../indexer/embeddings.js';
 import { TruthLedger } from '../truth/ledger.js';
+import { UvAttestations } from '../truth/attestations.js';
+import type { AgentClassifier } from '../truth/quorum.js';
 import { ObjectionLog } from '../truth/objections.js';
 import { ObjectionDispatcher } from '../truth/delivery.js';
 import type {
@@ -25,6 +27,8 @@ import type {
 
 export interface StateStoreOptions {
   dimensions?: number;
+  /** Who the truth ledger treats as an agent (TruthLedgerOptions.isAgent). Default: the `agent:` prefix. */
+  isAgent?: AgentClassifier;
 }
 
 /** Everything but the embedding blob, for reads that don't need vectors. */
@@ -82,6 +86,8 @@ export class StateStore {
   private dimensions: number;
   private vecEnabled: boolean = false;
   private truthLedger: TruthLedger | null = null;
+  private isAgent: AgentClassifier | undefined;
+  private uvAttestations: UvAttestations | null = null;
   private objectionLog: ObjectionLog | null = null;
   private dispatcher: ObjectionDispatcher | null = null;
   private statements: Map<string, Database.Statement> = new Map();
@@ -89,6 +95,7 @@ export class StateStore {
   constructor(dbPath: string, options: StateStoreOptions = {}) {
     this.db = new Database(dbPath);
     this.dimensions = options.dimensions ?? 0;
+    this.isAgent = options.isAgent;
     try {
       sqliteVec.load(this.db);
       this.vecEnabled = true;
@@ -109,9 +116,17 @@ export class StateStore {
   /** The append-only asserted-truth ledger (TB/UV v2), on the same database. */
   get truth(): TruthLedger {
     if (!this.truthLedger) {
-      this.truthLedger = new TruthLedger(this.db);
+      this.truthLedger = new TruthLedger(this.db, { isAgent: this.isAgent });
     }
     return this.truthLedger;
+  }
+
+  /** Agents' verdicts on open UVs, until a quorum settles them: operational state beside the ledger. */
+  get attestations(): UvAttestations {
+    if (!this.uvAttestations) {
+      this.uvAttestations = new UvAttestations(this.db, this.truth);
+    }
+    return this.uvAttestations;
   }
 
   /** Real-time objections (§12): operational log beside the ledger. */

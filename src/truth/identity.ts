@@ -21,6 +21,7 @@
 import { readFileSync } from 'node:fs';
 import { z } from 'zod';
 import { TruthWriteError } from './ledger.js';
+import { hasAgentPrefix, type AgentClassifier } from './quorum.js';
 import {
   canonicalIdentity,
   identityKey,
@@ -167,4 +168,20 @@ export function resolveIdentity(
 
 function withArticle(role: SignerRole): string {
   return role === 'agent' ? 'an agent' : `a ${role}`;
+}
+
+/**
+ * Who is an agent, for the agent quorum (spec/truth-format, "Agent quorum"):
+ * the role a signer registry lists, and, for an identity it doesn't list or
+ * without one, the `agent:` prefix. `agentIdentities` are agents whatever
+ * their spelling: the identity a server binds its agent-profile writes to,
+ * which `--agent-identity` may set to a name without the prefix.
+ */
+export function agentClassifier(registry: SignerRegistry | null, agentIdentities: Array<string | undefined> = []): AgentClassifier {
+  const own = new Set(agentIdentities.filter((id): id is string => typeof id === 'string').map(identityKey));
+  return (identity) => {
+    if (own.has(identityKey(identity))) return true;
+    const listed = registry?.lookup(identity);
+    return listed ? listed.role === 'agent' : hasAgentPrefix(identity);
+  };
 }

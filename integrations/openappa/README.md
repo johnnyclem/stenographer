@@ -32,21 +32,22 @@ that no rule names (or hands it to the deployment's `*` annotator).
 | Transcript reads: `get_recent_messages`, `search_conversation`, `search_similar`, `get_context_frame`, `get_entities`, `get_relations`, `get_decisions`, `get_decision_history`, `get_decision_chain`, `get_corrections` | result `self`, `suspicious` | In watch mode these return other sessions' text, quoting whatever those sessions read. After one, the session's data can't go to anyone but the person running it, and a call that needs trusted data needs an approval first. |
 | Ledger reads: `get_truth`, `search_truth`, `get_contested`, `get_verification_queue`, `list_proposals`, `list_objections`, inline `export_wiki_entries` | result `self`, `suspicious` | Same: agent-written UVs and drafts, and quoted transcript lines. |
 | `get_status` | result `self` | Keeps the session's trust. |
-| `propose_tombstone` | none; records `stenographer.proposed` | A draft is not truth and runs from any session. It becomes truth only when a person signs it. |
-| Truth writes: `assert_uv`, `resolve_uv`, `assert_tombstone`, `backfill_legacy_tombstones`, `export_wiki_entries` into a file | requires `trusted`; records `stenographer.changed` | Text that came from outside the session cannot become truth, contest a TB or settle a UV unless an authority approves the exact call. |
-| A person's acts: `sign_proposal`, `dismiss_proposal`, `override_tombstone`, `file_ruling`, `rule_on_objection`, `assert_tombstone`/`resolve_uv` with `signedBy`, and `import_wiki_entries` (a file applies overrides, strikes and rulings in its writers' names) | requires `trusted` and the `hitl` mark; records `stenographer.ruled` too | The person approves every act done in their name, every time, even from a trusted session. |
+| `propose_tombstone` | requires `trusted`; records `stenographer.proposed` and `stenographer.changed` | One agent's draft is not truth, but the draft that completes an agent quorum (two or more agent sessions agreeing from different angles within 15 minutes) mints a TB with no person, so text from outside the session can't draft one unless an authority approves the exact call. |
+| Truth writes: `assert_uv`, `resolve_uv`, `backfill_legacy_tombstones`, `export_wiki_entries` into a file | requires `trusted`; records `stenographer.changed` | Text that came from outside the session cannot become truth, contest a TB or attest to a UV unless an authority approves the exact call. An agent's `resolve_uv` settles the UV only as part of a quorum. |
+| A person's acts: `sign_proposal`, `dismiss_proposal`, `override_tombstone`, `file_ruling`, `rule_on_objection`, `assert_tombstone` (operator only, always with `signedBy`), `resolve_uv` with `signedBy`, and `import_wiki_entries` (a file applies overrides, strikes and rulings in its writers' names) | requires `trusted` and the `hitl` mark; records `stenographer.ruled` too | The person approves every act done in their name, every time, even from a trusted session. |
 
 What it does not cover:
 
 - Calls outside a protected session's MCP traffic: the REST API, the
   terminal notary (`stenographer notarize`), other harnesses, and
   sessions without OpenAPPA. A person who signs a bad draft through any
-  of them makes it truth.
+  of them makes it truth, and so do agent sessions without OpenAPPA that
+  complete a quorum together.
 - The ledger's own contents. OpenAPPA labels what a call returns, not
   what stenographer stores, so the battery labels reads by who can write
   the ledger. Write results keep the session's trust because OpenAPPA
   checks a call's requirements against the label its own result leaves;
-  `stenographer/README.md` lists the three results that can still carry
+  `stenographer/README.md` lists the results that can still carry
   unvouched text.
 - Tampering with the ledger file: that is `stenographer verify` (hash
   chain), not policy.

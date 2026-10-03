@@ -46,8 +46,9 @@ A prior statement is stale or wrong, and someone stands behind saying so.
 |---|---|
 | `claim` | What is dead, and what replaced it, if anything. |
 | `evidence` | At least one `{kind, ref, detail?}`. Known kinds: `commit`, `file`, `test`, `claimed-command`, `wiki`, `message`, `chat`, `ticket`, `doc`. [Evidence classes](#evidence-classes) says what each one names and which can settle a claim. `command` appears only on entries recorded before 1.0: since 1.0, command output a caller submits is recorded as `claimed-command`, because stenographer did not run it. |
-| `signedBy` | The person (or, on a single-user setup, the agent identity) asserting it. `null` only on a backfilled TB (author `migration`), which is second-class and never truth on its own. |
+| `signedBy` | The person asserting it, or an agent whose TB carries a `quorum`. `null` only on a backfilled TB (author `migration`), which is second-class and never truth on its own. |
 | `literals` | Optional, at least one. Dead literals an objection can cite: `{dead, subject?, current?}`, values non-empty with no surrounding whitespace. Without a `subject`, `dead` must be a distinctive identifier: at least 4 characters, at least one ASCII letter. A bare `30` would match everything. |
+| `quorum` | Present when agents settled the claim: the agent sessions that drafted it together (see [Agent quorum](#agent-quorum)). A TB an agent signs is valid only with one. |
 | `status` | The TB's status when the line was written: `active`, `contested`, `overridden` or `struck`. |
 
 ### UV: an unverified assertion
@@ -66,7 +67,7 @@ Believed true, stated before anyone verified it. Flag it; don't block on it.
 
 | Type | Fields | |
 |---|---|---|
-| `ADDENDUM` | `evidence` (at least one), `note` (string or null) | Evidence that verifies or refutes a UV, or overrides a TB. Verifying a UV that contests a TB is one addendum that does both. |
+| `ADDENDUM` | `evidence` (at least one), `note` (string or null), `quorum` (optional) | Evidence that verifies or refutes a UV, or overrides a TB. Verifying a UV that contests a TB is one addendum that does both. An agent's verification or refutation carries a `quorum` (see [Agent quorum](#agent-quorum)); no addendum with a quorum overrides. |
 | `RULING` | `kind`, `opinion` (not blank), `target` | A judgment with written reasoning. A wiki stream carries strikes (`kind: "strike"`). |
 
 Their `x-steno.links` say what they do (`verifies`, `refutes`, `overrides`, `strikes`), and they are the `cause.ref` of the TRANSITION lines that follow them.
@@ -118,6 +119,8 @@ A newer writer may add fields or values this version doesn't define. Readers MUS
 
 Stenographer's import is stricter about what it admits as truth (see [Importing](#importing-stenographers-rules)), and it keeps the unknown fields of the entries it takes and exports them again (rule 10).
 
+`quorum` is a field this version defines, on TB and ADDENDUM lines only: a reader refuses it anywhere else, and refuses one that breaks the [Agent quorum](#agent-quorum) rules.
+
 ## Evidence classes
 
 An evidence item is `{kind, ref, detail?}`: `ref` names the evidence, and `detail` says what it shows (for example, the output a command printed). Every kind has a class. **Settling** evidence points at something a reader can check against the code or a ledger. **Question** evidence reports what someone said or wrote down: it can prompt a check, but it isn't one.
@@ -136,11 +139,34 @@ An evidence item is `{kind, ref, detail?}`: `ref` names the evidence, and `detai
 | `command` | Command output recorded before 1.0, which nobody re-ran. It can't appear on a new write. | question |
 
 - **Fail closed.** Any kind a reader doesn't know is question-class, whatever a newer writer meant by it.
-- **In 1.0 the classes bind agents only:** they say which evidence an agent's settlement of a claim can rest on. A person may still sign a TB, or resolve a UV, on evidence of any class.
+- **In 1.0 the classes bind agents only:** they say which evidence an agent's settlement of a claim can rest on ([Agent quorum](#agent-quorum), rule 3). A person may still sign a TB, or resolve a UV, on evidence of any class.
+
+## Agent quorum
+
+Agents settle claims only together: two or more agent sessions agreeing from different angles at the same time. One agent's confidence is not evidence, and an agent on its own can only attest.
+
+**Agent.** An identity the signer registry (see [Identities](#identities)) lists with role `agent`. Without a registry: an identity whose key starts with `agent:`. Stenographer's default agent identity is `agent:<MCP client name>`.
+
+**What agents may settle.** Resolving an open UV as `verified` or `refuted` (an ADDENDUM with a `verifies` or `refutes` link), and writing a TB an agent signs. Nothing else: overriding a TB (`overrides`), striking, dismissing and every ruling stay a person's acts, together or alone. Verifying a UV that contests a TB would override that TB, so agents can't settle it: their agreement is raised to a person instead.
+
+**Quorum.** A settlement by agents is valid only when its line carries a `quorum`: an array of members `{author, agentSessionId, ts, evidence}`, one per agreeing agent session, each with the evidence it brought. An ADDENDUM's members also carry `verdict`, `verified` or `refuted`. The rules:
+
+1. **Two or more.** At least 2 members. Every `agentSessionId` is a non-empty string (trimmed), and no two members share one. Distinct sessions are distinct witnesses, so two sessions may share an identity such as `agent:claude-code`. Every member's `author` passes the identity rules.
+2. **The writer is a member.** The line's `author` is one of the members (by key): the agent whose attestation completed the quorum. On a TB, `signedBy` is the line's `author`.
+3. **From different angles.** Every member cites at least one item of settling-class evidence ([Evidence classes](#evidence-classes)). No evidence item appears in two members: items compare by `kind` and `ref`, the `ref` trimmed. Across all members, the settling evidence spans at least two kinds.
+4. **At the same time.** Every member's `ts` and the line's own `ts` lie within 15 minutes of each other: the latest minus the earliest is at most 900 000 ms.
+5. **Agreeing.** On an ADDENDUM every member's `verdict` is the one its link applies (`verifies` → `verified`, `refutes` → `refuted`), and an ADDENDUM with a quorum never carries an `overrides` link. On a TB the members drafted the same set of literals, which the TB carries (`literals`, at least one); readers can't check the drafts, so this half is the writer's obligation.
+6. **The line shows its evidence.** The line's `evidence` is the members' evidence: it holds every member's items, and no item no member cites (items compare as in rule 3).
+
+Readers MUST refuse a line whose `quorum` is present and breaks rules 1–6 (rule 5's TB half excepted), or that carries a `quorum` on any line but a TB or an ADDENDUM. Like the link rules, this is line-local: on an ADDENDUM, rule 5 reads the links in `x-steno.links`, and a line that lists none is checked for agreeing verdicts only. The schema checks a quorum's shape (at least two members, each `{author, agentSessionId, ts, evidence}`, with `verdict` on an ADDENDUM); the rules across members and the line are the codec's, and `fixtures/invalid/codec.jsonl` breaks each one.
+
+A reader that only folds statuses otherwise relies on the writer for who may change a status, as it already does for people's acts. Stenographer's import checks authority ([Importing](#importing-stenographers-rules), rules 3 and 6): an agent-signed TB is truth only with a valid quorum whose members are all agents, and an agent's resolution applies only with a valid quorum whose members are all agents and each meet the contempt-of-corpus rule.
+
+**How stenographer writes one.** In its agent profile, `resolve_uv` records the session's verdict as an attestation (operational state, never exported). When attestations from distinct sessions agree within 15 minutes from different angles, the one that completes the quorum writes the ADDENDUM: its author and session, every member's evidence (in member order, each item once), and the members ordered by `ts`. An opposite verdict within the window is a dispute: no quorum forms, and a person is told. `propose_tombstone` files a draft for a person as ever; agent drafts from distinct sessions naming the same set of literals, within 15 minutes and from different angles, mint the TB together, signed by the agent whose draft completed the quorum, with a `signs` link to each draft. A person still acts alone.
 
 ## Identities
 
-`author` and `signedBy` name someone who stands behind the entry. Readers MUST refuse a line whose identity:
+`author` and `signedBy` name someone who stands behind the entry, a person or an agent. An agent settles a claim only in a quorum ([Agent quorum](#agent-quorum)), whose members' `author`s pass these rules too. Readers MUST refuse a line whose identity:
 
 - is anonymous or generic: `system`, `assistant`, `agent`, `ai`, `bot`, `anonymous`, `unknown`, `user`, `human`, `admin`, `null`, `none`, `me`, or empty;
 - contains a control character (Unicode category Cc);
@@ -153,7 +179,7 @@ Identities compare by key: Unicode NFKC, default-ignorable code points removed, 
 | Field | |
 |---|---|
 | `id` | A handle, compared by key. One that ends in `*` is a prefix: `agent:*` lists every identity that starts with `agent:`. |
-| `role` | `human`, `agent` or `detector`. |
+| `role` | `human`, `agent` or `detector`. Who is an agent, for the [Agent quorum](#agent-quorum), is the registry's `agent` role. |
 | `aliases` | Optional. Other spellings that resolve to `id`. |
 | `keys` | Optional. `[{alg, id, publicKey}]`, each a non-empty string: `alg` names the signature algorithm (such as `ed25519`), `id` names the key among the signer's keys, and `publicKey` is the key. Reserved for key signing in 1.x: a 1.0 reader accepts `keys` and ignores it. Stenographer refuses a key with any other field, so a private key can't be put there by mistake. |
 
@@ -190,16 +216,16 @@ Stenographer's wiki export carries, in ledger order: every TB and UV; every ADDE
 
 1. **One transaction per file.** Every line is validated, the chain is checked, and each line is appended through the same admission check as a live write. If any line fails, nothing is written, and the result lists every failing line (`committed: false`, `errors: [{line, id, error}]`).
 2. **Lines the ledger already holds.** An entry line whose id the ledger holds, with the same type, author and body (compared as JCS), is a no-op. A different one is a conflict: it is filed as a reconciliation `PROPOSAL`, and the held entry is left as it is. An ADDENDUM or RULING whose id is held with different content is an error.
-3. **A TB lands as truth only when it is signed and verifiable.** Signed means `signedBy` is not null. Verifiable means a v2 line in a valid chain, and, when the importer has a signer registry, its author and signer listed there as a person or an agent. Any other TB becomes a reconciliation `PROPOSAL` that a person must notarize (`requiresNotary`, author `detector:wiki-sync`, `targetRef` the line's id). It is never active truth on its own.
+3. **A TB lands as truth only when it is signed and verifiable.** Signed means `signedBy` is not null. Verifiable means a v2 line in a valid chain, and, when the importer has a signer registry, its author and signer listed there as a person or an agent. A TB an agent signs lands only with a valid `quorum` whose members are all agents ([Agent quorum](#agent-quorum)); without one it is filed with reason `agent-without-quorum`. Any other TB becomes a reconciliation `PROPOSAL` that a person must notarize (`requiresNotary`, author `detector:wiki-sync`, `targetRef` the line's id). It is never active truth on its own.
 4. **A UV lands when its author passes the registry**, when there is one. Otherwise it becomes a reconciliation proposal too.
 5. **Fail closed.** A TB or UV line whose `status` stenographer doesn't know, or that says `struck` (only a strike, which travels, can set that), or that has an evidence, `verifyBy`, provenance or link value stenographer doesn't know, becomes a reconciliation proposal (`unknown-status`, `unknown-value`). It never becomes truth. A terminal status on an entry line (`overridden`, `verified`, `refuted`) is kept: no later line can undo it.
-6. **Status changes come from their causes.** Stenographer applies an ADDENDUM or RULING through its links, when its author may perform the act: an override, a strike or any ruling needs a person (with a registry: one it lists as `human`), and a verification or refutation needs a person or an agent. A resolution also meets the contempt-of-corpus rule: its author can't be the UV's author or drafter, or come from the UV's agent session, and refuting a contest can't come from the contested TB's author, signer or drafter. One that fails these checks, or whose target the ledger doesn't hold, is **held**: it is reported, nothing is written, and a later import tries it again. A change whose effect is already in place, such as an override of a TB that was overridden here first, is recorded and changes nothing.
+6. **Status changes come from their causes.** Stenographer applies an ADDENDUM or RULING through its links, when its author may perform the act: an override, a strike or any ruling needs a person (with a registry: one it lists as `human`; never an agent), and a verification or refutation needs a person, or an agent with a valid `quorum` whose members are all agents ([Agent quorum](#agent-quorum)). A resolution also meets the contempt-of-corpus rule, for its author and for every quorum member: none can be the UV's author or drafter, or come from the UV's agent session, and refuting a contest can't come from the contested TB's author, signer or drafter. One that fails these checks, or whose target the ledger doesn't hold, is **held**: it is reported, nothing is written, and a later import tries it again. A change whose effect is already in place, such as an override of a TB that was overridden here first, is recorded and changes nothing.
 7. **TRANSITION lines are checked, not applied.** Stenographer derives status from the causes. A TRANSITION whose `cause.ref` is neither earlier in the file nor in the ledger is an error. One with a status stenographer doesn't know is held.
 8. **PROPOSAL lines don't belong in a wiki file.** They are an error there; the intake files them.
 9. **Re-importing is a no-op.** A line whose reconciliation proposal exists, in any status, is not filed again, so a dismissed one isn't raised again and a signed one isn't minted twice.
 10. **Unknown fields are kept.** A TB, UV, ADDENDUM or RULING line's top-level fields that this version doesn't define (any field but the line's envelope, `x-steno` and its type's own fields above) are stored with the entry, count in rule 2's comparison, and are exported again verbatim. A TRANSITION line isn't stored (rule 7), so its unknown fields aren't kept. Neither are those of a line filed as a reconciliation proposal: the proposal's draft is what a person would sign, and the line's `hash` stays under its `meta.wiki`.
 
-Without a signer registry, any identity that passes the identity rules is accepted where a registry would be consulted, as on stenographer's live operator paths. A valid chain then shows the lines are unchanged, not who wrote them.
+Without a signer registry, any identity that passes the identity rules is accepted where a registry would be consulted, as on stenographer's live operator paths, and an agent is an identity whose key starts with `agent:`. A valid chain then shows the lines are unchanged, not who wrote them.
 
 ## Exporting (stenographer's rules)
 
@@ -242,14 +268,14 @@ v1 couldn't carry status changes, and a 0.x full export rewrote the file, which 
 | File | What a conforming reader does |
 |---|---|
 | `signers.json` | The signer registry the fixtures assume (see [Identities](#identities)). One entry carries `keys`, which every 1.0 reader must accept and ignore. |
-| `valid/ledger.jsonl` | One ledger's stream. It covers a TB with literals and `claimed-command` evidence, an open UV, a contest, an addendum that verifies the contest and overrides the TB, the superseding TB, a strike, an agent's UV refuted by a person, and a notarized agent draft whose `signs` link names a proposal that didn't travel, with a TRANSITION after each change. Every line passes the schema, every hash recomputes, and the lines chain. |
+| `valid/ledger.jsonl` | One ledger's stream. It covers a TB with literals and `claimed-command` evidence, an open UV, a contest, an addendum that verifies the contest and overrides the TB, the superseding TB, a strike, an agent's UV refuted by a person, a notarized agent draft whose `signs` link names a proposal that didn't travel, a UV verified by a two-session agent quorum, and a TB two agents' drafts minted by quorum, with a TRANSITION after each change. Every line passes the schema, every hash recomputes, and the lines chain. |
 | `valid/ledger.expected.json` | The fold: `{id: {type, status, current}}` for every TB and UV. |
 | `valid/proposals.jsonl`, `proposals.expected.json` | A PROPOSAL envelope stream and the kind each line files as. Two envelopes share a `targetRef` (each is filed), and one carries an unknown `signal.source` and evidence kind (filed; `unknown` lists them as stenographer records them). |
 | `valid/unknown.jsonl`, `unknown.expected.json` | What a newer writer may send: an unknown field, unknown statuses, an unknown evidence kind and `verifyBy` kind. `fold` is what readers compute, failing closed. `import` is what stenographer does with each line; the entry it takes keeps its unknown field, and exports it again. |
-| `valid/routing.jsonl`, `routing.expected.json` | Valid lines stenographer doesn't simply take as truth, each imported on its own: `inserted` (with the resulting `status`), `proposal` (with a `reason`), or `held`. |
+| `valid/routing.jsonl`, `routing.expected.json` | Valid lines stenographer doesn't simply take as truth, each imported on its own: `inserted` (with the resulting `status`), `proposal` (with a `reason`), or `held`. Among them, a TB an agent signed without a quorum (`agent-without-quorum`) and an agent's verification without one (held). |
 | `v1/legacy.jsonl`, `legacy.expected.json` | 0.x lines and their outcomes. The v2 schema refuses them; the codec reads them as version 1. |
 | `invalid/schema.jsonl`, `schema.expected.json` | Lines the schema and the codec both refuse, with the `reason`. Each is otherwise valid and correctly hashed. |
-| `invalid/codec.jsonl`, `codec.expected.json` | Lines the schema accepts and the codec refuses: hash, identity and link rules that JSON Schema can't express. `error` is a regular expression for stenographer's message; other readers need only refuse the line. |
+| `invalid/codec.jsonl`, `codec.expected.json` | Lines the schema accepts and the codec refuses: hash, identity, link and agent quorum rules that JSON Schema can't express, one line per quorum rule a line can break. `error` is a regular expression for stenographer's message; other readers need only refuse the line. |
 | `invalid/chain-gap.jsonl`, `chain-fork.jsonl`, `chain.expected.json` | Valid lines that aren't one stream: a missing line, and a line from another writer. |
 
 A consumer's test SHOULD validate every valid line against the schema, parse it with its own codec, recompute every `hash`, check the chain of each valid file except `routing.jsonl` (its lines come from two ledgers and are imported one at a time, so it is not one stream), fold `ledger.jsonl` and `unknown.jsonl` and compare the results with their expected files, and refuse every invalid line.

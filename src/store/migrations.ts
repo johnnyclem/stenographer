@@ -4,13 +4,14 @@
  * Each step runs in one transaction with its version bump, so a database is
  * never left half-migrated. Steps are append-only: never edit a released one.
  * One runner covers the whole file: the index tables and the truth layer
- * (ledger, objections, delivery state) that shares it.
+ * (ledger, objections, delivery state, agent attestations) that shares it.
  */
 
 import type Database from 'better-sqlite3';
 import { TruthLedger } from '../truth/ledger.js';
 import { ensureObjectionSchema } from '../truth/objections.js';
 import { ensureDeliverySchema } from '../truth/delivery.js';
+import { ensureAttestationSchema } from '../truth/attestations.js';
 
 export type Migration = (db: Database.Database) => void;
 
@@ -179,6 +180,14 @@ export const MIGRATIONS: Migration[] = [
     TruthLedger.ensureSchema(db);
     ensureObjectionSchema(db);
     ensureDeliverySchema(db);
+  },
+
+  // 5 — agent attestations: each agent session's verdict on an open UV,
+  // until a quorum of sessions agreeing from different angles settles it
+  // (spec/truth-format, "Agent quorum"). Operational state beside the
+  // ledger, like objections: never a ledger entry, never exported.
+  (db) => {
+    ensureAttestationSchema(db);
   },
 ];
 

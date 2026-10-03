@@ -52,8 +52,8 @@ mcp/stenographer/resolve_uv {
 }
 expect deny
 
-# assert_tombstone (agent profile, --allow-agent-assert).
-mcp/stenographer/assert_tombstone {
+# propose_tombstone: a draft can complete an agent quorum and mint a TB.
+mcp/stenographer/propose_tombstone {
   claim: "LOG_BUDGET 30 is dead; the budget is 100"
   evidence: [{"kind": "commit", "ref": "a1b2c3", "detail": "config.ts sets LOG_BUDGET = 100"}]
   literals: [{"subject": "LOG_BUDGET", "dead": "30", "current": "100"}]

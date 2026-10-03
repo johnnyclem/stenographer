@@ -74,5 +74,13 @@
   {
     "line": 19,
     "reason": "an empty status"
+  },
+  {
+    "line": 20,
+    "reason": "a quorum of one member"
+  },
+  {
+    "line": 21,
+    "reason": "a quorum ADDENDUM whose members carry no verdict"
   }
 ]

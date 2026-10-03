@@ -260,10 +260,13 @@ export interface StenographerConfig {
   notarySecret?: string;
   /**
    * Which MCP tools this server exposes, and who its writes are attributed to.
-   * - 'agent' (default): read tools plus propose_tombstone, assert_uv and a
-   *   resolve_uv that cannot mint TBs. Every write is attributed to
-   *   `agentIdentity`; tool arguments cannot name anyone. No tool in this
-   *   profile mints a TB, signs, dismisses, overrides, strikes or rules.
+   * - 'agent' (default): read tools plus propose_tombstone, assert_uv and
+   *   resolve_uv. Every write is attributed to `agentIdentity` and this
+   *   server's session; tool arguments cannot name anyone. An agent alone
+   *   only drafts and attests: a claim settles when two or more agent
+   *   sessions agree from different angles within 15 minutes (the agent
+   *   quorum), or when a person signs. No tool in this profile signs with a
+   *   person's name, dismisses, overrides, strikes or rules.
    * - 'operator': the judicial and destructive tools (sign_proposal,
    *   dismiss_proposal, override_tombstone, file_ruling, rule_on_objection,
    *   assert_tombstone, wiki import/export, backfill), for a notary UI or
@@ -273,21 +276,23 @@ export interface StenographerConfig {
   profile?: 'agent' | 'operator';
   /**
    * The identity agent-profile writes are attributed to (`--agent-identity`).
-   * Default: `agent:<name>` from the MCP client's clientInfo.
+   * Default: `agent:<name>` from the MCP client's clientInfo. This ledger
+   * treats it as an agent's whatever its spelling; other readers go by
+   * their signer registry or, without one, the `agent:` prefix.
    */
   agentIdentity?: string;
   /**
-   * Single-user opt-out (`--allow-agent-assert`): the agent profile also
-   * exposes assert_tombstone and lets resolve_uv mint TBs from `command`
-   * evidence, signed by the agent identity (never a person's name). Off by
-   * default, so every agent-authored TB is notarized by a person.
+   * The clock (epoch milliseconds) the agent quorum's 15-minute window reads,
+   * and agent drafts and attestations are stamped with. Default `Date.now`;
+   * tests pin it.
    */
-  allowAgentAssert?: boolean;
+  clock?: () => number;
   /**
    * Signer registry (`--signer-registry`): a JSON file path, or the parsed
    * file — `{"signers": [{"id", "role": "human"|"agent"|"detector", "aliases"?}]}`.
    * When set, operator paths accept only listed identities with a role that
-   * may perform the act (people sign, notarize, rule; agents draft).
+   * may perform the act (people sign, notarize, rule; agents draft and
+   * attest), and the ledger takes who is an agent from it.
    */
   signerRegistry?: string | SignerRegistryFile;
   /**

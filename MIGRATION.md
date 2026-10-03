@@ -8,7 +8,7 @@
 2. **Back up the state database.** Stop stenographer and copy `stenographer.db`. The first 1.0 start migrates it in place, and a 0.x build can't open it afterwards. See [State database: automatic migration, then verify](#state-database-automatic-migration-then-verify).
 3. **Start with the embedder you used before.** If an offline machine may have fallen back to hashed embeddings under 0.x, add `--reembed` to the first start. See [Extraction and retrieval](#extraction-and-retrieval).
 4. **Verify the ledger** with `npx -y @stenographer/core verify ./stenographer.db`, and keep the head hash it prints somewhere other than the state file.
-5. **Agent MCP configs:** remove `--require-notary` and drop identity arguments (`author`, `signedBy`, `proposedBy`, `dismissedBy`, `agentSessionId`) from agent tool calls. Optionally set `--agent-identity`. See [Agent MCP configs](#agent-mcp-configs).
+5. **Agent MCP configs:** remove `--require-notary` and drop identity arguments (`author`, `signedBy`, `proposedBy`, `dismissedBy`, `agentSessionId`) from agent tool calls. Optionally set `--agent-identity`. An agent alone no longer settles anything: `resolve_uv` and `propose_tombstone` settle a claim only as a quorum of two or more agent sessions, or a person does. See [Agent MCP configs](#agent-mcp-configs) and [Agents settle claims only together](#agents-settle-claims-only-together).
 6. **Notary UIs and scripts** that sign, dismiss, override, strike, rule, assert TBs, or import and export the wiki over MCP: point them at a `--profile operator` server, the REST notary routes, or `stenographer notarize`. Consider a `--signer-registry`. See [Tools that moved to the operator profile](#tools-that-moved-to-the-operator-profile).
 7. **REST clients:** send `Authorization: Bearer <token>` (from `<state dir>/rest-token` or `STENOGRAPHER_REST_TOKEN`), and add `--rest-allow-host` for any `Host` name other than loopback. See [REST, delivery and session identity](#rest-delivery-and-session-identity).
 8. **Webhook receivers:** verify the Standard Webhooks headers instead of `X-Stenographer-Signature`, use a secret of at least 24 bytes, and configure the final URL (redirects now fail). See [Webhook signatures](#rest-delivery-and-session-identity).
@@ -33,11 +33,12 @@
 
 ## State database: automatic migration, then verify
 
-Nothing to run by hand. The first time a 1.0 command opens a pre-1.0 state file, it migrates it in place: `start`, `notarize` and `proposals` run the versioned migrations (`PRAGMA user_version` 0 → 4), and `verify` performs the ledger's part. The migration:
+Nothing to run by hand. The first time a 1.0 command opens a pre-1.0 state file, it migrates it in place: `start`, `notarize` and `proposals` run the versioned migrations (`PRAGMA user_version` 0 → 5), and `verify` performs the ledger's part. The migration:
 
 - adds `ingest_checkpoints`, the schema v3 message columns, `index_meta` (the embedder pin), and rebuilds the vector index from the stored embeddings ([Ingestion](#ingestion-checkpoints-deterministic-ids), [Extraction and retrieval](#extraction-and-retrieval));
 - hash-chains the existing truth entries as they are, behind a `chained-at-migration` marker, and re-derives every status from links ([Existing state files](#existing-state-files));
 - rekeys the `objections` table per session ([Objections](#objections-and-the-pre-dispatch-gate));
+- adds `uv_attestations`, where agents' verdicts wait for a quorum ([Agents settle claims only together](#agents-settle-claims-only-together));
 - switches the database to WAL mode, so `-wal` and `-shm` files appear next to it. Copy all three when you move a live database, or stop stenographer first.
 
 Then check it:
@@ -68,9 +69,18 @@ Agent tool calls no longer take identities. Drop `proposedBy` and `agentSessionI
 }
 ```
 
-Without `--agent-identity`, writes are attributed to `agent:<name the MCP client reports>`, e.g. `agent:claude-code`.
+Without `--agent-identity`, writes are attributed to `agent:<name the MCP client reports>`, e.g. `agent:claude-code`. Your stenographer treats the identity you set as an agent's whatever its spelling, but a teammate's stenographer without a signer registry tells agents by the `agent:` prefix: prefer a name like `agent:ingest`, or list yours in the registry.
 
-`resolve_uv` in the agent profile refuses resolutions that would mint a TB (verifying a UV that contests a TB, and `mintTombstone`). Leave such a UV open with your evidence, or draft the successor with `propose_tombstone`.
+`resolve_uv` and `propose_tombstone` in the agent profile no longer settle anything on one agent's word; see [Agents settle claims only together](#agents-settle-claims-only-together). `resolve_uv` takes no `mintTombstone`.
+
+### Agents settle claims only together
+
+An agent's confidence is not evidence. In 1.0 a claim settles when a person signs it, or when two or more agent sessions agree from different angles within 15 minutes (the agent quorum, [truth format "Agent quorum"](./spec/truth-format/README.md#agent-quorum)):
+
+- **`resolve_uv`** records the agent's verdict and evidence as an attestation, and returns a `status`: `attested` (with `quorum: {agreeing, needed, windowEndsAt, missing}`, what is still missing), `disputed` (another session filed the opposite verdict within the window; a person is told), `raised` (a quorum verified a UV that contests a TB, which would override it: a person decides) or `settled` (with the addendum). An agent calling it once no longer resolves the UV. Agents that relied on that should report the status to the user, and leave the UV to a second session or a person.
+- **`propose_tombstone`** still files the draft and raises it to a person. When it completes a quorum — two or more agent sessions drafting the same set of literals, each with settling evidence (`commit`, `file`, `test`, `claimed-command`, `wiki`), no item cited twice, two kinds between them, within 15 minutes — it mints the TB and returns `status: "settled by quorum"` with the `tombstone`. Otherwise its result carries `quorum`.
+- **Settling evidence.** `message`, `chat`, `ticket` and `doc` evidence (what someone said or wrote down) never counts toward a quorum. Check against the code, a test, a commit or the ledger.
+- **Never alone, never by override.** Overriding, striking, dismissing and ruling stay a person's acts. The ledger refuses them from an agent on every path, and refuses an agent's TB or resolution without a valid quorum, so a library caller or a wiki file can't get around the MCP tools.
 
 ### Tools that moved to the operator profile
 
@@ -78,13 +88,20 @@ Without `--agent-identity`, writes are attributed to `agent:<name the MCP client
 
 Don't give the operator profile to an agent.
 
-### Single-user setups that let the agent assert TBs
+### Single-user setups: `--allow-agent-assert` is removed
 
-0.x without `--require-notary` let an agent call `assert_tombstone` with any `signedBy`. The closest 1.0 equivalent is `--allow-agent-assert`: the agent profile serves `assert_tombstone` (no `signedBy` argument), signed by the agent identity. `resolve_uv` can't mint there: command evidence no longer self-signs (see [Command evidence](#command-evidence)). A TB that should carry a person's name goes through the notary paths or the operator profile.
+0.x without `--require-notary` let an agent call `assert_tombstone` with any `signedBy`. 1.0 has no equivalent: no flag lets one agent sign a TB or settle a UV alone. A 1.0 pre-release offered `--allow-agent-assert` for this; it is removed, and `stenographer start --allow-agent-assert` (or `allowAgentAssert` in a `StenographerConfig`) now refuses to start. On a single-user setup, either:
+
+- **a person notarizes the drafts**: from an approval UI over REST (`POST /proposals/:id/notarize` with `X-Notary-Secret`), from a `--profile operator` server, or with `stenographer notarize <id> --as <you>` in a terminal; or
+- **two agent sessions agree**: run the agent in two sessions (two logs, so two session ids; one identity is fine), and have each check the claim its own way. Drafts of the same literals, or verdicts on the same UV, with disjoint settling evidence of two kinds, within 15 minutes, settle it (see [Agents settle claims only together](#agents-settle-claims-only-together)).
+
+TBs an agent signed alone under a pre-release stay in your ledger as they are. A teammate importing them files each as a reconciliation proposal (`agent-without-quorum`) for a person to sign.
 
 ### Library users (`Stenographer`, `TruthLedger`, `StenographerServer`)
 
-- `StenographerConfig.requireNotary` is removed. Use `profile`, `allowAgentAssert`, `agentIdentity` and `signerRegistry`.
+- `StenographerConfig.requireNotary` is removed. Use `profile`, `agentIdentity` and `signerRegistry`. (`allowAgentAssert`, from a 1.0 pre-release, is removed too: passing it throws.)
+- **The ledger enforces the agent quorum.** Who is an agent is the `TruthLedger`'s classifier (`new TruthLedger(db, { isAgent })`, `new StateStore(path, { isAgent })`; default: the `agent:` prefix). `Stenographer` installs one from its signer registry, which also counts its own `agentIdentity`. With it, `assertTombstone`/`signProposal` signed by an agent, and `resolveUv` by an agent, throw `TruthWriteError` unless the entry carries a valid quorum; `overrideTombstone`, `fileRuling`, `dismissProposal` and `fileObjectionRuling` by an agent always throw. A resolution that verifies a contest and mints a TB needs a person as the resolver too: the addendum overrides the TB. Settle by quorum with `TruthLedger.resolveUvByQuorum(uvId, resolution, members, ctx)` and `mintTombstoneByQuorum(proposalIds, ctx)`; the rules are `checkQuorum` (`QUORUM_WINDOW_MS`, `QUORUM_MIN_MEMBERS`).
+- `Stenographer.attestUv(uvId, resolution, evidence, {author, agentSessionId, opinion?})` is the agent profile's `resolve_uv`; attestations are in `StateStore.attestations` (`UvAttestations`). `Stenographer.resolveUv` no longer takes `allowMint` (`TruthLedger.resolveUv` still does). `Stenographer.draftTombstone` also returns `quorum`, or the `tombstone` a quorum minted. `StenographerConfig.clock` sets the clock the 15-minute window reads (tests pin it).
 - `signProposal`, `notarizeProposal`, `dismissProposal`, `overrideTombstone`, `fileRuling` and `ruleOnObjection` require a person. With `signerRegistry` set, the identity must be listed as `human`; without it, any non-anonymous, non-reserved name works, as before. They throw `IdentityError` (a `TruthWriteError`) otherwise.
 - `migration`, `detector:*` and identities with control characters are rejected as author or signer on every write path except the backfill and `addProposal`.
 - Identities are stored trimmed and NFC-normalized, and compared case-, width- and invisible-character-insensitively. `Alice` can no longer corroborate `alice`.
@@ -129,7 +146,6 @@ Don't point a 0.x stenographer at a migrated file. Its writes aren't chained, an
 Evidence of kind `command` is recorded as `claimed-command`. It no longer self-signs a TB minted by `resolve_uv`.
 
 - Operator `resolve_uv` calls, and `TruthLedger.resolveUv`/`Stenographer.resolveUv`, that verify a contest or pass `mintTombstone` need `signedBy` (a person) and an `opinion`. They file a promotion ruling.
-- On an `--allow-agent-assert` server, the agent's `resolve_uv` can no longer mint a TB from command evidence. Use `assert_tombstone` for TBs the agent signs, or leave the UV open for a person.
 - If you grade entries by evidence kind (smallchat's handoff), `claimed-command` grades asserted, not verified.
 
 ### Library users
@@ -164,6 +180,8 @@ Each person's stenographer exports to a file of its own (for example `wiki/<hand
 1.0 still reads v1 lines, but they carry no hash, so a v1 TB is filed as a reconciliation proposal for a person to sign rather than landing as truth. v1 UVs land as before. To move to v2, each member upgrades and exports into a new file. Once everyone's v2 file is in the wiki, the v1 file can be retired.
 
 If you use a signer registry, list your teammates in it: with one, a TB from the wiki lands as truth only when its author and signer are listed, and an override or strike applies only when a listed person filed it. Without one, any accountable name is accepted, as on live operator paths, and the hash chain shows a file is unchanged, not who wrote it.
+
+Agents settle only together, in files too. A TB an agent signed lands as truth only with a valid quorum whose members are all agents (otherwise it is filed as a proposal, reason `agent-without-quorum`), and an agent's verification or refutation applies only with one whose members each meet the contempt rule (otherwise it is held). An override, strike or ruling by an agent never applies. A resolution that fails the contempt rule is now held, as the spec says, instead of failing the whole file.
 
 ### Reading the import result
 
@@ -200,7 +218,7 @@ The gate is opt-in. To use it, add the `PreToolUse` hook from the README's "Pre-
 
 ## Ingestion (checkpoints, deterministic ids)
 
-**State database.** Opening a pre-1.0 database migrates it in place (`PRAGMA user_version` 0 → 4). Existing rows are kept, an `ingest_checkpoints` table is added, and step 4 brings the truth layer along: the ledger is hash-chained (see [Existing state files](#existing-state-files)) and the objections table rekeyed. The database switches to WAL mode, so `-wal` and `-shm` files appear next to it. Copy all three when you move a live database, or stop stenographer first. A 0.x build can't open the database after 1.0 has migrated it. Every 1.0 opener (`start`, `notarize`, `proposals`, `verify`, `stenographer gate`) refuses a database a newer stenographer wrote, rather than touching it.
+**State database.** Opening a pre-1.0 database migrates it in place (`PRAGMA user_version` 0 → 5). Existing rows are kept, an `ingest_checkpoints` table is added, and step 4 brings the truth layer along: the ledger is hash-chained (see [Existing state files](#existing-state-files)) and the objections table rekeyed. The database switches to WAL mode, so `-wal` and `-shm` files appear next to it. Copy all three when you move a live database, or stop stenographer first. A 0.x build can't open the database after 1.0 has migrated it. Every 1.0 opener (`start`, `notarize`, `proposals`, `verify`, `stenographer gate`) refuses a database a newer stenographer wrote, rather than touching it.
 
 **First start on an existing database.** Pre-1.0 databases have no checkpoints, so 1.0 reads each log once from the top. For formats whose lines carry an id (`claude-code` uuids, `jsonl` ids), messages that are already indexed are recognized and skipped, and nothing is derived from them a second time. For id-less formats (`openai`, `anthropic`, `generic` lines without `id`), the message id scheme changed (32-bit FNV → 128-bit hash of path, offset and line). That first pass therefore adds each message again under its new id, next to the old row. To avoid the duplicates, index into a fresh state path and carry the signed truth over. The wiki tools are operator tools, so run these servers with `--profile operator` (from a notary UI or CLI, not an agent), and name the file inside one shared wiki directory:
 

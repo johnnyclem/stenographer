@@ -1,6 +1,6 @@
 # stenographer battery: the stenographer MCP server (@stenographer/core
 # 1.0), both tool profiles under one namespace. `stenographer start`
-# serves the agent profile (reads, drafts, UVs) by default;
+# serves the agent profile (reads, drafts, UVs, attestations) by default;
 # `--profile operator` serves the notary's and judge's tools. A tool
 # neither profile serves is not named here.
 #
@@ -17,25 +17,32 @@
 #
 # Writes into the ledger need trusted data: suspicious text cannot become
 # truth, contest a TB or settle a UV unless an authority approves the
-# call. A draft (`propose_tombstone`) is not truth: it becomes truth only
-# through `sign_proposal`, which is gated, so a draft needs no trust and
-# records `stenographer.proposed`. Every act a person performs under
-# their own name in the operator profile — notarizing, dismissing,
-# overriding, ruling, and minting a TB with `signedBy` — also needs the
-# `hitl` mark: the server takes that name from the caller there, so the
-# person approves each such call. So does importing a team wiki file,
-# whose overrides, strikes and rulings apply in their writers' names.
-# The root config supplies an authority permitting `hitl`.
+# call. Agents settle claims only together: an agent's draft
+# (`propose_tombstone`) or verdict (`resolve_uv`) settles nothing alone,
+# but the one that completes a quorum — two or more agent sessions
+# agreeing from different angles within 15 minutes — mints the TB or
+# settles the UV without a person. So a draft is a truth write too: it
+# needs trusted data and records `stenographer.proposed` and
+# `stenographer.changed`. Every act a person performs under their own
+# name in the operator profile — notarizing, dismissing, overriding,
+# ruling, and minting a TB with `signedBy` — also needs the `hitl` mark:
+# the server takes that name from the caller there, so the person
+# approves each such call. So does importing a team wiki file, whose
+# overrides, strikes and rulings apply in their writers' names. The root
+# config supplies an authority permitting `hitl`.
 #
 # OpenAPPA checks a call's requirements against the label its own result
 # would leave, so a rule that requires `trusted` cannot also declare a
 # `suspicious` result: no call could satisfy it without an authority that
 # lifts trust. Write results therefore keep the session's trust. Most are
 # the record of the call itself: the entry it wrote, a count, the entry a
-# person just signed or overrode. Three can quote text nobody vouched
-# for — the UV a resolution settles, the draft a dismissal rejects, and
-# the transcript line an objection quotes — and the README lists that
-# limit. Results that carry ledger entries are restricted to `self`.
+# person just signed or overrode. Some can quote text nobody vouched
+# for — the UV a resolution settles, the evidence other agent sessions
+# brought to a quorum's addendum or TB (and the claim of the earliest
+# draft a quorum TB takes), the earlier draft a `targetRef` dedupes
+# into, the draft a dismissal rejects, and the transcript line an
+# objection quotes — and the README lists that limit. Results that carry
+# ledger entries are restricted to `self`.
 #
 # No write requires an audience. The ledger lives in the person's state
 # file, read by their own sessions; a deployment that exports it to a
@@ -120,23 +127,18 @@ delta = { audience = ["self"], trust = "suspicious" }
 name = "mcp/stenographer/list_objections"
 delta = { audience = ["self"], trust = "suspicious" }
 
-# --- drafts: a person notarizes them; not truth ---
+# --- truth writes: trusted data only ---
 
-# With targetRef, the call can return the drafter's earlier open draft for
-# the same target, which another session under the same agent identity
-# may have written.
-[[policy.tool]]
-name = "mcp/stenographer/propose_tombstone(targetRef:*)"
-delta = { audience = ["self"], trust = "suspicious" }
-effects = ["stenographer.proposed"]
-
-# Without it, the result echoes the call's own draft.
+# Agent profile. Files a draft and raises it to a person; the draft that
+# completes a quorum of agent sessions' drafts (the same literals, from
+# different angles, within 15 minutes) mints the TB. Returns the draft,
+# the earlier open draft a targetRef dedupes into, or the quorum's TB,
+# whose claim and evidence other sessions wrote (see the README's limits).
 [[policy.tool]]
 name = "mcp/stenographer/propose_tombstone"
-delta = {}
-effects = ["stenographer.proposed"]
-
-# --- truth writes: trusted data only ---
+delta = { audience = ["self"] }
+requires = { trust = "trusted" }
+effects = ["stenographer.proposed", "stenographer.changed"]
 
 # Agent profile: attributed to the server-bound agent identity. Operator
 # profile: `author` names who believes it.
@@ -154,27 +156,25 @@ delta = { audience = ["self"] }
 requires = { trust = "trusted", attention = ["hitl"] }
 effects = ["stenographer.changed", "stenographer.ruled"]
 
-# Returns the resolved UV, which its own author wrote (see the README's
-# limits), and the addendum this call filed.
+# Agent profile: files the agent's verdict as an attestation; the one
+# that completes a quorum of agent sessions settles the UV with one
+# addendum. Operator profile, without signedBy: a person resolves it.
+# Returns the UV, which its own author wrote, and the addendum, whose
+# evidence other agent sessions may have brought (see the README's
+# limits).
 [[policy.tool]]
 name = "mcp/stenographer/resolve_uv"
 delta = { audience = ["self"] }
 requires = { trust = "trusted" }
 effects = ["stenographer.changed"]
 
-# Operator profile: a TB signed with a person's name.
-[[policy.tool]]
-name = "mcp/stenographer/assert_tombstone(signedBy:*)"
-delta = {}
-requires = { trust = "trusted", attention = ["hitl"] }
-effects = ["stenographer.changed", "stenographer.ruled"]
-
-# Agent profile with --allow-agent-assert: signed by the agent identity.
+# Operator profile only, and always with signedBy: a TB signed with a
+# person's name. No profile lets an agent sign a TB alone.
 [[policy.tool]]
 name = "mcp/stenographer/assert_tombstone"
 delta = {}
-requires = { trust = "trusted" }
-effects = ["stenographer.changed"]
+requires = { trust = "trusted", attention = ["hitl"] }
+effects = ["stenographer.changed", "stenographer.ruled"]
 
 # Returns a count.
 [[policy.tool]]
