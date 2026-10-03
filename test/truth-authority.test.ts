@@ -10,6 +10,7 @@ import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { StenographerServer } from '../src/mcp/server.js';
+import { SignerRegistry } from '../src/truth/identity.js';
 import type { StenographerConfig } from '../src/types.js';
 import type { TbEntry, UvEntry, ProposalEntry } from '../src/truth/types.js';
 
@@ -322,6 +323,34 @@ describe('identity is bound by the server (STENO-T-18)', () => {
     ).toThrow(/invalid signer registry — signers\.0\.role/);
   });
 
+  it('accepts signing keys on a registry entry and ignores them: they are reserved for key signing in 1.x', () => {
+    const keys = [
+      { alg: 'ed25519', id: 'johnnyclem/2026-09', publicKey: 'Zm9yIGEgbGF0ZXIgcmVsZWFzZTsgMS4wIGlnbm9yZXMgaXQ' },
+      { alg: 'x-future-alg', id: 'johnnyclem/backup', publicKey: 'opaque' },
+    ];
+    const registry = SignerRegistry.load({ signers: [{ id: 'johnnyclem', role: 'human', aliases: ['johnny'], keys }, { id: 'agent:*', role: 'agent' }] });
+    expect(registry.lookup('Johnny')).toEqual({ id: 'johnnyclem', role: 'human' });
+    expect(registry.lookup('agent:claude-code')).toEqual({ id: 'agent:claude-code', role: 'agent' });
+    expect(SignerRegistry.load({ signers: [{ id: 'sam', role: 'human', keys: [] }] }).lookup('sam')).toEqual({ id: 'sam', role: 'human' });
+
+    // Each key is {alg, id, publicKey}, every one a non-empty string, and nothing else: no place for a private key
+    for (const [bad, error] of [
+      [[{ alg: 'ed25519', id: 'k1' }], /signers\.0\.keys\.0\.publicKey/],
+      [[{ alg: '', id: 'k1', publicKey: 'p' }], /signers\.0\.keys\.0\.alg/],
+      [[{ alg: 'ed25519', id: 'k1', publicKey: 7 }], /signers\.0\.keys\.0\.publicKey/],
+      [[{ alg: 'ed25519', id: 'k1', publicKey: 'p', privateKey: 's' }], /signers\.0\.keys\.0: Unrecognized key.*privateKey/],
+      [{ alg: 'ed25519', id: 'k1', publicKey: 'p' }, /signers\.0\.keys/],
+    ] as const) {
+      expect(() => SignerRegistry.load({ signers: [{ id: 'johnnyclem', role: 'human', keys: bad }] } as any), JSON.stringify(bad)).toThrow(error);
+    }
+
+    // A server starts with such a registry, and checks names against it as before
+    dir = mkdtempSync(join(tmpdir(), 'steno-authority-'));
+    const withKeys = { signers: [{ id: 'johnnyclem', role: 'human', keys }, { id: 'agent:*', role: 'agent' }] };
+    server = new StenographerServer({ logPath: join(dir, 'log.jsonl'), statePath: ':memory:', mode: 'catchup', agentIdentity: 'agent:solo', signerRegistry: withKeys as any });
+    expect(server.engine.resolveIdentity(' JohnnyClem ', ['human'], 'signer')).toBe('johnnyclem');
+  });
+
   it('refuses reserved identities as the agent identity', () => {
     dir = mkdtempSync(join(tmpdir(), 'steno-authority-'));
     for (const agentIdentity of ['migration', 'detector:supersession', 'assistant']) {
@@ -405,6 +434,23 @@ describe('identity is bound by the server (STENO-T-18)', () => {
 });
 
 describe('arguments are validated at the boundary (STENO-T-23)', () => {
+  it('takes chat, ticket and doc evidence, and the evidence description names every kind', async () => {
+    const { call, client } = await start();
+    for (const kind of ['chat', 'ticket', 'doc']) {
+      const res = await call('propose_tombstone', { ...DRAFT, targetRef: `kind:${kind}`, evidence: [{ kind, ref: `${kind}-1` }] });
+      expect(res.error, kind).toBeUndefined();
+      expect(res.proposal.body.draft.evidence, kind).toEqual([{ kind, ref: `${kind}-1` }]);
+    }
+    expect((await call('propose_tombstone', { ...DRAFT, evidence: [{ kind: 'screenshot', ref: 's' }] })).error).toMatch(/kind/);
+    const tools = (await client.listTools()).tools;
+    for (const name of ['propose_tombstone', 'resolve_uv']) {
+      const description = (tools.find((t) => t.name === name)!.inputSchema.properties as any).evidence.description as string;
+      for (const kind of ['commit', 'file', 'test', 'command', 'wiki', 'message', 'chat', 'ticket', 'doc']) {
+        expect(description.split(/[^a-z-]+/), `${name}: ${kind}`).toContain(kind);
+      }
+    }
+  });
+
   it('rejects an unknown enum with a validation error, not a SQL error', async () => {
     const { call } = await start();
     const res = await call('get_truth', { truthFilter: 'bogus' });

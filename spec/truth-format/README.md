@@ -45,7 +45,7 @@ A prior statement is stale or wrong, and someone stands behind saying so.
 | Field | |
 |---|---|
 | `claim` | What is dead, and what replaced it, if anything. |
-| `evidence` | At least one `{kind, ref, detail?}`. Known kinds: `commit`, `file`, `test`, `claimed-command`, `wiki`, `message`. `command` appears only on entries recorded before 1.0: since 1.0, command output a caller submits is recorded as `claimed-command`, because stenographer did not run it. |
+| `evidence` | At least one `{kind, ref, detail?}`. Known kinds: `commit`, `file`, `test`, `claimed-command`, `wiki`, `message`, `chat`, `ticket`, `doc`. [Evidence classes](#evidence-classes) says what each one names and which can settle a claim. `command` appears only on entries recorded before 1.0: since 1.0, command output a caller submits is recorded as `claimed-command`, because stenographer did not run it. |
 | `signedBy` | The person (or, on a single-user setup, the agent identity) asserting it. `null` only on a backfilled TB (author `migration`), which is second-class and never truth on its own. |
 | `literals` | Optional, at least one. Dead literals an objection can cite: `{dead, subject?, current?}`, values non-empty with no surrounding whitespace. Without a `subject`, `dead` must be a distinctive identifier: at least 4 characters, at least one ASCII letter. A bare `30` would match everything. |
 | `status` | The TB's status when the line was written: `active`, `contested`, `overridden` or `struck`. |
@@ -116,7 +116,27 @@ Renderers that put truth into a model's context use these markers, and escape th
 
 A newer writer may add fields or values this version doesn't define. Readers MUST NOT reject a line for an unknown field, or for an unknown value of `status`, an evidence or `verifyBy` `kind`, a provenance `kind`, a link `type`, a ruling `kind`, a `cause.kind` or a proposal `signal.source`. They keep such a line, preserve it verbatim on re-serialization, never coerce a value to a known one, and fail closed: an entry whose status they don't know is not current truth. Equality and conflict detection compare JCS bytes, so key order never matters. The schema is open in the same places. The line `type` and the required fields are closed: a reader refuses a line it can't identify.
 
-Stenographer's import is stricter about what it admits as truth (see [Importing](#importing-stenographers-rules)).
+Stenographer's import is stricter about what it admits as truth (see [Importing](#importing-stenographers-rules)), and it keeps the unknown fields of the entries it takes and exports them again (rule 10).
+
+## Evidence classes
+
+An evidence item is `{kind, ref, detail?}`: `ref` names the evidence, and `detail` says what it shows (for example, the output a command printed). Every kind has a class. **Settling** evidence points at something a reader can check against the code or a ledger. **Question** evidence reports what someone said or wrote down: it can prompt a check, but it isn't one.
+
+| Kind | `ref` names | Class |
+|---|---|---|
+| `commit` | A commit, by its hash. | settling |
+| `file` | A file, usually with a line (`path:line`). | settling |
+| `test` | A test, by its name or path. | settling |
+| `claimed-command` | A command line someone says they ran; `detail` holds the output they say they saw. Stenographer didn't run it. | settling |
+| `wiki` | The id of an entry in a truth ledger: this one or a teammate's. A team wiki page is a `doc`. | settling |
+| `message` | A message in a conversation transcript, by its id. | question |
+| `chat` | A chat message or thread (Slack, Teams, Discord). | question |
+| `ticket` | An issue or ticket (Jira, Linear, GitHub issues). | question |
+| `doc` | A document or page outside the truth ledger: a design doc, a team wiki page, a README. | question |
+| `command` | Command output recorded before 1.0, which nobody re-ran. It can't appear on a new write. | question |
+
+- **Fail closed.** Any kind a reader doesn't know is question-class, whatever a newer writer meant by it.
+- **In 1.0 the classes bind agents only:** they say which evidence an agent's settlement of a claim can rest on. A person may still sign a TB, or resolve a UV, on evidence of any class.
 
 ## Identities
 
@@ -127,6 +147,17 @@ Stenographer's import is stricter about what it admits as truth (see [Importing]
 - is reserved where it doesn't belong: `migration` authors only an unsigned backfilled TB, and `detector:*` authors only PROPOSAL lines. A TRANSITION takes its cause's author, so it is never reserved.
 
 Identities compare by key: Unicode NFKC, default-ignorable code points removed, trimmed, lowercased. So `Assistant` and `ａｓｓｉｓｔａｎｔ` are both refused, and `Alice` and `alice` are one person. Lines store identities as written.
+
+**The signer registry.** A reader that checks who may sign (stenographer's import, rules 3, 4 and 6) reads a JSON file, `{"signers": [...]}`, with one entry per signer:
+
+| Field | |
+|---|---|
+| `id` | A handle, compared by key. One that ends in `*` is a prefix: `agent:*` lists every identity that starts with `agent:`. |
+| `role` | `human`, `agent` or `detector`. |
+| `aliases` | Optional. Other spellings that resolve to `id`. |
+| `keys` | Optional. `[{alg, id, publicKey}]`, each a non-empty string: `alg` names the signature algorithm (such as `ed25519`), `id` names the key among the signer's keys, and `publicKey` is the key. Reserved for key signing in 1.x: a 1.0 reader accepts `keys` and ignores it. Stenographer refuses a key with any other field, so a private key can't be put there by mistake. |
+
+The registry is an allowlist of names and roles, not authentication: it doesn't show who wrote a line.
 
 ## Links an entry may carry
 
@@ -166,12 +197,14 @@ Stenographer's wiki export carries, in ledger order: every TB and UV; every ADDE
 7. **TRANSITION lines are checked, not applied.** Stenographer derives status from the causes. A TRANSITION whose `cause.ref` is neither earlier in the file nor in the ledger is an error. One with a status stenographer doesn't know is held.
 8. **PROPOSAL lines don't belong in a wiki file.** They are an error there; the intake files them.
 9. **Re-importing is a no-op.** A line whose reconciliation proposal exists, in any status, is not filed again, so a dismissed one isn't raised again and a signed one isn't minted twice.
+10. **Unknown fields are kept.** A TB, UV, ADDENDUM or RULING line's top-level fields that this version doesn't define (any field but the line's envelope, `x-steno` and its type's own fields above) are stored with the entry, count in rule 2's comparison, and are exported again verbatim. A TRANSITION line isn't stored (rule 7), so its unknown fields aren't kept. Neither are those of a line filed as a reconciliation proposal: the proposal's draft is what a person would sign, and the line's `hash` stays under its `meta.wiki`.
 
 Without a signer registry, any identity that passes the identity rules is accepted where a registry would be consulted, as on stenographer's live operator paths. A valid chain then shows the lines are unchanged, not who wrote them.
 
 ## Exporting (stenographer's rules)
 
 - The export is the ledger's stream from `seq` 1. The stream depends only on the ledger's entries in order, so it only grows at the end: line *n* is the same on every export.
+- An imported entry's line carries the unknown fields it came with (Importing rule 10), as they came. `x-steno` is this ledger's own record, written afresh. TRANSITION lines are derived from the causes this ledger applied, so an imported TRANSITION's unknown fields don't reappear.
 - `sinceSeq` returns the lines after that seq. The result reports `lastSeq`, which is what to pass next time. `since` (an ISO timestamp) is a deprecated alias: it returns the stream from the first line written after that time, so the lines still chain.
 - Exporting into a file appends, in one write, the lines of the stream the file doesn't hold yet. The file must hold a run of this ledger's stream and nothing else. A file holding a teammate's lines, or an edited line, is refused and left untouched. Export never truncates or rewrites a line.
 - MCP callers name files relative to the wiki directory (`--wiki-dir`, default `wiki/` next to the state file). Absolute paths, `..`, names that aren't `*.jsonl`, symlinks that resolve outside the directory and the state file itself are refused.
@@ -208,11 +241,11 @@ v1 couldn't carry status changes, and a 0.x full export rewrote the file, which 
 
 | File | What a conforming reader does |
 |---|---|
-| `signers.json` | The signer registry the fixtures assume: `{"signers": [{id, role}]}`. |
+| `signers.json` | The signer registry the fixtures assume (see [Identities](#identities)). One entry carries `keys`, which every 1.0 reader must accept and ignore. |
 | `valid/ledger.jsonl` | One ledger's stream. It covers a TB with literals and `claimed-command` evidence, an open UV, a contest, an addendum that verifies the contest and overrides the TB, the superseding TB, a strike, an agent's UV refuted by a person, and a notarized agent draft whose `signs` link names a proposal that didn't travel, with a TRANSITION after each change. Every line passes the schema, every hash recomputes, and the lines chain. |
 | `valid/ledger.expected.json` | The fold: `{id: {type, status, current}}` for every TB and UV. |
 | `valid/proposals.jsonl`, `proposals.expected.json` | A PROPOSAL envelope stream and the kind each line files as. Two envelopes share a `targetRef` (each is filed), and one carries an unknown `signal.source` and evidence kind (filed; `unknown` lists them as stenographer records them). |
-| `valid/unknown.jsonl`, `unknown.expected.json` | What a newer writer may send: an unknown field, unknown statuses, an unknown evidence kind and `verifyBy` kind. `fold` is what readers compute, failing closed. `import` is what stenographer does with each line. |
+| `valid/unknown.jsonl`, `unknown.expected.json` | What a newer writer may send: an unknown field, unknown statuses, an unknown evidence kind and `verifyBy` kind. `fold` is what readers compute, failing closed. `import` is what stenographer does with each line; the entry it takes keeps its unknown field, and exports it again. |
 | `valid/routing.jsonl`, `routing.expected.json` | Valid lines stenographer doesn't simply take as truth, each imported on its own: `inserted` (with the resulting `status`), `proposal` (with a `reason`), or `held`. |
 | `v1/legacy.jsonl`, `legacy.expected.json` | 0.x lines and their outcomes. The v2 schema refuses them; the codec reads them as version 1. |
 | `invalid/schema.jsonl`, `schema.expected.json` | Lines the schema and the codec both refuse, with the `reason`. Each is otherwise valid and correctly hashed. |

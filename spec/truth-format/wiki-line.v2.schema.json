@@ -144,7 +144,7 @@
       "type": "object",
       "properties": {
         "kind": {
-          "description": "An open string. Known: commit, file, test, claimed-command, wiki, message, and command (only on entries recorded before 1.0).",
+          "description": "An open string. Known: commit, file, test, claimed-command, wiki, message, chat, ticket, doc, and command (only on entries recorded before 1.0). Settling: commit, file, test, claimed-command, wiki. Every other kind, and any kind a reader doesn't know, is question-class (README, Evidence classes).",
           "type": "string",
           "minLength": 1
         },

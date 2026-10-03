@@ -104,6 +104,8 @@ Don't give the operator profile to an agent.
 
 Pass it with `--signer-registry signers.json` to `stenographer start`, and to `stenographer notarize` if you use the terminal notary. With a registry, the agent identity must resolve to an `agent` entry. Add `agent:*`, or your `--agent-identity`. Otherwise agent writes fail: at startup when `--agent-identity` is set, at the first write when the identity comes from the MCP client.
 
+An entry may also carry `keys`, a list of `{alg, id, publicKey}` (each a non-empty string). It is reserved for key signing in 1.x: 1.0 checks its shape and otherwise ignores it, so you can list keys now without breaking a 1.0 install. A key with any other field, such as a private key, makes the registry invalid.
+
 ### Terminal notary
 
 `stenographer notarize` prints a random code; type that back. The last four characters of the proposal id no longer confirm.
@@ -135,7 +137,8 @@ Evidence of kind `command` is recorded as `claimed-command`. It no longer self-s
 - Don't write to `truth_entries` or `truth_links` directly. Any row inserted, updated or deleted outside `TruthLedger` fails `verify`, and so does any change to the `status` or `struck` columns.
 - `body.status` on returned entries is derived. Stored bodies no longer contain it, so a raw `SELECT body` won't show it.
 - A dismissed proposal is closed by a `RULING` with `body.kind === 'dismissal'` and a `dismisses` link. Code that lists rulings may want to skip that kind. `dismissProposal` takes an optional fourth `ctx` argument (timestamp, provenance, session).
-- New union members: `TruthEntryType` includes `'MARKER'`, `LinkType` includes `'dismisses'`, `RulingKind` includes `'dismissal'`, and `EvidenceSchema`'s `kind` includes `'claimed-command'`. Exhaustive `switch`es over these need a new case.
+- New union members: `TruthEntryType` includes `'MARKER'`, `LinkType` includes `'dismisses'`, `RulingKind` includes `'dismissal'`, and `EvidenceSchema`'s `kind` (`EvidenceKind`) includes `'claimed-command'`, `'chat'`, `'ticket'` and `'doc'`. Exhaustive `switch`es over these need a new case. To tell evidence that can settle a claim from evidence that only raises a question, use `evidenceClass(kind)` (or `SETTLING_EVIDENCE_KINDS`) rather than a list of your own: it puts a kind it doesn't know in the question class.
+- The body of a TB, UV, addendum or ruling imported from the wiki may carry `extra`: the line's fields this version doesn't define, kept so the export writes them back. Live writes never set it.
 
 ## Team wiki: truth format v2
 
@@ -170,7 +173,7 @@ If you use a signer registry, list your teammates in it: with one, a TB from the
 
 - `exportWikiEntries(ledger, {sinceSeq?, since?})` returns `{lines, count, lastSeq, skipped}` and touches no file; write with `appendWikiFile({dir, file, statePath}, lines)`. `importWikiEntries(ledger, {lines}, {signers?, embeddings?})` takes lines; read them with `readWikiFile({dir, file})`. Neither accepts `path` any more.
 - `entryToWikiLine`, `wikiLineToEntry`, `WikiEntryLine` and `TruthLedger.getExportableEntries` are gone. To read lines, use `decodeWikiLine` and `checkWikiChain`. `TruthLedger.importEntry` takes `(entry, links, opts)`, and `importChange` imports addenda and rulings.
-- Consumers of the format (short-hand, smallchat, smallchat-swift): follow `spec/truth-format/README.md`, and run `spec/truth-format/fixtures/` in your tests. A line's current status is its latest TRANSITION's, else the entry line's own `status`; unknown statuses fail closed.
+- Consumers of the format (short-hand, smallchat, smallchat-swift): follow `spec/truth-format/README.md`, and run `spec/truth-format/fixtures/` in your tests. A line's current status is its latest TRANSITION's, else the entry line's own `status`; unknown statuses fail closed. Evidence kinds `chat`, `ticket` and `doc` are known, and every kind has a class (settling or question; an unknown kind is question-class). A registry entry may carry `keys`, which a 1.0 reader accepts and ignores.
 - Proposal files: write the v2 PROPOSAL envelope (`kind: "tb"|"uv"`, `signal.source: "compaction-candidate"|"agent"|"detector:<name>"`, chained with `seq`, `prevHash`, `hash`). The bare short-hand dialect and `shorthand-compaction` are still read. An id names one envelope: re-exporting it, at any `seq`, is a no-op, and a different envelope under an id already filed is reported as an error.
 
 ## Objections and the pre-dispatch gate

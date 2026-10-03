@@ -27,7 +27,9 @@
  * PROPOSAL. Status changes are applied from the ADDENDUM and RULING entries
  * that cause them, under the same trust rules; TRANSITION lines are checked
  * against their causes, since this ledger derives status itself.
- * Re-importing a file is a no-op.
+ * Re-importing a file is a no-op. A TB, UV, ADDENDUM or RULING line's fields
+ * this version doesn't define are kept with the entry (its body's `extra`)
+ * and exported again as written; TRANSITIONs are derived, so theirs aren't.
  *
  * v1 lines (0.x: no schemaVersion, a `status` field) are still read; see
  * the spec's upgrade notes.
@@ -37,7 +39,15 @@ import { z } from 'zod';
 import { canonicalize, sha256Hex } from './jcs.js';
 import { deriveStatus, deriveStruck, recordedStatus, type InboundLink } from './status.js';
 import { resolveIdentity, type SignerRegistry, type SignerRole } from './identity.js';
-import { INBOUND_LINKS, OUTBOUND_LINKS, type LedgerRecord, type NewEntry, type TruthLedger } from './ledger.js';
+import {
+  INBOUND_LINKS,
+  LINE_BODY_FIELDS,
+  LINE_ENVELOPE_FIELDS,
+  OUTBOUND_LINKS,
+  type LedgerRecord,
+  type NewEntry,
+  type TruthLedger,
+} from './ledger.js';
 import {
   EVIDENCE_KINDS,
   EvidenceSchema,
@@ -502,13 +512,15 @@ function buildStream(ledger: TruthLedger): { lines: WikiLine[]; skipped: Array<{
     const steno = { origin: r.origin, provenance: r.provenance, agentSessionId: r.agentSessionId, targetRef: r.targetRef, links: r.links, ledgerHash: r.hash };
     const envelope = { id: r.id, type: r.type, ts: r.createdAt, author: r.author };
     const b = r.body;
+    // The fields a newer writer's line carried, as it wrote them (admission keeps them off the line's own)
+    const extra = (b.extra ?? {}) as Record<string, unknown>;
     if (r.type === 'TB' || r.type === 'UV') {
       const status = wikiStatus(derived.get(r.id)!);
       const body =
         r.type === 'TB'
           ? { claim: b.claim, evidence: b.evidence, signedBy: b.signedBy, ...(b.literals !== undefined ? { literals: b.literals } : {}) }
           : { assertion: b.assertion, basis: b.basis, verifyBy: b.verifyBy, contests: b.contests ?? null };
-      if (emit({ ...envelope, ...body, status, 'x-steno': steno }, r.id)) {
+      if (emit({ ...envelope, ...body, status, ...extra, 'x-steno': steno }, r.id)) {
         stated.set(r.id, status);
         written.add(r.id);
       }
@@ -517,7 +529,7 @@ function buildStream(ledger: TruthLedger): { lines: WikiLine[]; skipped: Array<{
       r.links.some((l) => STATUS_LINKS.includes(l.type) && (types.get(l.toId) === 'TB' || types.get(l.toId) === 'UV'))
     ) {
       const body = r.type === 'ADDENDUM' ? { evidence: b.evidence, note: b.note ?? null } : { kind: b.kind, opinion: b.opinion, target: b.target };
-      if (emit({ ...envelope, ...body, 'x-steno': steno }, r.id)) written.add(r.id);
+      if (emit({ ...envelope, ...body, ...extra, 'x-steno': steno }, r.id)) written.add(r.id);
     }
 
     // Every exported TB or UV whose status this entry changed gets a
@@ -763,6 +775,17 @@ function unknownValue(line: Record<string, unknown>): string | null {
   return null;
 }
 
+/**
+ * A line's top-level fields that this version doesn't define for its type,
+ * kept for the entry's body (`extra`) so the export writes them back as they
+ * came. `x-steno` is this ledger's own record, and is written afresh.
+ */
+function extraOf(line: Record<string, unknown>, type: keyof typeof LINE_BODY_FIELDS): { extra?: Record<string, unknown> } {
+  const unknown = Object.entries(line).filter(([key]) => !LINE_ENVELOPE_FIELDS.includes(key) && !LINE_BODY_FIELDS[type].includes(key));
+  // fromEntries defines each key as an own field, so even a `__proto__` field stays one
+  return unknown.length > 0 ? { extra: Object.fromEntries(unknown) } : {};
+}
+
 /** The ledger entry a TB or UV line describes, and why it can't be admitted as truth, if it can't. */
 function entryOf(d: DecodedWikiLine): EntryOf {
   const line = d.line;
@@ -795,8 +818,8 @@ function entryOf(d: DecodedWikiLine): EntryOf {
   const floor = status && TERMINAL.has(status) ? { status } : {};
   const body =
     type === 'TB'
-      ? { claim: line.claim, evidence: line.evidence, signedBy: line.signedBy, ...(line.literals !== undefined ? { literals: line.literals } : {}), ...floor }
-      : { assertion: line.assertion, basis: line.basis, verifyBy: line.verifyBy, contests: line.contests, ...floor };
+      ? { claim: line.claim, evidence: line.evidence, signedBy: line.signedBy, ...(line.literals !== undefined ? { literals: line.literals } : {}), ...floor, ...extraOf(line, type) }
+      : { assertion: line.assertion, basis: line.basis, verifyBy: line.verifyBy, contests: line.contests, ...floor, ...extraOf(line, type) };
   return {
     entry: {
       id,
@@ -830,11 +853,12 @@ function entryOfV1(line: Record<string, unknown>, type: 'TB' | 'UV'): EntryOf {
       evidence: tb.evidence,
       signedBy: tb.signedBy ? canonicalIdentity(tb.signedBy) : null,
       ...(tb.literals && tb.literals.length > 0 ? { literals: tb.literals } : {}),
+      ...extraOf(line, type),
     };
   } else {
     const uv = parseOrThrow(UvBodyV1, line);
     author = canonicalIdentity(uv.author);
-    body = { assertion: uv.assertion, basis: uv.basis, verifyBy: uv.verifyBy, contests: uv.contests ?? null };
+    body = { assertion: uv.assertion, basis: uv.basis, verifyBy: uv.verifyBy, contests: uv.contests ?? null, ...extraOf(line, type) };
   }
 
   // Fail closed on a status a v1 line couldn't have meant; keep a terminal one as a floor
@@ -880,16 +904,20 @@ function changeOf(d: DecodedWikiLine): { entry: NewEntry; links: TruthLink[] } |
   const x = (line['x-steno'] ?? {}) as { provenance?: NewEntry['provenance']; agentSessionId?: string | null; links?: TruthLink[] };
   if (!x.links) return { unknown: 'it lists no links (x-steno.links), so what it changes is unknown' };
   const id = line.id as string;
+  const type = d.type as 'ADDENDUM' | 'RULING';
   return {
     entry: {
       id,
-      type: d.type as 'ADDENDUM' | 'RULING',
+      type,
       createdAt: line.ts as string,
       author: line.author as string,
       provenance: x.provenance ?? { kind: 'wiki', ref: id },
       agentSessionId: x.agentSessionId ?? null,
       origin: 'wiki',
-      body: d.type === 'ADDENDUM' ? { evidence: line.evidence, note: line.note } : { kind: line.kind, opinion: line.opinion, target: line.target },
+      body:
+        type === 'ADDENDUM'
+          ? { evidence: line.evidence, note: line.note, ...extraOf(line, type) }
+          : { kind: line.kind, opinion: line.opinion, target: line.target, ...extraOf(line, type) },
     },
     links: x.links.map((l) => ({ fromId: l.fromId, toId: l.toId, type: l.type })),
   };

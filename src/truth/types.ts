@@ -135,8 +135,29 @@ export const ProvenanceSchema = z.object({
 });
 export type Provenance = z.infer<typeof ProvenanceSchema>;
 
-export const EVIDENCE_KINDS = ['commit', 'file', 'test', 'command', 'claimed-command', 'wiki', 'message'] as const;
+/**
+ * The evidence kinds this version knows (spec/truth-format, "Evidence
+ * classes"). `wiki` is the id of an entry in a truth ledger, this one or a
+ * teammate's; a team wiki page is a `doc`. `chat` is a chat message or
+ * thread, `ticket` an issue or ticket, `doc` a document or page outside the
+ * truth ledger.
+ */
+export const EVIDENCE_KINDS = ['commit', 'file', 'test', 'command', 'claimed-command', 'wiki', 'message', 'chat', 'ticket', 'doc'] as const;
 export type EvidenceKind = (typeof EVIDENCE_KINDS)[number];
+
+/**
+ * Evidence that points at something a reader can check against the code or
+ * the ledger. Every other kind (`message`, `chat`, `ticket`, `doc`, pre-1.0
+ * `command`) is question-class: it can prompt a check, but isn't one. In 1.0
+ * the classes bind agents only; a person may sign on any evidence.
+ */
+export const SETTLING_EVIDENCE_KINDS = ['commit', 'file', 'test', 'claimed-command', 'wiki'] as const;
+export type EvidenceClass = 'settling' | 'question';
+
+/** An evidence kind's class. A kind this version doesn't know is question-class: it fails closed. */
+export function evidenceClass(kind: string): EvidenceClass {
+  return (SETTLING_EVIDENCE_KINDS as readonly string[]).includes(kind) ? 'settling' : 'question';
+}
 
 /**
  * Evidence as a caller submits it. A `command` the caller says it ran, with
@@ -149,7 +170,7 @@ export const EvidenceSchema = z.object({
   kind: z
     .enum(EVIDENCE_KINDS)
     .transform((kind): EvidenceKind => (kind === 'command' ? 'claimed-command' : kind)),
-  /** Commit sha, file/line, test name, command line, wiki entry id, or message id. */
+  /** Commit sha, file/line, test name, command line, truth entry id, message id, chat message or thread, ticket, or document. */
   ref: z.string().min(1),
   /** What the evidence shows (e.g. captured command output). */
   detail: z.string().optional(),
@@ -267,6 +288,14 @@ export interface TruthEnvelope {
   links: TruthLink[];
 }
 
+/**
+ * Fields a newer writer put on a wiki line that this version doesn't define,
+ * kept as the line gave them so the export writes them back verbatim
+ * (spec/truth-format, "Unknown values"). Only wiki import sets it; live
+ * writes never do.
+ */
+export type ExtraFields = Record<string, unknown>;
+
 /** TB — asserted tombstone: a prior statement is provably stale or wrong. */
 export interface TbBody {
   /** What is dead and what replaces it (if anything). */
@@ -278,6 +307,7 @@ export interface TbBody {
   status: TbStatus;
   /** Matchable dead literals — optional; only TBs carrying them can raise objections (§12). */
   literals?: TombstonedLiteral[];
+  extra?: ExtraFields;
 }
 
 /** UV — unverified assertion: believed true, stated before verification exists. */
@@ -291,6 +321,7 @@ export interface UvBody {
   /** Id of a TB this UV disputes — this link puts the TB into `contested`. */
   contests?: string | null;
   status: UvStatus;
+  extra?: ExtraFields;
 }
 
 /** PROPOSAL — machine-drafted candidate. Never truth until signed. */
@@ -332,6 +363,7 @@ export interface ProposalBody {
 export interface AddendumBody {
   evidence: Evidence[];
   note?: string | null;
+  extra?: ExtraFields;
 }
 
 /** RULING — a signed judgment about an existing entry (§11). */
@@ -350,6 +382,7 @@ export interface RulingBody {
   /** Objection rulings (§12): the objection ruled on, and the outcome. */
   objectionId?: string;
   outcome?: 'sustained' | 'overruled';
+  extra?: ExtraFields;
 }
 
 /**

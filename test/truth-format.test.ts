@@ -23,7 +23,7 @@ import { SignerRegistry } from '../src/truth/identity.js';
 import { importProposalDrafts } from '../src/truth/intake.js';
 import { canonicalize } from '../src/truth/jcs.js';
 import { decodeWikiLine, exportWikiEntries, importWikiEntries, wikiLineHash, WIKI_STATUSES } from '../src/truth/wiki.js';
-import type { ProposalEntry, TbEntry } from '../src/truth/types.js';
+import { EVIDENCE_KINDS, evidenceClass, type ProposalEntry, type TbEntry } from '../src/truth/types.js';
 
 const SPEC = join(import.meta.dirname, '..', 'spec', 'truth-format');
 const FIXTURES = join(SPEC, 'fixtures');
@@ -43,7 +43,9 @@ const rehash = (line: Record<string, unknown>) => ({ ...line, hash: wikiLineHash
 
 const SIGNERS = {
   signers: [
-    { id: 'johnnyclem', role: 'human' },
+    // `keys` is reserved for key signing in 1.x: every 1.0 reader must accept it, and ignore it.
+    // (A placeholder, not a real key: base64url SHA-256 of 'stenographer truth-format fixture: johnnyclem/2026-09'.)
+    { id: 'johnnyclem', role: 'human', keys: [{ alg: 'ed25519', id: 'johnnyclem/2026-09', publicKey: 'vwK0Oit9S-qSuXboNLd6z8x_ZT3Cikae7d8UUSPaxoE' }] },
     { id: 'sam', role: 'human' },
     { id: 'alex', role: 'human' },
     { id: 'kim', role: 'human' },
@@ -83,6 +85,18 @@ function stream(bodies: Array<Record<string, unknown>>, from = 1, prev: string |
   });
   return out;
 }
+
+/** The top-level fields the spec defines, per line type: anything else on a line is a newer writer's. */
+const ENVELOPE_FIELDS = ['schemaVersion', 'seq', 'id', 'type', 'ts', 'author', 'prevHash', 'hash', 'x-steno'];
+const BODY_FIELDS: Record<string, string[]> = {
+  TB: ['claim', 'evidence', 'signedBy', 'literals', 'status'],
+  UV: ['assertion', 'basis', 'verifyBy', 'contests', 'status'],
+  ADDENDUM: ['evidence', 'note'],
+  RULING: ['kind', 'opinion', 'target'],
+  TRANSITION: ['target', 'status', 'cause'],
+};
+const unknownFields = (line: Record<string, unknown>) =>
+  Object.keys(line).filter((k) => !ENVELOPE_FIELDS.includes(k) && !BODY_FIELDS[line.type as string].includes(k));
 
 /** The fold every reader applies: the highest-seq TRANSITION's status, else the entry line's own. */
 function fold(stream: string[]): Record<string, { type: string; status: string | null; current: boolean }> {
@@ -280,7 +294,7 @@ function buildFixtures(): Map<string, string> {
     json({
       fold: fold(unknown),
       import: [
-        { line: 1, outcome: 'inserted', note: 'an unknown field is ignored (and preserved by readers that re-serialize)' },
+        { line: 1, outcome: 'inserted', note: 'the unknown field is kept with the entry and exported again verbatim' },
         { line: 2, outcome: 'proposal', reason: 'unknown-status' },
         { line: 3, outcome: 'proposal', reason: 'unknown-value', note: "evidence kind 'url'" },
         { line: 4, outcome: 'proposal', reason: 'unknown-value', note: "verifyBy kind 'query'" },
@@ -571,6 +585,76 @@ describe('valid/unknown.jsonl: what a newer writer may send', () => {
       if (w.outcome === 'held') expect(result.held.map((h) => h.line), `line ${w.line}`).toContain(w.line);
     }
   });
+
+  it('stenographer keeps the unknown fields of each entry it takes, and exports them again verbatim', () => {
+    const ledger = fresh();
+    importWikiEntries(ledger, { lines: fixture() }, { signers: signers() });
+    const exported = new Map(exportWikiEntries(ledger).lines.map(parse).map((l) => [l.id, l]));
+    const taken = want()
+      .import.filter((w) => w.outcome === 'inserted')
+      .map((w) => parse(fixture()[w.line - 1]));
+    expect(taken.flatMap(unknownFields), 'an unknown field on a line stenographer takes').not.toEqual([]);
+    for (const line of taken) {
+      const out = exported.get(line.id)!;
+      expect(unknownFields(out).sort(), line.id).toEqual(unknownFields(line).sort());
+      for (const key of unknownFields(line)) expect(canonicalize(out[key]), `${line.id}: ${key}`).toBe(canonicalize(line[key]));
+    }
+  });
+
+  it('so does every entry line type: TB, UV, ADDENDUM and RULING; a TRANSITION, derived on export, does not', () => {
+    // A writer's stream: a TB, a UV a person verifies, and a strike of the TB
+    const origin = fresh();
+    const tb = origin.assertTombstone({ claim: 'The cron box is decommissioned.', evidence: [{ kind: 'commit', ref: 'c0ffee1' }], signedBy: 'kim' }, { author: 'kim', timestamp: T(50) });
+    const uv = origin.assertUv({ assertion: 'Backups run nightly.', basis: 'the runbook', verifyBy: { kind: 'inspect', value: 'cron.d/backup' } }, { author: 'sam', timestamp: T(51) });
+    origin.resolveUv(uv.id, 'verified', [{ kind: 'file', ref: 'cron.d/backup:1', detail: '0 2 * * *' }], { author: 'alex', opinion: 'it runs at 02:00', timestamp: T(52) });
+    origin.fileRuling({ kind: 'strike', opinion: 'the commit is on an abandoned branch', target: tb.id }, { author: 'johnnyclem', timestamp: T(53) });
+
+    // ...as a newer writer would send it: fields this version doesn't define, on every line
+    const added: Record<string, Record<string, unknown>> = {
+      TB: { reviewers: ['sam', 'alex'], expires: '2027-01-01' },
+      UV: { severity: 3, tags: [] },
+      ADDENDUM: { confidence: 0.92, attachments: [{ name: 'trace.txt', bytes: 2048, sha: null }] },
+      // An own `__proto__` key is a field like any other (JSON.parse makes it one), never the object's prototype
+      RULING: { appealBy: null, precedent: { cites: ['RULING-17'], binding: false }, ...JSON.parse('{"__proto__":{"polluted":true}}') },
+      TRANSITION: { reason: 'derived by the writer' },
+    };
+    const sent = stream(
+      exportWikiEntries(origin).lines.map((l) => {
+        const { schemaVersion: _v, seq: _s, prevHash: _p, hash: _h, ...line } = parse(l);
+        return { ...line, ...added[line.type] };
+      })
+    );
+    expect(sent.map((l) => parse(l).type)).toEqual(['TB', 'UV', 'ADDENDUM', 'TRANSITION', 'RULING', 'TRANSITION']);
+    for (const line of sent) expect(schemaValid(line), ajv.errorsText(validate.errors)).toBe(true);
+
+    const ledger = fresh();
+    expect(importWikiEntries(ledger, { lines: sent }, { signers: signers() })).toMatchObject({ committed: true, inserted: 4, derived: 2, proposals: [], held: [] });
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+    const back = exportWikiEntries(ledger).lines;
+    expect(back.map((l) => parse(l).type)).toEqual(['TB', 'UV', 'ADDENDUM', 'TRANSITION', 'RULING', 'TRANSITION']);
+    for (const [i, line] of sent.map(parse).entries()) {
+      const out = parse(back[i]);
+      expect(schemaValid(back[i]), ajv.errorsText(validate.errors)).toBe(true);
+      if (line.type === 'TRANSITION') {
+        // This ledger writes its own TRANSITIONs from the causes it applied
+        expect(unknownFields(out), `line ${i + 1}`).toEqual([]);
+        continue;
+      }
+      expect(unknownFields(out).sort(), `line ${i + 1}`).toEqual(unknownFields(line).sort());
+      for (const key of unknownFields(line)) expect(canonicalize(out[key]), `line ${i + 1}: ${key}`).toBe(canonicalize(line[key]));
+      // ...and the rest of the line is the writer's too, but for where this ledger got it
+      const { 'x-steno': x, prevHash: _p, hash: _h, ...rest } = out;
+      const { 'x-steno': sx, prevHash: _sp, hash: _sh, ...sentRest } = line;
+      expect(canonicalize(rest), `line ${i + 1}`).toBe(canonicalize(sentRest));
+      expect({ ...x, origin: undefined, ledgerHash: undefined }).toEqual({ ...sx, origin: undefined, ledgerHash: undefined });
+    }
+
+    // Kept as part of the entry: the same line again is a no-op, and so is this ledger's own export of it
+    expect(importWikiEntries(ledger, { lines: sent }, { signers: signers() })).toMatchObject({ committed: true, inserted: 0, unchanged: 4, proposals: [] });
+    expect(importWikiEntries(ledger, { lines: back }, { signers: signers() })).toMatchObject({ committed: true, inserted: 0, unchanged: 4, proposals: [] });
+    expect(exportWikiEntries(ledger).lines).toEqual(back);
+    expect(ledger.verify().ok).toBe(true);
+  });
 });
 
 describe('valid/routing.jsonl: lines stenographer does not simply take as truth', () => {
@@ -681,5 +765,38 @@ describe('the spec document', () => {
   it('lists the statuses the codec knows', () => {
     const readme = read('README.md');
     for (const status of [...WIKI_STATUSES.TB, ...WIKI_STATUSES.UV]) expect(readme).toContain(`\`${status}\``);
+  });
+
+  it('lists the evidence kinds the codec knows, in the TB row and the schema, and gives each the class the codec does', () => {
+    const readme = read('README.md');
+    const row = readme.split('\n').find((l) => l.startsWith('| `evidence` |'))!;
+    for (const kind of EVIDENCE_KINDS) expect(row, kind).toContain(`\`${kind}\``);
+    const described = new Set((schema.$defs.evidence.properties.kind.description as string).split(/[^a-z-]+/));
+    for (const kind of EVIDENCE_KINDS) expect(described.has(kind), `the schema's evidence kind description lists ${kind}`).toBe(true);
+
+    // The "Evidence classes" table: one row per known kind, with its class
+    const section = readme.slice(readme.indexOf('\n## Evidence classes\n'), readme.indexOf('\n## ', readme.indexOf('\n## Evidence classes\n') + 1));
+    const classes = new Map(
+      [...section.matchAll(/^\| `([^`]+)` \|.*\| (settling|question) \|$/gm)].map((m) => [m[1], m[2]])
+    );
+    expect([...classes.keys()].sort()).toEqual([...EVIDENCE_KINDS].sort());
+    for (const [kind, cls] of classes) expect(cls, kind).toBe(evidenceClass(kind));
+    expect(section).toMatch(/any kind (a|the) reader doesn't know is question-class/i);
+  });
+
+  it('documents the signer registry fields, keys included', () => {
+    const readme = read('README.md');
+    for (const field of ['`id`', '`role`', '`aliases`', '`keys`', '`alg`', '`publicKey`']) expect(readme, field).toContain(field);
+  });
+});
+
+describe('signers.json: the registry the fixtures assume', () => {
+  it('has an entry carrying keys, reserved for key signing in 1.x, which a 1.0 registry accepts and ignores', () => {
+    const file = expected<{ signers: Array<{ id: string; role: string; keys?: Array<Record<string, string>> }> }>('fixtures/signers.json');
+    const keyed = file.signers.filter((s) => s.keys !== undefined);
+    expect(keyed).toHaveLength(1);
+    for (const key of keyed[0].keys!) expect(Object.keys(key).sort()).toEqual(['alg', 'id', 'publicKey']);
+    const registry = signers();
+    for (const s of file.signers.filter((s) => !s.id.endsWith('*'))) expect(registry.lookup(s.id), s.id).toEqual({ id: s.id, role: s.role });
   });
 });

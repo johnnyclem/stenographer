@@ -121,8 +121,11 @@ const Evidence = z
   .array(EvidenceSchema.strict())
   .min(1)
   .describe(
-    'At least one piece of evidence: {kind: commit|file|test|command|wiki|message, ref, detail?}. Command output ' +
-      'you report is recorded as kind claimed-command: stenographer did not run it, so it never signs for itself.'
+    'At least one piece of evidence: {kind: commit|file|test|command|wiki|message|chat|ticket|doc, ref, detail?}. ' +
+      'wiki is a truth-ledger entry id; chat a chat message or thread (Slack, Teams, Discord); ticket an issue or ' +
+      'ticket (Jira, Linear, GitHub issues); doc a document or page outside the truth ledger (design doc, team wiki ' +
+      'page, README). Command output you report is recorded as kind claimed-command: stenographer did not run it, so ' +
+      'it never signs for itself.'
   );
 const Literals = z
   .array(StrictTombstonedLiteralSchema)

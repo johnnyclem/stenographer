@@ -21,7 +21,7 @@ Grade every consumed entry, highest signal first:
 | Grade | What it is | How dispatch should treat it | Suggested weight |
 |---|---|---|---|
 | **verified** | TB whose evidence includes a reproducible check (`command` or `test` kind), or a UV resolved `verified` by one | Authoritative. May **rewrite dispatch**: forward a superseded selector to its successor, demote/redirect a dead tool | 1.0 |
-| **asserted** | Signed TB whose evidence is judgment-grade (`commit`, `file`, `wiki`, `message`) or `claimed-command` (command output someone reported, which stenographer did not run) — stands on the signer's accountability | Authoritative for **ranking**, not rewiring: prefer the successor, keep the old selector callable | 0.75 |
+| **asserted** | Signed TB whose evidence is judgment-grade (`commit`, `file`, `wiki`, `message`, `chat`, `ticket`, `doc`) or `claimed-command` (command output someone reported, which stenographer did not run) — stands on the signer's accountability | Authoritative for **ranking**, not rewiring: prefer the successor, keep the old selector callable | 0.75 |
 | **migration** | Backfilled pre-assertion TB (`author: "migration"`, `signedBy: null`) — queryably second-class by design | Weak ranking bias only | 0.5 |
 | **contested** | Any TB with `status: "contested"` (a live UV disputes it) | Still truth, one notch down; carry the contest into the tool's annotation so the caller can see the asterisk | ×0.8 multiplier on its base grade |
 | **advisory** | Open UV | **Never moves a tool in the table.** Zero ranking weight. Attach as a warning annotation (tool description, `doesNotUnderstand`-style hint) — flag, don't block | 0 (surfaced, not scored) |

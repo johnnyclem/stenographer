@@ -123,6 +123,37 @@ interface AppendOptions {
   imported?: boolean;
 }
 
+/**
+ * A wiki line's top-level fields that aren't its entry's body: the envelope,
+ * the chain, and this ledger's own `x-steno`, which the export writes afresh.
+ */
+export const LINE_ENVELOPE_FIELDS: readonly string[] = ['schemaVersion', 'seq', 'id', 'type', 'ts', 'author', 'prevHash', 'hash', 'x-steno'];
+
+/**
+ * The body fields a wiki line of each entry type carries (spec/truth-format).
+ * Any other top-level field of an imported line is a newer writer's: it is
+ * kept in the body's `extra` and exported again as written.
+ */
+export const LINE_BODY_FIELDS: Readonly<Record<'TB' | 'UV' | 'ADDENDUM' | 'RULING', readonly string[]>> = {
+  TB: ['claim', 'evidence', 'signedBy', 'literals', 'status'],
+  UV: ['assertion', 'basis', 'verifyBy', 'contests', 'status'],
+  ADDENDUM: ['evidence', 'note'],
+  RULING: ['kind', 'opinion', 'target'],
+};
+
+/** An imported line's unknown fields: never one the line itself defines, which the export would write twice. */
+const extraFields = (type: keyof typeof LINE_BODY_FIELDS) =>
+  z
+    .record(z.unknown())
+    .superRefine((extra, ctx) => {
+      for (const key of Object.keys(extra)) {
+        if (LINE_ENVELOPE_FIELDS.includes(key) || LINE_BODY_FIELDS[type].includes(key)) {
+          ctx.addIssue({ code: z.ZodIssueCode.custom, message: `'${key}' is a field a ${type} line defines, not an unknown one` });
+        }
+      }
+    })
+    .optional();
+
 // What admit() checks, per entry type. Bodies are checked as stored: the
 // same building blocks the write-time input schemas use (types.ts), without
 // their transforms, so a validated body is stored exactly as given.
@@ -137,6 +168,7 @@ const STORED_BODY: Partial<Record<TruthEntryType, z.ZodTypeAny>> = {
       literals: z.array(TombstonedLiteralSchema).optional(),
       // Recorded by a pre-1.0 ledger or a v1 wiki line; a terminal one is a floor (status.ts)
       status: z.enum(TB_STATUSES).optional(),
+      extra: extraFields('TB'),
     })
     .strict(),
   UV: z
@@ -146,12 +178,14 @@ const STORED_BODY: Partial<Record<TruthEntryType, z.ZodTypeAny>> = {
       verifyBy: VerifyBySchema,
       contests: z.string().min(1).nullable().optional(),
       status: z.enum(UV_STATUSES).optional(),
+      extra: extraFields('UV'),
     })
     .strict(),
   ADDENDUM: z
     .object({
       evidence: z.array(EvidenceSchema).min(1, 'an addendum requires at least one piece of evidence'),
       note: z.string().nullable().optional(),
+      extra: extraFields('ADDENDUM'),
     })
     .strict(),
   RULING: z
@@ -161,6 +195,7 @@ const STORED_BODY: Partial<Record<TruthEntryType, z.ZodTypeAny>> = {
       target: z.string().min(1),
       objectionId: z.string().min(1).optional(),
       outcome: z.enum(['sustained', 'overruled']).optional(),
+      extra: extraFields('RULING'),
     })
     .strict(),
   PROPOSAL: z
@@ -612,6 +647,10 @@ export class TruthLedger {
 
     const parsed = bodySchema!.safeParse(body);
     if (!parsed.success) fail(formatIssues(parsed.error));
+    // A newer writer's fields arrive only on a wiki line
+    if (entry.type in LINE_BODY_FIELDS && body.extra !== undefined && !opts.imported) {
+      fail(`only an imported entry carries extra (a wiki line's unknown fields)`);
+    }
 
     // Links: of a type this entry writes, at an entry of the type the link means
     const typeOf = this.db.prepare('SELECT type FROM truth_entries WHERE id = ?');

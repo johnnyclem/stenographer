@@ -11,7 +11,10 @@ import { runVerifyCLI, startupLedgerCheck } from '../src/truth/verify-cli.js';
 import { runNotaryCLI } from '../src/truth/notary-cli.js';
 import { importWikiEntries } from '../src/truth/wiki.js';
 import {
+  EVIDENCE_KINDS,
+  SETTLING_EVIDENCE_KINDS,
   EvidenceSchema,
+  evidenceClass,
   isSelfSigningEvidence,
   type Evidence,
   type MarkerBody,
@@ -350,6 +353,31 @@ describe('evidence semantics', () => {
       expect((ledger.getEntry(live.id) as TbEntry).body.status).toBe('contested');
     }
     store.close();
+  });
+
+  it('knows chat, ticket and doc evidence, and records them as given', () => {
+    const store = new StateStore(':memory:');
+    const evidence = [
+      { kind: 'chat', ref: 'slack:#infra/p1712345678', detail: 'ops confirmed the box is gone' },
+      { kind: 'ticket', ref: 'OPS-1432' },
+      { kind: 'doc', ref: 'https://wiki.example.com/runbooks/cron' },
+    ] as Evidence[];
+    expect(evidence.map((e) => EvidenceSchema.parse(e))).toEqual(evidence);
+    const tb = store.truth.assertTombstone({ claim: 'The cron box is retired.', evidence, signedBy: 'johnny' }, { author: 'johnny' });
+    expect(tb.body.evidence).toEqual(evidence);
+    store.close();
+  });
+
+  it('sorts every evidence kind into a class: settling, or question (which any kind it does not know falls into)', () => {
+    expect([...SETTLING_EVIDENCE_KINDS]).toEqual(['commit', 'file', 'test', 'claimed-command', 'wiki']);
+    for (const kind of ['commit', 'file', 'test', 'claimed-command', 'wiki']) expect(evidenceClass(kind), kind).toBe('settling');
+    // Pre-1.0 `command` is output nobody re-ran: a question, like a message or a page
+    for (const kind of ['message', 'chat', 'ticket', 'doc', 'command']) expect(evidenceClass(kind), kind).toBe('question');
+    // Fail closed: a kind this version doesn't know never settles
+    for (const kind of ['screenshot', 'url', '', 'Commit', 'commit ']) expect(evidenceClass(kind), JSON.stringify(kind)).toBe('question');
+    // Every known kind has a class, and every settling kind is a known one
+    for (const kind of EVIDENCE_KINDS) expect(['settling', 'question']).toContain(evidenceClass(kind));
+    for (const kind of SETTLING_EVIDENCE_KINDS) expect(EVIDENCE_KINDS).toContain(kind);
   });
 });
 
