@@ -66,6 +66,7 @@ import {
   type LinkType,
   type TruthEntryType,
   type TruthLink,
+  type UvEntry,
 } from './types.js';
 
 export const WIKI_SCHEMA_VERSION = 2;
@@ -783,13 +784,20 @@ interface EntryOf {
 
 type Route = { reason: ReconciliationReason; detail: string };
 
-/** The first value in a v2 line this stenographer has no meaning for, if any. */
+/**
+ * The first value in a v2 line this stenographer has no meaning for, if any.
+ * Each field is read only on the line types that define it: on any other,
+ * a field of that name is a newer writer's unknown field, kept as written
+ * (Importing rule 10), whatever it holds.
+ */
 function unknownValue(line: Record<string, unknown>): string | null {
   const x = (line['x-steno'] ?? {}) as { origin?: string; provenance?: { kind: string }; links?: Array<{ type: string }> };
-  for (const e of (line.evidence ?? []) as Array<{ kind: string }>) {
-    if (!(EVIDENCE_KINDS as readonly string[]).includes(e.kind)) return `evidence kind '${e.kind}'`;
+  if ((line.type === 'TB' || line.type === 'ADDENDUM') && Array.isArray(line.evidence)) {
+    for (const e of line.evidence as Array<{ kind: string }>) {
+      if (!(EVIDENCE_KINDS as readonly string[]).includes(e.kind)) return `evidence kind '${e.kind}'`;
+    }
   }
-  const verifyBy = line.verifyBy as { kind: string } | undefined;
+  const verifyBy = line.type === 'UV' ? (line.verifyBy as { kind: string }) : undefined;
   if (verifyBy && !(VerifyBySchema.shape.kind.options as readonly string[]).includes(verifyBy.kind)) {
     return `verifyBy kind '${verifyBy.kind}'`;
   }
@@ -936,7 +944,8 @@ function changeOf(d: DecodedWikiLine): { entry: NewEntry; links: TruthLink[] } |
   const unknown = unknownValue(line);
   if (unknown) return { unknown: `it has ${unknown}, which this stenographer doesn't know` };
   const x = (line['x-steno'] ?? {}) as { provenance?: NewEntry['provenance']; agentSessionId?: string | null; links?: TruthLink[] };
-  if (!x.links) return { unknown: 'it lists no links (x-steno.links), so what it changes is unknown' };
+  // No links, or an empty list: either way the line says nothing it changes
+  if (!x.links || x.links.length === 0) return { unknown: 'it lists no links (x-steno.links), so what it changes is unknown' };
   const id = line.id as string;
   const type = d.type as 'ADDENDUM' | 'RULING';
   return {
@@ -975,9 +984,7 @@ function entryRoute(d: DecodedWikiLine, entry: NewEntry, signers: SignerRegistry
   }
   // Agents settle only together: an agent's TB is truth only with a quorum of agents (the codec checked its rules)
   if (entry.type === 'TB' && isAgent(body.signedBy!)) {
-    const why = !body.quorum
-      ? 'no quorum'
-      : body.quorum.filter((m) => !isAgent(m.author)).map((m) => `quorum member ${m.author} is not an agent`)[0];
+    const why = !body.quorum ? 'no quorum' : nonAgentMember(body.quorum, signers, isAgent);
     if (why) {
       return {
         reason: 'agent-without-quorum',
@@ -1028,8 +1035,20 @@ function changeDistrust(
           'angles within 15 minutes'
         );
       }
-      const person = quorum.find((m) => !isAgent(m.author));
-      if (person) return `${entry.author}'s resolution has a quorum that isn't all agents: quorum member ${person.author} is not an agent`;
+      const person = nonAgentMember(quorum, signers, isAgent);
+      if (person) return `${entry.author}'s resolution has a quorum that isn't all agents: ${person}`;
+      // Verifying a contest would override its TB: a person's act, whatever the agents agree
+      for (const link of links) {
+        if (link.type !== 'verifies' || link.fromId !== entry.id) continue;
+        const uv = ledger.getEntry(link.toId);
+        const contested = uv?.type === 'UV' ? (uv as UvEntry).body.contests : null;
+        if (contested) {
+          return (
+            `${entry.author}'s quorum verifies UV ${link.toId}, which contests TB ${contested}: verifying it would override TB ` +
+            `${contested}, which agents never do, together or alone — a person does`
+          );
+        }
+      }
     }
   }
   if (judicial && !signers) {
@@ -1045,6 +1064,27 @@ function changeDistrust(
         `a ${entry.type === 'RULING' ? 'ruling' : 'override'} from the wiki changes ${local}, which this ledger made itself: ` +
         'that applies only from a person a signer registry lists, and none is configured'
       );
+    }
+  }
+  return null;
+}
+
+/**
+ * Why a quorum isn't all agents, if it isn't: the first member who is not
+ * one. With a signer registry, an agent is an identity it lists with role
+ * `agent` (the spec's definition): an unlisted `agent:` name is no witness.
+ * Without one, the classifier says (the `agent:` prefix).
+ */
+function nonAgentMember(quorum: QuorumMember[], signers: SignerRegistry | null, isAgent: AgentClassifier): string | null {
+  for (const m of quorum) {
+    if (signers) {
+      try {
+        resolveIdentity(m.author, ['agent'], 'quorum member', signers);
+      } catch (err) {
+        return `quorum member ${m.author} is not an agent (${messageOf(err)})`;
+      }
+    } else if (!isAgent(m.author)) {
+      return `quorum member ${m.author} is not an agent`;
     }
   }
   return null;

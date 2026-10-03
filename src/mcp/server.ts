@@ -31,7 +31,8 @@ import {
   type Tool,
   type ToolAnnotations,
 } from '@modelcontextprotocol/sdk/types.js';
-import { Stenographer } from '../core/stenographer.js';
+import { ALLOW_AGENT_ASSERT_REMOVED, Stenographer } from '../core/stenographer.js';
+import type { TombstoneQuorumProgress } from '../truth/attestations.js';
 import {
   CONSUMPTION_RULES,
   EvidenceSchema,
@@ -54,12 +55,6 @@ export const AGENT_STANDING =
   'Your confidence is not evidence and settles nothing. On your own you can only attest: a claim settles when two or ' +
   'more agent sessions agree from different angles within 15 minutes, or when a person signs. Agents never override ' +
   'or strike a tombstone.';
-
-/** The removed single-user flag, and what replaced it (MIGRATION.md). */
-const ALLOW_AGENT_ASSERT_REMOVED =
-  '--allow-agent-assert was removed in 1.0: agents settle claims only as a quorum of two or more agent sessions ' +
-  'agreeing from different angles within 15 minutes, or a person signs. See MIGRATION.md ("--allow-agent-assert is ' +
-  'removed") for single-user setups.';
 
 /** Read by MCP clients at initialize; clients that support Claude Code channels (claude/channel) read the events part too. */
 const CHANNEL_INSTRUCTIONS: Record<ToolProfile, string> = {
@@ -180,6 +175,32 @@ const ResolveFields = {
   opinion: z.string().min(1).describe('Written reasoning, recorded with the resolution').optional(),
 };
 
+/**
+ * What propose_tombstone says of a draft that minted nothing: already truth
+ * (a TB holds every literal), or awaiting a person or a quorum, and what
+ * keeps this draft out of any quorum.
+ */
+function draftStatus(result: { dedupedInto?: string; quorum?: TombstoneQuorumProgress }, targetRef?: string): string {
+  const quorum = result.quorum;
+  if (quorum?.heldBy) {
+    return (
+      `already truth: TB ${quorum.heldBy} holds every literal this draft names, so nothing is minted; the draft stays ` +
+      'open for a person, who may dismiss it'
+    );
+  }
+  const waiting = result.dedupedInto
+    ? `deduped into your open draft ${result.dedupedInto} for ${targetRef} — it is unchanged and still awaiting ` +
+      'notarization; not truth until a person signs it or a quorum of agent sessions agrees'
+    : 'awaiting notarization — not truth until a person signs it or a quorum of agent sessions agrees';
+  const lacks = [
+    ...(quorum?.missing.includes('literals') ? ['names no literals'] : []),
+    ...(quorum?.missing.includes('a settling evidence item')
+      ? ['cites no settling evidence (commit, file, test, claimed-command or wiki)']
+      : []),
+  ];
+  return lacks.length > 0 ? `${waiting}. This draft can't count toward a quorum: it ${lacks.join(' and ')}` : waiting;
+}
+
 // ─────────────────────────────────────────────────────────────
 // MCP Server Implementation
 // ─────────────────────────────────────────────────────────────
@@ -191,17 +212,15 @@ export class StenographerServer {
   private tools: Map<string, ToolSpec>;
   private toolList: Tool[];
   private boundIdentity: string | null = null;
+  private boundSession: string | null = null;
 
   constructor(config: StenographerConfig) {
     const profile = config.profile ?? 'agent';
     if (!PROFILES.includes(profile)) {
       throw new Error(`Unknown profile '${profile}'. Available: ${PROFILES.join(', ')}`);
     }
-    // A 1.0-dev config that still asks for agents to assert alone is refused, not ignored
-    if ((config as { allowAgentAssert?: unknown }).allowAgentAssert) {
-      throw new Error('allowAgentAssert' + ALLOW_AGENT_ASSERT_REMOVED.slice('--allow-agent-assert'.length));
-    }
     this.profile = profile;
+    // Refuses a config that still asks for agents to assert alone (allowAgentAssert)
     this.engine = new Stenographer(config);
 
     // A misconfigured identity fails at startup, not at the first write
@@ -344,12 +363,17 @@ export class StenographerServer {
   }
 
   /**
-   * The agent session writes are attributed to, for the contempt check: this
-   * server's session. Subagents sharing the connection share it, which is
-   * the point — one session corroborating itself is one witness.
+   * The agent session writes are attributed to, for the contempt check and
+   * the agent quorum: this server's session when the connection first
+   * wrote, bound like the identity. Subagents sharing the connection share
+   * it, which is the point — one session corroborating itself is one
+   * witness — and so does every later write on it, whatever session the log
+   * the server follows names by then (a resumed transcript, a log that
+   * aggregates sessions): one connection is never a second witness.
    */
   private agentSessionId(): string {
-    return this.engine.getSessionId();
+    this.boundSession ??= this.engine.getSessionId();
+    return this.boundSession;
   }
 
   // ─────────────────────────────────────────────────────────
@@ -564,11 +588,14 @@ export class StenographerServer {
           'Draft a tombstone. Use this when you have found that a prior statement, decision or value is provably ' +
           'dead: you gather the evidence and name the literals. The draft is raised to a person immediately and is ' +
           'NOT truth on your word: you cannot sign or notarize it. It becomes truth when a person signs it, or when ' +
-          'two or more agent sessions draft the same set of literals from different angles within 15 minutes ' +
-          '(disjoint evidence, two settling kinds among commit, file, test, claimed-command and wiki): then the ' +
-          'draft that completes the quorum mints the TB (status "settled by quorum"). Otherwise the result says ' +
-          'what the quorum still misses. targetRef dedupes only against your own open drafts (reported as ' +
-          `dedupedInto). ${bound} Tell the user what you have raised and what it would object to.`,
+          'two or more agent sessions draft the same set of literals from different angles within 15 minutes: then ' +
+          'the draft that completes the quorum mints the TB (status "settled by quorum"). Each draft must cite ' +
+          'settling evidence of its own (commit, file, test, claimed-command or wiki; not message, chat, ticket or ' +
+          'doc), no evidence another draft cites, and together they cite two settling kinds; a draft without ' +
+          'literals or settling evidence never counts toward a quorum. When an active or contested TB already holds ' +
+          'every literal, the claim is already truth and nothing is minted (status "already truth"). Otherwise the ' +
+          'result says what the quorum still misses. targetRef dedupes only against your own open drafts (reported ' +
+          `as dedupedInto). ${bound} Tell the user what you have raised and what it would object to.`,
         input: args({
           claim: Text('What is dead and what replaces it (if anything)'),
           evidence: Evidence,
@@ -598,10 +625,7 @@ export class StenographerServer {
           }
           return {
             proposal: result.proposal,
-            status: result.dedupedInto
-              ? `deduped into your open draft ${result.dedupedInto} for ${a.targetRef} — it is unchanged and still ` +
-                'awaiting notarization; not truth until a person signs it or a quorum of agent sessions agrees'
-              : 'awaiting notarization — not truth until a person signs it or a quorum of agent sessions agrees',
+            status: draftStatus(result, a.targetRef),
             ...(result.dedupedInto ? { dedupedInto: result.dedupedInto } : {}),
             raisedTo: result.raisedTo,
             undelivered: result.undelivered,
@@ -630,8 +654,8 @@ export class StenographerServer {
           'addendum). A verdict the other way within the window is a dispute (status "disputed"): no quorum forms, ' +
           'and a person rules. Verifying a UV that contests a TB would override the TB, which agents never do: an ' +
           'agreeing quorum is raised to a person (status "raised"). A refuted contest closes: its TB is active ' +
-          'again unless another contest is open. You must be provenance-independent of the UV: not its author, not ' +
-          `the same session (contempt of corpus). ${bound}`,
+          'again unless another contest is open or it has been overridden (an override is never undone). You must ' +
+          `be provenance-independent of the UV: not its author, not the same session (contempt of corpus). ${bound}`,
         input: args(ResolveFields),
         annotations: APPEND,
         run: (a) =>
@@ -792,8 +816,11 @@ export class StenographerServer {
           'Ingest a team llm-wiki JSONL file (truth format v2; v1 lines are still read) in one transaction: every ' +
           'line lands or none does, with a per-line error report, and the file\'s hash chain must hold. Entries ' +
           'keep their ids and authors. A TB lands as truth only when signed and verifiable (hash-chained, and ' +
-          'its signer listed in the signer registry when one is configured); otherwise it becomes a ' +
-          'reconciliation PROPOSAL, as does a line that contradicts a local entry or whose status is unknown. ' +
+          'its signer listed in the signer registry when one is configured) and, when an agent signed it, with a ' +
+          'valid quorum of agents; otherwise it becomes a reconciliation PROPOSAL (an agent\'s TB without one: ' +
+          'agent-without-quorum), as does a line that contradicts a local entry or whose status is unknown. An ' +
+          'agent\'s resolution of a UV applies only with a valid quorum of agents, never one that verifies a ' +
+          'contest; an override, strike or ruling never applies from an agent. Those are held, and reported. ' +
           'Re-importing a file changes nothing.',
         input: args({ file: WikiFile }),
         annotations: { ...APPEND, idempotentHint: true },

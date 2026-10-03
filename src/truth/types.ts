@@ -163,9 +163,10 @@ export function evidenceClass(kind: string): EvidenceClass {
 /**
  * Evidence as a caller submits it. A `command` the caller says it ran, with
  * the output it says it saw, is a claim: it is recorded as
- * `claimed-command`. `command` in the ledger is reserved for a check
- * stenographer executed itself — and 1.0 ships no runner, so nothing a
- * caller submits is recorded as `command`.
+ * `claimed-command`. `command` appears only on entries recorded before 1.0,
+ * where it means the same unchecked output: it is question-class, and keeps
+ * that meaning (spec, Evidence classes). A check stenographer runs itself,
+ * when a version adds one, gets a kind of its own.
  */
 export const EvidenceSchema = z.object({
   kind: z
@@ -180,11 +181,13 @@ export type Evidence = z.infer<typeof EvidenceSchema>;
 
 /**
  * Evidence that signs for itself (summary judgment, §6): only a check
- * stenographer ran. Caller-submitted command output is `claimed-command`
- * after parsing, so it never self-signs: an unexecuted claim cannot mint truth.
+ * stenographer ran, and 1.0 has no kind for one (it ships no runner), so
+ * none does. Caller-submitted command output is `claimed-command`, and a
+ * pre-1.0 `command` is the same unchecked output: an unexecuted claim
+ * cannot mint truth.
  */
-export function isSelfSigningEvidence(evidence: Evidence[]): boolean {
-  return evidence.some((e) => e.kind === 'command');
+export function isSelfSigningEvidence(_evidence: Evidence[]): boolean {
+  return false;
 }
 
 // ─────────────────────────────────────────────────────────────

@@ -12,23 +12,32 @@
  *      accountable identity.
  *   2. The writer is a member; a TB is signed by its writer.
  *   3. From different angles: every member cites settling evidence, no
- *      evidence item appears in two members, and the members' settling
- *      evidence spans two kinds or more.
+ *      evidence item appears in two members (in any spelling: refs compare
+ *      normalized for their kind, sameEvidence), and the members' settling
+ *      evidence spans two kinds or more. A kind the reader doesn't know is
+ *      an unknown value, not a broken rule: it may be a newer writer's
+ *      settling kind, so it never makes a line fail these clauses (the
+ *      import fails closed on it instead).
  *   4. At the same time: the members' and the line's timestamps lie within
- *      15 minutes of each other.
- *   5. Agreeing: an ADDENDUM's members carry the verdict its link applies,
- *      and a quorum never overrides. (A TB's members drafted the same
- *      literals: the writer's obligation, which no reader can check.)
+ *      15 minutes of each other, read to the millisecond.
+ *   5. Agreeing: an ADDENDUM's members agree, and carry the verdict each
+ *      of its resolution links applies, and a quorum never overrides. A TB
+ *      carries the literals its members agreed on. (That the members
+ *      drafted those literals is the writer's obligation: no reader sees
+ *      the drafts.)
  *   6. The line shows its evidence: the members' items, and no others.
  *
- * checkQuorum is line-local, like the link rules: the codec and the
- * ledger's admission both apply it. chooseQuorum picks, deterministically,
- * the quorum an attestation or a draft completes, or says what is missing.
+ * Sessions and refs are trimmed of Unicode White_Space (trimWhiteSpace), so
+ * every codec trims the same characters. checkQuorum is line-local, like
+ * the link rules: the codec and the ledger's admission both apply it.
+ * chooseQuorum picks, deterministically, the quorum an attestation or a
+ * draft completes, or says what is missing.
  */
 
 import { canonicalize } from './jcs.js';
 import {
   evidenceClass,
+  EVIDENCE_KINDS,
   hasControlCharacters,
   identityKey,
   isAnonymousIdentity,
@@ -70,12 +79,70 @@ export interface QuorumMember {
 /** What a resolution link applies to its UV. */
 const VERDICT_OF: Record<string, QuorumVerdict> = { verifies: 'verified', refutes: 'refuted' };
 
-/** An evidence item's identity in the quorum rules: its kind and its ref, the ref trimmed. */
-export function evidenceKey(item: { kind: string; ref: string }): string {
-  return JSON.stringify([item.kind, item.ref.trim()]);
+/**
+ * Removes leading and trailing Unicode White_Space: the characters every
+ * codec trims from a quorum member's session and an evidence ref. (Not
+ * String.prototype.trim, which also removes U+FEFF and keeps U+0085.)
+ */
+export function trimWhiteSpace(value: string): string {
+  return value.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, '');
 }
 
-const describeItem = (item: { kind: string; ref: string }) => `${item.kind} ${item.ref.trim()}`;
+/** An evidence item as rule 6 compares it: its kind and its ref, the ref trimmed. */
+export function evidenceKey(item: { kind: string; ref: string }): string {
+  return JSON.stringify([item.kind, trimWhiteSpace(item.ref)]);
+}
+
+/**
+ * A ref as rule 3 compares it, normalized for its kind so that one piece
+ * of evidence spelled two ways is one item: a `commit` lowercased; a `file`
+ * path with `\` read as `/` and empty and `.` segments dropped (`./src//x.ts`
+ * is `src/x.ts`); a `test` or `claimed-command` with each run of White_Space
+ * read as one space. Every ref is trimmed first.
+ */
+export function evidenceRefKey(item: { kind: string; ref: string }): string {
+  const ref = trimWhiteSpace(item.ref);
+  switch (item.kind) {
+    case 'commit':
+      return ref.toLowerCase();
+    case 'file': {
+      const segments = ref.replace(/\\/g, '/').split('/');
+      const absolute = segments[0] === '';
+      const kept = segments.filter((s) => s !== '' && s !== '.');
+      return (absolute ? '/' : '') + kept.join('/');
+    }
+    case 'test':
+    case 'claimed-command':
+      return ref.replace(/\p{White_Space}+/gu, ' ');
+    default:
+      return ref;
+  }
+}
+
+/**
+ * Whether two evidence items are the same evidence (rule 3): the same kind,
+ * and refs equal once normalized for it (evidenceRefKey), where a `commit`
+ * one is a prefix of the other also counts (an abbreviated hash).
+ */
+export function sameEvidence(a: { kind: string; ref: string }, b: { kind: string; ref: string }): boolean {
+  if (a.kind !== b.kind) return false;
+  const x = evidenceRefKey(a);
+  const y = evidenceRefKey(b);
+  return x === y || (a.kind === 'commit' && x.length > 0 && y.length > 0 && (x.startsWith(y) || y.startsWith(x)));
+}
+
+/** Whether this version knows an evidence kind; one it doesn't know may be a newer writer's settling kind. */
+const isKnownKind = (kind: string) => (EVIDENCE_KINDS as readonly string[]).includes(kind);
+
+/**
+ * A timestamp as rule 4 reads it: to the millisecond, any further
+ * fractional digits dropped (not rounded). NaN when it isn't one.
+ */
+export function quorumTime(ts: string): number {
+  return Date.parse(ts.replace(/(\.\d{3})\d+/, '$1'));
+}
+
+const describeItem = (item: { kind: string; ref: string }) => `${item.kind} ${trimWhiteSpace(item.ref)}`;
 
 /** The identity rules (spec, Identities), for a quorum member: never anonymous, generic, reserved or with control characters. */
 function identityIssue(identity: string): string | null {
@@ -94,6 +161,8 @@ export interface QuorumSubject {
   evidence: unknown;
   quorum: unknown;
   signedBy?: unknown;
+  /** A TB's literals: a quorum TB carries the ones its members agreed on. */
+  literals?: unknown;
   /** The links the line writes. Omitted: read from `x-steno.links` (those starting at `id`); absent there too, unknown. */
   links?: ReadonlyArray<{ type: string; fromId?: string }> | null;
   'x-steno'?: unknown;
@@ -116,8 +185,8 @@ function linksOf(subject: QuorumSubject): ReadonlyArray<{ type: string }> | null
 /**
  * The rules a line carrying a `quorum` breaks, each as one message naming
  * its rule; empty when it keeps them all. Line-local: a reader needs nothing
- * but the line. Rule 5's TB half (the members drafted the same literals) is
- * the writer's obligation, not checked here.
+ * but the line. That a TB's members drafted the literals it carries (rule
+ * 5) is the writer's obligation, not checked here; that it carries some is.
  */
 export function checkQuorum(subject: QuorumSubject): string[] {
   if (subject.type !== 'TB' && subject.type !== 'ADDENDUM') {
@@ -150,7 +219,7 @@ export function checkQuorum(subject: QuorumSubject): string[] {
   }
   const sessions = new Map<string, number>();
   members.forEach((m, i) => {
-    const session = m.agentSessionId.trim();
+    const session = trimWhiteSpace(m.agentSessionId);
     if (session.length === 0) {
       issues.push(`quorum member ${i + 1} names no agent session (rule 1)`);
     } else if (sessions.has(session)) {
@@ -171,31 +240,32 @@ export function checkQuorum(subject: QuorumSubject): string[] {
     issues.push(`a quorum TB is signed by its author (rule 2): signedBy ${String(subject.signedBy)} is not ${author}`);
   }
 
-  // Rule 3: from different angles
-  const citedBy = new Map<string, number>();
+  // Rule 3: from different angles. A kind this version doesn't know may be a
+  // newer writer's settling kind: an unknown value, which never refuses a line
   const settlingKinds = new Set<string>();
+  const unknownKinds = members.some((m) => m.evidence.some((e) => !isKnownKind(e.kind)));
   members.forEach((m, i) => {
     const settling = m.evidence.filter((e) => evidenceClass(e.kind) === 'settling');
-    if (settling.length === 0) {
+    if (settling.length === 0 && m.evidence.every((e) => isKnownKind(e.kind))) {
       issues.push(`quorum member ${i + 1} cites no settling evidence (${SETTLING_EVIDENCE_KINDS.join(', ')}) (rule 3)`);
     }
     for (const e of settling) settlingKinds.add(e.kind);
-    for (const e of new Map(m.evidence.map((e) => [evidenceKey(e), e])).values()) {
-      const key = evidenceKey(e);
-      const prior = citedBy.get(key);
-      if (prior !== undefined) {
-        issues.push(`quorum members ${prior} and ${i + 1} both cite ${describeItem(e)}: each member brings evidence of its own (rule 3)`);
-      } else {
-        citedBy.set(key, i + 1);
+  });
+  members.forEach((m, i) => {
+    for (let j = 0; j < i; j++) {
+      const shared = m.evidence.find((e) => members[j].evidence.some((o) => sameEvidence(e, o)));
+      if (shared) {
+        issues.push(`quorum members ${j + 1} and ${i + 1} both cite ${describeItem(shared)}: each member brings evidence of its own (rule 3)`);
+        break;
       }
     }
   });
-  if (settlingKinds.size === 1) {
+  if (settlingKinds.size === 1 && !unknownKinds) {
     issues.push(`a quorum's settling evidence spans at least two settling kinds, and this one cites only ${[...settlingKinds][0]} (rule 3)`);
   }
 
-  // Rule 4: at the same time
-  const times = [...members.map((m) => m.ts), subject.ts].map((t) => (typeof t === 'string' ? Date.parse(t) : NaN));
+  // Rule 4: at the same time, to the millisecond
+  const times = [...members.map((m) => m.ts), subject.ts].map((t) => (typeof t === 'string' ? quorumTime(t) : NaN));
   if (times.some((t) => !Number.isFinite(t))) {
     issues.push(`the line's ts is not a timestamp (rule 4)`);
   } else {
@@ -205,7 +275,13 @@ export function checkQuorum(subject: QuorumSubject): string[] {
     }
   }
 
-  // Rule 5: agreeing (an ADDENDUM's verdicts; a TB's literals are the writer's obligation)
+  // Rule 5: agreeing. An ADDENDUM's verdicts agree, with each other and with
+  // the links it lists (one that lists no resolution link, or only types this
+  // version doesn't know, is checked for agreeing verdicts only); a TB
+  // carries the literals its members agreed on
+  if (subject.type === 'TB' && (!Array.isArray(subject.literals) || subject.literals.length === 0)) {
+    issues.push('a quorum TB carries the literals its members agreed on (literals, at least one) (rule 5)');
+  }
   if (subject.type === 'ADDENDUM') {
     const verdicts = new Set(members.map((m) => m.verdict));
     if (verdicts.size > 1) issues.push(`the quorum's members disagree: ${[...verdicts].join(' and ')} (rule 5)`);
@@ -214,8 +290,7 @@ export function checkQuorum(subject: QuorumSubject): string[] {
       if (links.some((l) => l.type === 'overrides')) {
         issues.push('a quorum ADDENDUM never overrides a TB: overriding is a person\'s act (rule 5)');
       }
-      const resolutions = links.filter((l) => l.type in VERDICT_OF);
-      if (resolutions.length === 0) issues.push('a quorum ADDENDUM verifies or refutes a UV: its links name neither (rule 5)');
+      const resolutions = links.filter((l) => Object.hasOwn(VERDICT_OF, l.type));
       for (const link of resolutions) {
         members.forEach((m, i) => {
           if (m.verdict !== VERDICT_OF[link.type]) {
@@ -226,10 +301,11 @@ export function checkQuorum(subject: QuorumSubject): string[] {
     }
   }
 
-  // Rule 6: the line's evidence is the members' evidence
+  // Rule 6: the line's evidence is the members' evidence (items compare by kind and trimmed ref)
   if (!isEvidenceList(subject.evidence)) {
     issues.push(`the line's evidence is not an evidence list (rule 6)`);
   } else {
+    const citedBy = new Set(members.flatMap((m) => m.evidence.map(evidenceKey)));
     const shown = new Set(subject.evidence.map(evidenceKey));
     members.forEach((m, i) => {
       for (const e of m.evidence) {
@@ -243,7 +319,7 @@ export function checkQuorum(subject: QuorumSubject): string[] {
   return issues;
 }
 
-/** The members' evidence, in member order, each item once (by kind and trimmed ref): a quorum line's `evidence`. */
+/** The members' evidence, in member order, each item once (by kind and trimmed ref, evidenceKey): a quorum line's `evidence`. */
 export function quorumEvidence<E extends { kind: string; ref: string }>(members: Array<{ evidence: E[] }>): E[] {
   const seen = new Set<string>();
   const out: E[] = [];
@@ -272,7 +348,10 @@ export function literalSetKey(literals: ReadonlyArray<{ dead: string; subject?: 
 
 /** Where a quorum stands, for an attestation or a draft that didn't complete one. */
 export interface QuorumProgress {
-  /** Agent sessions, this one included, that agree within the window. */
+  /**
+   * Agent sessions, this one included, that agree within the window and
+   * cite settling evidence: the ones that could join a quorum.
+   */
   agreeing: number;
   needed: number;
   /** When this attestation or draft leaves the window. */
@@ -310,24 +389,22 @@ export function chooseQuorum<C extends QuorumCandidate>(
   candidates: C[],
   now: number
 ): { members: C[] | null; progress: QuorumProgress } {
-  const time = (c: C) => Date.parse(c.createdAt);
-  const session = (c: C) => c.agentSessionId?.trim() ?? '';
+  const time = (c: C) => quorumTime(c.createdAt);
+  const session = (c: C) => (c.agentSessionId ? trimWhiteSpace(c.agentSessionId) : '');
   const inWindow = (c: C) => time(c) >= now - QUORUM_WINDOW_MS && time(c) <= now;
-  const keys = (c: C) => new Set(c.evidence.map(evidenceKey));
   const settling = (c: C) => c.evidence.some((e) => evidenceClass(e.kind) === 'settling');
   const kinds = (cs: C[]) => new Set(cs.flatMap((c) => c.evidence.filter((e) => evidenceClass(e.kind) === 'settling').map((e) => e.kind)));
-  const disjoint = (a: C, b: C) => {
-    const bk = keys(b);
-    return [...keys(a)].every((k) => !bk.has(k));
-  };
+  const disjoint = (a: C, b: C) => a.evidence.every((e) => !b.evidence.some((o) => sameEvidence(e, o)));
   const byTime = (a: C, b: C) => time(a) - time(b) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
 
   const pool = session(self)
     ? candidates.filter((c) => c.id !== self.id && session(c) && session(c) !== session(self) && inWindow(c)).sort(byTime)
     : [];
   const fits = (members: C[], c: C) => settling(c) && members.every((m) => session(m) !== session(c) && disjoint(m, c));
+  // Who could join a quorum: this session, when it cites settling evidence and is in the window, and every partner that does
+  const able = [...(session(self) && inWindow(self) && settling(self) ? [self] : []), ...pool.filter(settling)];
   const base = {
-    agreeing: new Set([session(self), ...pool.map(session)].filter(Boolean)).size || 1,
+    agreeing: new Set(able.map(session)).size,
     needed: QUORUM_MIN_MEMBERS,
     windowEndsAt: new Date(time(self) + QUORUM_WINDOW_MS).toISOString(),
   };

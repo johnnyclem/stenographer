@@ -118,5 +118,45 @@
     "line": 24,
     "reason": "a quorum on a UV line",
     "error": "only on TB and ADDENDUM lines"
+  },
+  {
+    "line": 25,
+    "reason": "quorum rule 1: a member whose session is White_Space only (schema minLength 1 lets it through)",
+    "error": "names no agent session"
+  },
+  {
+    "line": 26,
+    "reason": "quorum rule 1: two members' sessions equal once trimmed of White_Space",
+    "error": "share agent session"
+  },
+  {
+    "line": 27,
+    "reason": "quorum rule 3: one commit in two spellings (case)",
+    "error": "both cite commit"
+  },
+  {
+    "line": 28,
+    "reason": "quorum rule 3: one commit in two spellings (an abbreviated hash and the full one)",
+    "error": "both cite commit"
+  },
+  {
+    "line": 29,
+    "reason": "quorum rule 3: one file in two spellings ('./', '//')",
+    "error": "both cite file"
+  },
+  {
+    "line": 30,
+    "reason": "quorum rule 3: one command in two spellings (runs of White_Space)",
+    "error": "both cite claimed-command"
+  },
+  {
+    "line": 31,
+    "reason": "quorum rule 4: the line's ts more than 15 minutes after its members, which lie a minute apart",
+    "error": "more than 15 minutes"
+  },
+  {
+    "line": 32,
+    "reason": "quorum rule 4 at its edge: 900 001 ms from the earliest member to the latest",
+    "error": "900001 ms"
   }
 ]

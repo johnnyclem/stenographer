@@ -11,7 +11,7 @@
  */
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { createServer, type Server } from 'node:http';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, appendFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
@@ -20,6 +20,9 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { TruthLedger, ContemptError } from '../src/truth/ledger.js';
 import { StenographerServer, runCLI } from '../src/mcp/server.js';
 import { SignerRegistry } from '../src/truth/identity.js';
+import { StateStore } from '../src/store/index.js';
+import { Stenographer } from '../src/core/stenographer.js';
+import { settleTombstoneQuorum } from '../src/truth/attestations.js';
 import { decodeWikiLine, exportWikiEntries, importWikiEntries, wikiLineHash } from '../src/truth/wiki.js';
 import { QUORUM_MIN_MEMBERS, QUORUM_WINDOW_MS, checkQuorum, type QuorumMember } from '../src/truth/quorum.js';
 import { CONSUMPTION_RULES, type AddendumEntry, type ProposalEntry, type TbEntry, type UvEntry } from '../src/truth/types.js';
@@ -74,7 +77,7 @@ describe('checkQuorum: the rules a line with a quorum must keep', () => {
     // A TB: no verdicts; signed by its author
     const { verdict: _a, ...a } = member();
     const { verdict: _b, ...b } = second();
-    const tb = { type: 'TB', author: AGENT, signedBy: AGENT, ts: at(5 * MIN), evidence: [...a.evidence, ...b.evidence], quorum: [a, b] };
+    const tb = { type: 'TB', author: AGENT, signedBy: AGENT, ts: at(5 * MIN), evidence: [...a.evidence, ...b.evidence], quorum: [a, b], literals: LITERALS };
     expect(checkQuorum(tb)).toEqual([]);
   });
 
@@ -91,8 +94,20 @@ describe('checkQuorum: the rules a line with a quorum must keep', () => {
     expect(checkQuorum(addendum({ author: 'agent:other' })).join()).toMatch(/agent:other is not a quorum member.*rule 2/);
     const { verdict: _a, ...a } = member();
     const { verdict: _b, ...b } = second();
-    const tb = { type: 'TB', author: AGENT, signedBy: 'kim', ts: at(5 * MIN), evidence: [...a.evidence, ...b.evidence], quorum: [a, b] };
+    const tb = { type: 'TB', author: AGENT, signedBy: 'kim', ts: at(5 * MIN), evidence: [...a.evidence, ...b.evidence], quorum: [a, b], literals: LITERALS };
     expect(checkQuorum(tb).join()).toMatch(/signed by its author.*rule 2/);
+    // signedBy compares with the author by key, like every identity
+    expect(checkQuorum({ ...tb, signedBy: 'AGENT:CLAUDE-CODE' })).toEqual([]);
+  });
+
+  it('rule 1: sessions compare trimmed of Unicode White_Space, and only of it', () => {
+    for (const spelling of [' sess-a', 'sess-a\t', '\u00a0sess-a\u3000']) {
+      expect(checkQuorum(addendum({ quorum: [member(), second({ agentSessionId: spelling })] })).join(), JSON.stringify(spelling)).toMatch(
+        /share agent session sess-a.*rule 1/
+      );
+    }
+    // U+FEFF is not White_Space: another session id (String.prototype.trim would have removed it)
+    expect(checkQuorum(addendum({ quorum: [member(), second({ agentSessionId: 'sess-a\ufeff' })] }))).toEqual([]);
   });
 
   it('rule 3: from different angles — settling evidence each, no item shared, two settling kinds', () => {
@@ -105,10 +120,53 @@ describe('checkQuorum: the rules a line with a quorum must keep', () => {
     );
     const oneKind = second({ evidence: [{ kind: 'commit', ref: 'd4e5f6' }] });
     expect(checkQuorum(addendum({ quorum: [member(), oneKind] })).join()).toMatch(/two settling kinds.*rule 3/);
-    // Question-class evidence only: message, chat, ticket, doc, pre-1.0 command, and kinds a reader doesn't know
-    for (const kind of ['message', 'chat', 'ticket', 'doc', 'command', 'screenshot']) {
+    // Question-class evidence only: message, chat, ticket, doc, pre-1.0 command
+    for (const kind of ['message', 'chat', 'ticket', 'doc', 'command']) {
       const q = [member({ evidence: [{ kind, ref: 'x1' }] }), second({ evidence: [{ kind, ref: 'x2' }] })];
       expect(checkQuorum(addendum({ quorum: q })).join(), kind).toMatch(/cites no settling evidence.*rule 3/);
+    }
+  });
+
+  it('rule 3: a kind the reader does not know is an unknown value, not a broken rule (the import fails closed on it)', () => {
+    // A newer writer's settling kind: this reader can't tell, so it doesn't refuse the line under rule 3
+    const bench = { kind: 'benchmark', ref: 'bench/retry' };
+    expect(checkQuorum(addendum({ quorum: [member({ evidence: [{ kind: 'commit', ref: 'a1b2c3' }, { kind: 'file', ref: 'x.ts:1' }] }), second({ evidence: [bench] })] }))).toEqual([]);
+    expect(checkQuorum(addendum({ quorum: [member(), second({ evidence: [{ kind: 'commit', ref: 'd4e5f6' }, bench] })] }))).toEqual([]);
+    // ...but the rules it can read still hold: an item two members cite, whatever its kind
+    expect(checkQuorum(addendum({ quorum: [member({ evidence: [{ kind: 'commit', ref: 'a1b2c3' }, bench] }), second({ evidence: [{ kind: 'file', ref: 'f' }, bench] })] })).join()).toMatch(
+      /both cite benchmark bench\/retry.*rule 3/
+    );
+  });
+
+  it('rule 3: the same evidence in another spelling is one angle (refs compare normalized for their kind)', () => {
+    const test = { kind: 'test', ref: 'test/a.test.ts' };
+    const file = { kind: 'file', ref: 'src/b.ts:1' };
+    const twice = (a: { kind: string; ref: string }, b: { kind: string; ref: string }) =>
+      checkQuorum(addendum({ quorum: [member({ evidence: [a, test] }), second({ evidence: [b, file] })] })).join();
+    const same: Array<[string, string, string]> = [
+      ['commit', 'a1b2c3d', 'A1B2C3D'],
+      ['commit', 'a1b2c3d', 'a1b2c3d4e5f60718293a4b5c6d7e8f9a0b1c2d3e'],
+      ['commit', ' a1b2c3d\u00a0', 'a1b2c3d'],
+      ['file', 'src/retry.ts:10', './src/retry.ts:10'],
+      ['file', 'src/retry.ts:10', 'src//retry.ts:10'],
+      ['file', 'src/retry.ts:10', 'src\\retry.ts:10'],
+      ['file', 'src/retry.ts:10', 'src/./retry.ts:10'],
+      ['test', 'retry budget is per tenant', 'retry  budget is\tper tenant'],
+      ['claimed-command', 'grep -n LOG_BUDGET config.ts', 'grep  -n LOG_BUDGET\tconfig.ts'],
+    ];
+    for (const [kind, a, b] of same) {
+      expect(twice({ kind, ref: a }, { kind, ref: b }), `${kind}: ${JSON.stringify(a)} and ${JSON.stringify(b)}`).toMatch(/both cite.*rule 3/);
+    }
+    const different: Array<[string, string, string]> = [
+      ['commit', 'a1b2c3d', 'b1b2c3d'],
+      ['file', 'src/retry.ts:10', 'src/retry.ts:12'],
+      ['file', 'src/retry.ts', 'lib/src/retry.ts'],
+      ['test', 'retry budget', 'Retry budget'],
+      // U+FEFF is not White_Space, so it is not trimmed
+      ['wiki', '01J9ABC', '01J9ABC\ufeff'],
+    ];
+    for (const [kind, a, b] of different) {
+      expect(twice({ kind, ref: a }, { kind, ref: b }), `${kind}: ${JSON.stringify(a)} and ${JSON.stringify(b)}`).not.toMatch(/both cite/);
     }
   });
 
@@ -119,13 +177,33 @@ describe('checkQuorum: the rules a line with a quorum must keep', () => {
     );
     // The line's own ts counts too
     expect(checkQuorum(addendum({ ts: at(20 * MIN) })).join()).toMatch(/rule 4/);
+    // To the millisecond: digits past the third fractional digit are dropped, not rounded
+    const subMs = '2026-09-01T12:15:00.0009Z';
+    expect(checkQuorum(addendum({ quorum: [member(), second({ ts: subMs })], ts: subMs }))).toEqual([]);
+    const pastEdge = '2026-09-01T12:15:00.001Z';
+    expect(checkQuorum(addendum({ quorum: [member(), second({ ts: pastEdge })], ts: pastEdge })).join()).toMatch(/900001 ms.*rule 4/);
   });
 
   it('rule 5: agreeing — every verdict is the one the link applies, and a quorum never overrides', () => {
     expect(checkQuorum(addendum({ quorum: [member(), second({ verdict: 'refuted' })] })).join()).toMatch(/verdict refuted.*verifies.*rule 5/);
     expect(checkQuorum(addendum({ links: [{ type: 'refutes' }] })).join()).toMatch(/rule 5/);
     expect(checkQuorum(addendum({ links: [{ type: 'verifies' }, { type: 'overrides' }] })).join()).toMatch(/never overrides.*rule 5/);
-    expect(checkQuorum(addendum({ links: [] })).join()).toMatch(/verifies or refutes.*rule 5/);
+    // A line that lists no resolution link (none at all, an empty list, or only types the reader doesn't know)
+    // is checked for agreeing verdicts only
+    for (const links of [undefined, [], [{ type: 'corroborates' }]]) {
+      const subject = { ...addendum(), links: links ?? null };
+      expect(checkQuorum(subject), JSON.stringify(links)).toEqual([]);
+      expect(checkQuorum({ ...subject, quorum: [member(), second({ verdict: 'refuted' })] }).join(), JSON.stringify(links)).toMatch(/disagree.*rule 5/);
+    }
+  });
+
+  it('rule 5: a quorum TB carries the literals its members agreed on (at least one)', () => {
+    const { verdict: _a, ...a } = member();
+    const { verdict: _b, ...b } = second();
+    const tb = { type: 'TB', author: AGENT, signedBy: AGENT, ts: at(5 * MIN), evidence: [...a.evidence, ...b.evidence], quorum: [a, b] };
+    expect(checkQuorum(tb).join()).toMatch(/literals.*rule 5/);
+    expect(checkQuorum({ ...tb, literals: [] }).join()).toMatch(/literals.*rule 5/);
+    expect(checkQuorum({ ...tb, literals: LITERALS })).toEqual([]);
   });
 
   it('rule 6: the line shows its evidence — the members\' items, and only theirs', () => {
@@ -251,6 +329,64 @@ describe('the ledger: an agent settles only with a quorum, and never overrides, 
     const l = fresh();
     const uv = personUv(l);
     expect(() => l.resolveUvByQuorum(uv.id, 'verified', quorum('verified'), { author: 'kim', agentSessionId: null, timestamp: at(MIN) })).toThrow(/not a quorum member.*rule 2/);
+  });
+
+  it('a quorum the ledger admits from an agent is all agents: a person\'s draft or verdict is no agent\'s second witness', () => {
+    const l = fresh();
+    const mine = l.draftTombstone({ claim: 'LOG_BUDGET 30 is dead', evidence: [COMMIT], literals: LITERALS }, { author: AGENT, agentSessionId: 'sess-a', timestamp: at(0) });
+    const kims = l.draftTombstone({ claim: 'LOG_BUDGET 30 is dead', evidence: [FILE], literals: LITERALS }, { author: 'kim', agentSessionId: 'kim-laptop', timestamp: at(MIN) });
+    expect(() => l.mintTombstoneByQuorum([mine.id, kims.id], { author: AGENT, agentSessionId: 'sess-a', timestamp: at(MIN) })).toThrow(/quorum member kim is not an agent/);
+    const uv = personUv(l);
+    expect(() =>
+      l.resolveUvByQuorum(uv.id, 'verified', quorum('verified', [{}, { author: 'kim', agentSessionId: 'kim-laptop' }]), { author: AGENT, agentSessionId: 'sess-a', timestamp: at(MIN) })
+    ).toThrow(/quorum member kim is not an agent/);
+    expect(l.getStats().tombstones).toBe(0);
+    expect((l.getEntry(uv.id) as UvEntry).body.status).toBe('open');
+    for (const p of [mine, kims]) expect((l.getEntry(p.id) as ProposalEntry).body.status).toBe('open');
+  });
+
+  it('admission refuses a TB with a quorum but no literals: the agreement it certifies would name nothing', () => {
+    const l = fresh();
+    const members = quorum().map(({ verdict: _v, ...m }) => m);
+    const tb = {
+      id: '01J9QUORUMTBNOLITERALS0000',
+      type: 'TB' as const,
+      createdAt: at(MIN),
+      author: AGENT,
+      provenance: { kind: 'wiki' as const, ref: '01J9QUORUMTBNOLITERALS0000' },
+      agentSessionId: 'sess-b',
+      origin: 'wiki' as const,
+      body: { claim: 'LOG_BUDGET 30 is dead', evidence: [COMMIT, FILE], signedBy: AGENT, quorum: members },
+    };
+    expect(() => l.importEntry(tb, [])).toThrow(/literals.*rule 5/);
+    expect(l.importEntry({ ...tb, body: { ...tb.body, literals: LITERALS } }, [])).toBe('inserted');
+  });
+
+  it('an agent quorum never verifies a contest, by any path: that overrides the TB, which a person does', () => {
+    const l = fresh();
+    const tb = personTb(l);
+    const contest = personUv(l, tb.id);
+    const id = '01J9QUORUMVERIFIESCONTEST0';
+    const verifying = {
+      id,
+      type: 'ADDENDUM' as const,
+      createdAt: at(MIN),
+      author: AGENT,
+      provenance: { kind: 'wiki' as const, ref: id },
+      agentSessionId: 'sess-b',
+      origin: 'wiki' as const,
+      body: { evidence: [COMMIT, FILE], note: null, quorum: quorum('verified') },
+    };
+    const outcome = l.importChange(verifying, [{ fromId: id, toId: contest.id, type: 'verifies' }]);
+    expect(outcome).toMatchObject({ outcome: 'held' });
+    expect((outcome as { reason: string }).reason).toMatch(/would override TB .*a person/);
+    expect(l.getEntry(id)).toBeNull();
+    expect((l.getEntry(contest.id) as UvEntry).body.status).toBe('open');
+    expect((l.getEntry(tb.id) as TbEntry).body.status).toBe('contested');
+    // ...while refuting the contest by quorum is settling a UV, which agents may do
+    const refuting = { ...verifying, body: { ...verifying.body, quorum: quorum('refuted') } };
+    expect(l.importChange(refuting, [{ fromId: id, toId: contest.id, type: 'refutes' }])).toEqual({ outcome: 'inserted' });
+    expect((l.getEntry(tb.id) as TbEntry).body.status).toBe('active');
   });
 
   it('mints a TB from agent drafts that agree, signing each draft', () => {
@@ -424,6 +560,57 @@ describe('resolve_uv: an agent attests; two sessions agreeing from different ang
     expect(addenda()).toEqual([]);
   });
 
+  it('one connection is one witness, whichever session its log names later', async () => {
+    dir ??= mkdtempSync(join(tmpdir(), 'steno-quorum-'));
+    const log = join(dir, 'transcript.jsonl');
+    const line = (uuid: string, sessionId: string) =>
+      JSON.stringify({
+        parentUuid: null,
+        isSidechain: false,
+        type: 'user',
+        message: { role: 'user', content: [{ type: 'text', text: 'check the budget' }] },
+        uuid,
+        timestamp: '2026-09-01T12:00:00Z',
+        sessionId,
+      }) + '\n';
+    writeFileSync(log, line('u-1', 'conv-1'));
+    const clock = { now: T0 };
+    const server = new StenographerServer({
+      logPath: log,
+      statePath: join(dir, 'live.db'),
+      mode: 'live',
+      adapter: 'claude-code',
+      embeddingModel: 'hashed',
+      agentIdentity: AGENT,
+      clock: () => clock.now,
+    });
+    servers.push(server);
+    const engine = server.engine;
+    await engine.start();
+    const until = async (cond: () => boolean) => {
+      for (let i = 0; i < 100 && !cond(); i++) {
+        await new Promise((r) => setTimeout(r, 30));
+        await engine.flush();
+      }
+    };
+    await until(() => engine.getSessionId() === 'conv-1');
+    const call = (tool: string, a: Record<string, unknown>) =>
+      (server as unknown as { callTool: (n: string, a: Record<string, unknown>) => Promise<any> }).callTool(tool, a);
+    const target = await engine.assertUv({ assertion: 'LOG_BUDGET is 100 everywhere.', basis: 'the config change', verifyBy: { kind: 'inspect', value: 'config.ts' }, author: 'sam' });
+    const first = await call('resolve_uv', resolve(target.id, 'verified', [COMMIT]));
+    expect(first.attestation.agentSessionId).toBe('conv-1');
+
+    // The log the server follows names another session (a resumed transcript, a log that aggregates sessions)
+    appendFileSync(log, line('u-2', 'conv-2'));
+    await until(() => engine.getSessionId() === 'conv-2');
+    expect(engine.getSessionId()).toBe('conv-2');
+    clock.now = T0 + MIN;
+    const again = await call('resolve_uv', resolve(target.id, 'verified', [FILE]));
+    expect(again.status).toBe('attested');
+    expect(again.attestation.agentSessionId).toBe('conv-1');
+    expect((engine.store.truth.getEntry(target.id) as UvEntry).body.status).toBe('open');
+  });
+
   it('shared evidence is one angle: the items compare by kind and trimmed ref', async () => {
     const { s, ledger, uv } = await sessions(['sess-a', 'sess-b']);
     const target = await uv();
@@ -444,6 +631,34 @@ describe('resolve_uv: an agent attests; two sessions agreeing from different ang
     expect((ledger.getEntry(target.id) as UvEntry).body.status).toBe('open');
   });
 
+  it('the same evidence spelled another way is one angle: a commit in upper case, a path with ./', async () => {
+    const { s, clock, ledger, uv } = await sessions(['sess-a', 'sess-b']);
+    const target = await uv();
+    await s['sess-a'].call('resolve_uv', resolve(target.id, 'verified', [{ kind: 'commit', ref: 'a1b2c3d' }, { kind: 'file', ref: 'src/retry.ts:10' }]));
+    clock.now = T0 + MIN;
+    const res = await s['sess-b'].call('resolve_uv', resolve(target.id, 'verified', [{ kind: 'commit', ref: 'A1B2C3D' }, { kind: 'file', ref: './src/retry.ts:10' }]));
+    expect(res.status).toBe('attested');
+    expect(res.quorum).toMatchObject({ agreeing: 2, missing: ['other evidence'] });
+    expect((ledger.getEntry(target.id) as UvEntry).body.status).toBe('open');
+  });
+
+  it('progress counts only the sessions that could join a quorum, and tells a verdict without settling evidence what to do', async () => {
+    const { s, clock, uv } = await sessions(['sess-a', 'sess-b']);
+    const target = await uv();
+    const said = await s['sess-a'].call('resolve_uv', resolve(target.id, 'verified', [{ kind: 'message', ref: 'msg_0042' }]));
+    expect(said.status).toBe('attested');
+    expect(said.quorum).toMatchObject({ agreeing: 0, missing: ['a settling evidence item', 'another session'] });
+    expect(said.detail).toMatch(/can't count toward a quorum/);
+    expect(said.detail).toMatch(/commit, file, test, claimed-command or wiki/);
+    expect(said.detail).not.toMatch(/settles when another agent session agrees/);
+    clock.now = T0 + MIN;
+    const checked = await s['sess-b'].call('resolve_uv', resolve(target.id, 'verified', [COMMIT, FILE]));
+    expect(checked.status).toBe('attested');
+    // sess-a's message-only verdict is no partner: one session could join a quorum, and it needs another
+    expect(checked.quorum).toMatchObject({ agreeing: 1, needed: 2, missing: ['another session'] });
+    expect(checked.detail).toMatch(/settles when another agent session agrees/);
+  });
+
   it('question-class evidence settles nothing: what someone said or wrote down is not a check', async () => {
     const { s, clock, ledger, uv } = await sessions(['sess-a', 'sess-b', 'sess-c']);
     const target = await uv();
@@ -457,14 +672,15 @@ describe('resolve_uv: an agent attests; two sessions agreeing from different ang
     expect(a.quorum.missing).toEqual(['a settling evidence item', 'another session']);
     const b = await s['sess-b'].call('resolve_uv', resolve(target.id, 'verified', said.slice(2)));
     expect(b.status).toBe('attested');
-    expect(b.quorum).toMatchObject({ agreeing: 2, missing: ['a settling evidence item', 'another session'] });
+    // Neither can join a quorum, so neither counts as agreeing
+    expect(b.quorum).toMatchObject({ agreeing: 0, missing: ['a settling evidence item', 'another session'] });
     expect((ledger.getEntry(target.id) as UvEntry).body.status).toBe('open');
 
     // ...and doesn't count toward a quorum: the next settling attestation still needs a partner
     clock.now = T0 + MIN;
     const c = await s['sess-c'].call('resolve_uv', resolve(target.id, 'verified', [COMMIT]));
     expect(c.status).toBe('attested');
-    expect(c.quorum).toMatchObject({ agreeing: 3, missing: ['another session'] });
+    expect(c.quorum).toMatchObject({ agreeing: 1, missing: ['another session'] });
   });
 
   it('outside the 15-minute window, no quorum forms; at its edge, one does', async () => {
@@ -514,6 +730,38 @@ describe('resolve_uv: an agent attests; two sessions agreeing from different ang
     expect(d.status).toBe('settled');
     expect(d.uv.body.status).toBe('refuted');
     expect((d.addendum as AddendumEntry).body.quorum!.map((m) => m.agentSessionId)).toEqual(['sess-c', 'sess-d']);
+  });
+
+  it('a contest verified by a quorum stays a standing verdict: refutations within the window are a dispute, not a settlement', async () => {
+    const { s, clock, ledger, uv, personTb, addenda } = await sessions(['sess-a', 'sess-b', 'sess-c', 'sess-d']);
+    const tb = await personTb();
+    const contest = await uv(tb.id);
+    await s['sess-a'].call('resolve_uv', resolve(contest.id, 'verified', [COMMIT]));
+    clock.now = T0 + MIN;
+    expect((await s['sess-b'].call('resolve_uv', resolve(contest.id, 'verified', [FILE]))).status).toBe('raised');
+    // Two sessions now refute, from two other angles, while a person is asked to override
+    clock.now = T0 + 2 * MIN;
+    const c = await s['sess-c'].call('resolve_uv', resolve(contest.id, 'refuted', [TEST]));
+    expect(c.status).toBe('disputed');
+    expect(c.dissent.map((d: { agentSessionId: string }) => d.agentSessionId)).toEqual(['sess-a', 'sess-b']);
+    clock.now = T0 + 3 * MIN;
+    expect((await s['sess-d'].call('resolve_uv', resolve(contest.id, 'refuted', [CLAIMED]))).status).toBe('disputed');
+    expect(addenda()).toEqual([]);
+    expect((ledger.getEntry(contest.id) as UvEntry).body.status).toBe('open');
+    expect((ledger.getEntry(tb.id) as TbEntry).body.status).toBe('contested');
+  });
+
+  it('one session reversing its own verdict within the window is a dispute too, and says so', async () => {
+    const { s, clock, uv } = await sessions(['sess-a']);
+    const target = await uv();
+    await s['sess-a'].call('resolve_uv', resolve(target.id, 'verified', [COMMIT]));
+    clock.now = T0 + MIN;
+    const back = await s['sess-a'].call('resolve_uv', resolve(target.id, 'refuted', [FILE]));
+    expect(back.status).toBe('disputed');
+    expect(back.dissent).toMatchObject([{ agentSessionId: 'sess-a', resolution: 'verified' }]);
+    expect(back.detail).toMatch(/opposite verdicts/);
+    expect(back.detail).toMatch(/this session's own/);
+    expect(back.detail).not.toMatch(/agent sessions disagree/);
   });
 
   it('a verified contest is raised to a person: agents never override a TB', async () => {
@@ -642,6 +890,11 @@ describe('propose_tombstone: agent drafts that agree from different angles withi
     const { s } = await sessions(['sess-a']);
     const bare = await s['sess-a'].call('propose_tombstone', { claim: 'fetchV1 is dead', evidence: [{ kind: 'chat', ref: 'slack:C01' }] });
     expect(bare.quorum.missing).toEqual(['literals', 'a settling evidence item', 'another session']);
+    expect(bare.quorum.agreeing).toBe(0);
+    // ...and says what it lacks
+    expect(bare.status).toMatch(/can't count toward a quorum/);
+    expect(bare.status).toMatch(/literals/);
+    expect(bare.status).toMatch(/commit, file, test, claimed-command or wiki/);
   });
 
   it('mints nothing when an active TB already holds every literal', async () => {
@@ -650,10 +903,11 @@ describe('propose_tombstone: agent drafts that agree from different angles withi
     await s['sess-a'].call('propose_tombstone', draft());
     clock.now = T0 + MIN;
     const res = await s['sess-b'].call('propose_tombstone', draft({ evidence: [FILE], literals: [LITERALS[1]] }));
-    // A subset of the held TB's literals: already truth
-    expect(res.status).toMatch(/awaiting notarization/);
+    // A subset of the held TB's literals: already truth, and the result says so rather than wait for a quorum
+    expect(res.status).toMatch(new RegExp(`already truth: TB ${tb.id} holds every literal`));
+    expect(res.status).not.toMatch(/until a person signs it or a quorum/);
     const again = await s['sess-b'].call('propose_tombstone', draft({ evidence: [FILE], targetRef: 'again' }));
-    expect(again.status).toMatch(/awaiting notarization/);
+    expect(again.status).toMatch(new RegExp(`already truth: TB ${tb.id} holds every literal`));
     expect(again.quorum).toMatchObject({ heldBy: tb.id, missing: [] });
     expect(ledger.getStats().tombstones).toBe(1);
   });
@@ -682,9 +936,31 @@ describe('the agent profile', () => {
     const names = tools.map((t) => t.name);
     expect(names).not.toContain('assert_tombstone');
     expect(Object.keys(tools.find((t) => t.name === 'resolve_uv')!.inputSchema.properties ?? {}).sort()).toEqual(['evidence', 'opinion', 'resolution', 'uvId']);
+    const description = (name: string) => tools.find((t) => t.name === name)!.description!;
+    // Each draft must bring settling evidence of its own; a held claim mints nothing
+    expect(description('propose_tombstone')).toMatch(/Each draft must cite settling evidence of its own/);
+    expect(description('propose_tombstone')).toMatch(/already truth/);
+    // An override is never undone, by a refuted contest either
+    expect(description('resolve_uv')).toMatch(/active again unless another contest is open or it has been overridden \(an override is never undone\)/);
     const res = (await client.callTool({ name: 'assert_tombstone', arguments: { claim: 'x', evidence: [COMMIT] } })) as { isError?: boolean; content: Array<{ text: string }> };
     expect(res.isError).toBe(true);
     expect(res.content[0].text).toMatch(/propose_tombstone.*two or more agent sessions/);
+  });
+
+  it('the operator profile\'s import_wiki_entries says an agent\'s line lands only with a quorum of agents', async () => {
+    dir ??= mkdtempSync(join(tmpdir(), 'steno-quorum-'));
+    writeFileSync(join(dir, 'op.jsonl'), '');
+    const server = new StenographerServer({ logPath: join(dir, 'op.jsonl'), statePath: ':memory:', mode: 'catchup', embeddingModel: 'hashed', profile: 'operator' });
+    servers.push(server);
+    const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverSide);
+    const client = new Client({ name: 'notary-ui', version: '1.0.0' });
+    await client.connect(clientSide);
+    const { tools } = await client.listTools();
+    const text = tools.find((t) => t.name === 'import_wiki_entries')!.description!;
+    expect(text).toMatch(/when an agent signed it, with a valid quorum of agents/);
+    expect(text).toMatch(/agent-without-quorum/);
+    expect(text).toMatch(/an override, strike or ruling never applies from an agent/);
   });
 
   it('ships the consumption rule that says a verdict settles only with another session, or a person', () => {
@@ -715,12 +991,67 @@ describe('--allow-agent-assert is removed', () => {
     expect(said).toMatch(/MIGRATION/);
   });
 
-  it('refuses the old config option too', () => {
+  it('refuses the old config option too, on the server and on the engine a library caller builds', () => {
     dir = mkdtempSync(join(tmpdir(), 'steno-quorum-'));
     expect(
       () =>
         new StenographerServer({ logPath: join(dir!, 'log.jsonl'), statePath: ':memory:', mode: 'catchup', allowAgentAssert: true } as StenographerConfig)
     ).toThrow(/allowAgentAssert was removed/);
+    expect(
+      () => new Stenographer({ logPath: join(dir!, 'log.jsonl'), statePath: ':memory:', mode: 'catchup', embeddingModel: 'hashed', allowAgentAssert: true } as StenographerConfig)
+    ).toThrow(/allowAgentAssert was removed/);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
+// Concurrency: the window reads the clock under the write lock
+// ─────────────────────────────────────────────────────────────
+
+describe('attestations from several processes on one state file', () => {
+  it('a verdict whose clock was read before another session\'s opposite verdict committed still sees it as dissent', () => {
+    dir = mkdtempSync(join(tmpdir(), 'steno-quorum-'));
+    const path = join(dir, 'state.db');
+    const one = new StateStore(path);
+    const two = new StateStore(path);
+    try {
+      const uv = one.truth.assertUv(
+        { assertion: 'LOG_BUDGET is 100 everywhere.', basis: 'the config change', verifyBy: { kind: 'inspect', value: 'config.ts' } },
+        { author: 'sam' }
+      );
+      const attest = (store: StateStore, agentSessionId: string, resolution: 'verified' | 'refuted', evidence: typeof COMMIT[], now: number) =>
+        store.attestations.attest({ uvId: uv.id, resolution, evidence, author: AGENT, agentSessionId }, now);
+      expect(attest(one, 'sess-a', 'verified', [COMMIT], T0).status).toBe('attested');
+      // sess-b read its clock later than sess-c, but took the write lock first
+      expect(attest(two, 'sess-b', 'refuted', [FILE], T0 + MIN + 1).status).toBe('disputed');
+      // sess-c's clock reads before sess-b's verdict: it stands all the same, so no quorum forms
+      expect(attest(one, 'sess-c', 'verified', [TEST], T0 + MIN).status).toBe('disputed');
+      expect((two.truth.getEntry(uv.id) as UvEntry).body.status).toBe('open');
+    } finally {
+      one.close();
+      two.close();
+    }
+  });
+
+  it('reads the clock inside the write transaction, for attestations and for drafts', () => {
+    const store = new StateStore(':memory:');
+    try {
+      const db = (store as unknown as { db: Database.Database }).db;
+      const read: boolean[] = [];
+      const clock = (at: number) => () => {
+        read.push(db.inTransaction);
+        return at;
+      };
+      const uv = store.truth.assertUv(
+        { assertion: 'LOG_BUDGET is 100 everywhere.', basis: 'the config change', verifyBy: { kind: 'inspect', value: 'config.ts' } },
+        { author: 'sam' }
+      );
+      store.attestations.attest({ uvId: uv.id, resolution: 'verified', evidence: [COMMIT], author: AGENT, agentSessionId: 'sess-a' }, clock(T0));
+      const draft = store.truth.draftTombstone({ claim: 'LOG_BUDGET 30 is dead', evidence: [COMMIT], literals: LITERALS }, { author: AGENT, agentSessionId: 'sess-a', timestamp: at(0) });
+      settleTombstoneQuorum(store.truth, draft, { author: AGENT, agentSessionId: 'sess-a', now: clock(T0) });
+      expect(read).toEqual([true, true]);
+    } finally {
+      store.close();
+    }
   });
 });
 
@@ -859,5 +1190,113 @@ describe('wiki import: agent lines land only with a valid quorum of agents', () 
       expect(result.held.map((h) => parse(stream(asAgent)[h.line - 1]).type)).toEqual(['ADDENDUM', 'RULING']);
       expect((ledger.getEntry(tb.id) as TbEntry).body.status).toBe('active');
     }
+  });
+
+  it('holds an agent quorum that verifies a contest, with or without a registry: that would override the TB', () => {
+    const l = new TruthLedger(new Database(':memory:'));
+    const tb = l.assertTombstone({ claim: 'LOG_BUDGET 30 is dead', evidence: [COMMIT], signedBy: 'kim', literals: LITERALS }, { author: 'kim', timestamp: at(0) });
+    const contest = l.assertUv(
+      { assertion: 'LOG_BUDGET went back to 30.', basis: 'the hotfix notes', verifyBy: { kind: 'inspect', value: 'config.ts' }, contests: tb.id },
+      { author: 'sam', timestamp: at(MIN) }
+    );
+    const lines = exportWikiEntries(l).lines.map(parse);
+    const id = '01J9QUORUMVERIFIESCONTEST0';
+    const verifying = {
+      id,
+      type: 'ADDENDUM',
+      ts: at(3 * MIN),
+      author: AGENT,
+      evidence: [FILE, TEST],
+      note: null,
+      quorum: [
+        { author: AGENT, agentSessionId: 'sess-a', ts: at(2 * MIN), evidence: [FILE], verdict: 'verified' },
+        { author: AGENT, agentSessionId: 'sess-b', ts: at(3 * MIN), evidence: [TEST], verdict: 'verified' },
+      ],
+      'x-steno': { agentSessionId: 'sess-b', links: [{ fromId: id, toId: contest.id, type: 'verifies' }] },
+    };
+    // The writer's TRANSITIONs after it, as a writer that let agents override would send them
+    const transitions = [
+      { id: `${id}:${contest.id}`, type: 'TRANSITION', ts: at(3 * MIN), author: AGENT, target: contest.id, status: 'verified', cause: { kind: 'verify', ref: id } },
+      { id: `${id}:${tb.id}`, type: 'TRANSITION', ts: at(3 * MIN), author: AGENT, target: tb.id, status: 'active', cause: { kind: 'verify', ref: id } },
+    ];
+    const sent = stream([...lines, verifying, ...transitions]);
+    for (const line of sent) expect(() => decodeWikiLine(line)).not.toThrow();
+    for (const signers of [null, SignerRegistry.load(REGISTRY)]) {
+      const ledger = new TruthLedger(new Database(':memory:'));
+      const result = importWikiEntries(ledger, { lines: sent }, { signers });
+      expect(result).toMatchObject({ committed: true, errors: [] });
+      expect(result.held.map((h) => h.id)).toEqual([id]);
+      expect(result.held[0].reason).toMatch(/would override TB .*a person/);
+      expect((ledger.getEntry(contest.id) as UvEntry).body.status).toBe('open');
+      expect((ledger.getEntry(tb.id) as TbEntry).body.status).toBe('contested');
+      expect(ledger.getEntry(id)).toBeNull();
+    }
+  });
+
+  it('with a signer registry, every quorum member is one it lists as an agent: an unlisted agent: name is no witness', () => {
+    const registry = SignerRegistry.load({ signers: [{ id: 'kim', role: 'human' }, { id: 'sam', role: 'human' }, { id: 'agent:ci', role: 'agent' }] });
+    expect(registry.lookup('agent:ghost')).toBeNull();
+    // A TB signed by the listed agent:ci, whose second member is the unlisted agent:ghost
+    const w = new TruthLedger(new Database(':memory:'));
+    const a = w.draftTombstone({ claim: 'LOG_BUDGET 30 is dead', evidence: [COMMIT], literals: LITERALS }, { author: 'agent:ci', agentSessionId: 'sess-a', timestamp: at(0) });
+    const b = w.draftTombstone({ claim: 'LOG_BUDGET 30 is dead', evidence: [FILE], literals: LITERALS }, { author: 'agent:ghost', agentSessionId: 'sess-b', timestamp: at(MIN) });
+    const tb = w.mintTombstoneByQuorum([a.id, b.id], { author: 'agent:ci', agentSessionId: 'sess-a', timestamp: at(MIN) });
+    const uv = w.assertUv({ assertion: 'Retries are idempotent.', basis: 'the design doc', verifyBy: { kind: 'inspect', value: 'src/retry.ts' } }, { author: 'sam', timestamp: at(2 * MIN) });
+    const { addendum } = w.resolveUvByQuorum(
+      uv.id,
+      'verified',
+      [
+        { author: 'agent:ci', agentSessionId: 'sess-a', ts: at(2 * MIN), evidence: [COMMIT], verdict: 'verified' },
+        { author: 'agent:ghost', agentSessionId: 'sess-b', ts: at(3 * MIN), evidence: [TEST], verdict: 'verified' },
+      ],
+      { author: 'agent:ci', agentSessionId: 'sess-a', timestamp: at(3 * MIN) }
+    );
+    const lines = exportWikiEntries(w).lines;
+    const ledger = new TruthLedger(new Database(':memory:'));
+    const result = importWikiEntries(ledger, { lines }, { signers: registry });
+    expect(result.committed).toBe(true);
+    expect(result.proposals).toMatchObject([{ id: tb.id, reason: 'agent-without-quorum' }]);
+    expect(result.proposals[0].detail).toMatch(/agent:ghost/);
+    expect(result.held.map((h) => h.id)).toEqual([addendum.id]);
+    expect(result.held[0].reason).toMatch(/agent:ghost/);
+    expect(ledger.getEntry(tb.id)).toBeNull();
+    expect((ledger.getEntry(uv.id) as UvEntry).body.status).toBe('open');
+    // Without a registry, the agent: prefix is the rule: both land
+    const open = new TruthLedger(new Database(':memory:'));
+    expect(importWikiEntries(open, { lines })).toMatchObject({ committed: true, proposals: [], held: [] });
+  });
+
+  it('decodes a quorum line with values it does not know, and holds it: unknown values never refuse a line', () => {
+    const { lines, uv, addendum } = writer();
+    const uvLine = lines.find((l) => l.id === uv.id)!;
+    const resolution = lines.find((l) => l.id === addendum.id)!;
+    const bench = { kind: 'benchmark', ref: 'bench/retry' };
+    // A member whose only evidence is a kind this version doesn't know (a newer writer's settling kind, perhaps)
+    const quorum = [{ ...resolution.quorum[0], evidence: [COMMIT, FILE] }, { ...resolution.quorum[1], evidence: [bench] }];
+    const newKind = { ...resolution, quorum, evidence: [COMMIT, FILE, bench] };
+    // Its only link of a type this version doesn't know, or no link at all
+    const newLink = { ...resolution, 'x-steno': { ...resolution['x-steno'], links: [{ fromId: resolution.id, toId: uv.id, type: 'corroborates' }] } };
+    const noLink = { ...resolution, 'x-steno': { ...resolution['x-steno'], links: [] } };
+    for (const [change, why] of [
+      [newKind, /evidence kind 'benchmark'/],
+      [newLink, /link type 'corroborates'/],
+      [noLink, /lists no links/],
+    ] as const) {
+      const sent = stream([uvLine, change]);
+      expect(() => decodeWikiLine(sent[1]), JSON.stringify(why)).not.toThrow();
+      const ledger = new TruthLedger(new Database(':memory:'));
+      const result = importWikiEntries(ledger, { lines: sent });
+      expect(result, JSON.stringify(why)).toMatchObject({ committed: true, errors: [] });
+      expect(result.held.map((h) => h.reason)).toEqual([expect.stringMatching(why)]);
+      expect((ledger.getEntry(uv.id) as UvEntry).body.status).toBe('open');
+    }
+  });
+
+  it('refuses a quorum TB without literals, and a quorum on a v1 line', () => {
+    const { lines, tb } = writer();
+    const { literals: _l, ...noLiterals } = lines.find((l) => l.id === tb.id)!;
+    expect(() => decodeWikiLine(stream([noLiterals])[0])).toThrow(/literals.*rule 5/);
+    const v1 = { id: '01J9V1TB000000000000000000', type: 'TB', ts: at(0), author: 'johnnyclem', claim: 'x is dead', evidence: [COMMIT], signedBy: 'johnnyclem', quorum: noLiterals.quorum };
+    expect(() => decodeWikiLine(JSON.stringify(v1))).toThrow(/v1 line carries no quorum/);
   });
 });

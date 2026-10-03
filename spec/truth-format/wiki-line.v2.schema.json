@@ -335,7 +335,7 @@
       ]
     },
     "quorum": {
-      "description": "The agent sessions that settled a claim together: at least two (README, Agent quorum). The codec also checks the rules across the members and the line: distinct sessions, the writer a member, settling evidence of two kinds with no item shared, every timestamp within 15 minutes, agreeing verdicts, and the line's evidence the members' own.",
+      "description": "The agent sessions that settled a claim together: at least two (README, Agent quorum). The codec also checks the rules across the members and the line: distinct sessions (trimmed), the writer a member, settling evidence of two kinds with no item shared (refs compared normalized for their kind), every timestamp within 15 minutes to the millisecond, agreeing verdicts, a TB's literals, and the line's evidence the members' own.",
       "type": "array",
       "items": {
         "$ref": "#/$defs/quorumMember"
@@ -400,7 +400,7 @@
           "minItems": 1
         },
         "quorum": {
-          "description": "Present when agents settled it: the agent sessions that agreed (README, Agent quorum). A TB an agent signs needs one.",
+          "description": "Present when agents settled it: the agent sessions that agreed (README, Agent quorum). A TB an agent signs needs one, and a TB with one carries the literals its members agreed on.",
           "$ref": "#/$defs/quorum"
         },
         "status": {
@@ -412,7 +412,12 @@
         "claim",
         "evidence",
         "signedBy"
-      ]
+      ],
+      "dependentRequired": {
+        "quorum": [
+          "literals"
+        ]
+      }
     },
     "uv": {
       "title": "UV: an unverified assertion",

@@ -40,7 +40,7 @@ import { submitProposalEnvelope } from '../truth/intake.js';
 import { ContemptError } from '../truth/ledger.js';
 import { SignerRegistry, agentClassifier, resolveIdentity, type SignerRole } from '../truth/identity.js';
 import { settleTombstoneQuorum, type Attestation, type TombstoneQuorumProgress } from '../truth/attestations.js';
-import type { QuorumProgress } from '../truth/quorum.js';
+import { trimWhiteSpace, type QuorumProgress } from '../truth/quorum.js';
 import type {
   Evidence,
   VerifyBy,
@@ -97,6 +97,15 @@ export class EmbedderMismatchError extends Error {
 /** Registered identity for the embedding-similarity supersession detector. */
 const DETECTOR_AUTHOR = 'detector:supersession';
 
+/** The removed single-user flag, and what replaced it (MIGRATION.md). The CLI and every config path refuse it. */
+export const ALLOW_AGENT_ASSERT_REMOVED =
+  '--allow-agent-assert was removed in 1.0: agents settle claims only as a quorum of two or more agent sessions ' +
+  'agreeing from different angles within 15 minutes, or a person signs. See MIGRATION.md ("--allow-agent-assert is ' +
+  'removed") for single-user setups.';
+
+/** The settling evidence kinds, as an agent is told them. */
+const SETTLING_KINDS_TEXT = 'commit, file, test, claimed-command or wiki';
+
 /**
  * What supersession matching needs, embedded before the commit transaction
  * (which can't await): the decisions active before the message, and the
@@ -132,6 +141,10 @@ export class Stenographer implements StenographerAPI {
   private clock: () => number;
 
   constructor(config: StenographerConfig) {
+    // A 1.0-dev config that still asks for agents to assert alone is refused, not ignored
+    if ((config as { allowAgentAssert?: unknown }).allowAgentAssert) {
+      throw new Error('allowAgentAssert' + ALLOW_AGENT_ASSERT_REMOVED.slice('--allow-agent-assert'.length));
+    }
     this.config = config;
     // Until a line names its harness session (Claude Code's sessionId), a
     // log's session is its basename — stable across restarts, never minted
@@ -1161,10 +1174,11 @@ export class Stenographer implements StenographerAPI {
     };
     // An agent's draft may complete a quorum of agent sessions' drafts, which mints the TB
     if (!input.agentSessionId || !this.store.truth.isAgent(proposedBy)) return result;
+    // The clock is read under the write lock: drafts committed while this one waited for it count
     const settled = settleTombstoneQuorum(this.store.truth, proposal, {
       author: proposedBy,
       agentSessionId: input.agentSessionId,
-      now: this.now(),
+      now: () => this.now(),
     });
     if ('progress' in settled) return { ...result, quorum: settled.progress };
     // Embedded after the fact: the minting transaction can't await the embedder
@@ -1242,9 +1256,11 @@ export class Stenographer implements StenographerAPI {
   }
 
   /**
-   * Direct TB, skipping the proposal path — for authors who already know.
-   * The signer may be a person or (single-user setups) an agent identity;
-   * a registry decides which, when configured.
+   * Direct TB, skipping the proposal path — for people who already know.
+   * A person signs it. The ledger refuses an agent signer here: an agent's
+   * TB carries a quorum, which only agent drafts that agree mint
+   * (draftTombstone, TruthLedger.mintTombstoneByQuorum). The author may be
+   * a person or an agent that drafted it.
    */
   async assertTombstone(input: {
     claim: string;
@@ -1327,8 +1343,9 @@ export class Stenographer implements StenographerAPI {
    * settles when two or more agent sessions agree from different angles
    * within 15 minutes (spec/truth-format, "Agent quorum"). Results:
    * - `attested`: recorded; `quorum` says what is still missing;
-   * - `disputed`: another session's opposite verdict stands within the
-   *   window, so no quorum forms; the first dispute is raised to a person;
+   * - `disputed`: an opposite verdict stands within the window (from any
+   *   session, this one included), so no quorum forms; the first dispute is
+   *   raised to a person;
    * - `raised`: a quorum verified a contest, which would override its TB:
    *   that is raised to a person, and nothing is written to the ledger;
    * - `settled`: the quorum's ADDENDUM resolved the UV.
@@ -1353,9 +1370,10 @@ export class Stenographer implements StenographerAPI {
     | { status: 'settled'; uv: UvEntry; addendum: AddendumEntry }
   > {
     const author = this.resolveIdentity(opts.author, ['agent'], 'the attesting agent');
+    // The clock is read under the write lock: a verdict committed while this one waited for it counts
     const outcome = this.store.attestations.attest(
       { uvId, resolution, evidence, author, agentSessionId: opts.agentSessionId, note: opts.opinion ?? null },
-      this.now()
+      () => this.now()
     );
     const raise = async (r: Omit<UvRaise, 'cause'>) => {
       const notice = { ...r, cause: outcome.attestation.id };
@@ -1372,12 +1390,18 @@ export class Stenographer implements StenographerAPI {
           uv: outcome.uv,
           attestation: outcome.attestation,
           quorum: outcome.quorum,
-          detail:
-            'Your verdict is recorded; it settles nothing on its own. The UV settles when another agent session agrees ' +
-            `from a different angle (other evidence, another kind) before ${outcome.quorum.windowEndsAt}, or when a person rules.`,
+          detail: outcome.quorum.missing.includes('a settling evidence item')
+            ? 'Your verdict is recorded, but it can\'t count toward a quorum: it cites no settling evidence. Check the ' +
+              `claim against ${SETTLING_KINDS_TEXT} evidence and file your verdict again with it, or leave the UV to a person.`
+            : 'Your verdict is recorded; it settles nothing on its own. The UV settles when another agent session agrees ' +
+              `from a different angle (other evidence, another kind) before ${outcome.quorum.windowEndsAt}, or when a person rules.`,
         };
       case 'disputed': {
-        const detail = `agent sessions disagree on UV ${uvId} within 15 minutes: no quorum forms while both verdicts stand; a person rules`;
+        const own = outcome.dissent.some((d) => trimWhiteSpace(d.agentSessionId) === trimWhiteSpace(opts.agentSessionId));
+        const detail =
+          `opposite verdicts stand on UV ${uvId} within 15 minutes` +
+          (own ? ', this session\'s own earlier one among them' : '') +
+          ': no quorum forms while both stand; a person rules';
         return {
           status: 'disputed',
           uv: outcome.uv,

@@ -731,13 +731,15 @@ export class TruthLedger {
   /**
    * Agents settle claims only together (spec/truth-format, "Agent quorum").
    * A TB an agent signs, and an agent's ADDENDUM that verifies or refutes a
-   * UV, need a quorum that keeps rules 1–6; a quorum on any line is held to
-   * them. Overriding, striking, dismissing and every ruling stay a person's
-   * acts: an agent never authors one, alone or in a quorum. Who is an agent
-   * is this ledger's classifier's call.
+   * UV, need a quorum that keeps rules 1–6, whose members are all agents; a
+   * quorum on any line is held to the rules. Overriding, striking,
+   * dismissing and every ruling stay a person's acts: an agent never authors
+   * one, alone or in a quorum, and never verifies a UV that contests a TB,
+   * which would override it. Who is an agent is this ledger's classifier's
+   * call.
    */
   private admitAgentAct(entry: NewEntry, links: TruthLink[], fail: (message: string) => never): void {
-    const body = entry.body as { signedBy?: unknown; evidence?: unknown; quorum?: QuorumMember[]; kind?: unknown };
+    const body = entry.body as { signedBy?: unknown; evidence?: unknown; quorum?: QuorumMember[]; kind?: unknown; literals?: unknown };
     const own = links.filter((l) => l.fromId === entry.id);
     if ((entry.type === 'TB' || entry.type === 'ADDENDUM') && body.quorum !== undefined) {
       const issues = checkQuorum({
@@ -746,10 +748,17 @@ export class TruthLedger {
         ts: entry.createdAt,
         evidence: body.evidence,
         signedBy: body.signedBy,
+        literals: body.literals,
         quorum: body.quorum,
         links: own,
       });
       if (issues.length > 0) fail(issues.join('; '));
+      // An agent's settlement rests on agents only: a person's draft or verdict is not a second agent witness
+      const agentAct = this.isAgent(entry.author) || (typeof body.signedBy === 'string' && this.isAgent(body.signedBy));
+      const person = agentAct ? body.quorum.find((m) => !this.isAgent(m.author)) : undefined;
+      if (person) {
+        fail(`quorum member ${person.author} is not an agent: an agent settles a claim only with other agent sessions, or a person signs it`);
+      }
     }
     if (entry.type === 'TB' && typeof body.signedBy === 'string' && this.isAgent(body.signedBy) && body.quorum === undefined) {
       fail(
@@ -768,10 +777,34 @@ export class TruthLedger {
             'or more agent sessions agreeing from different angles within 15 minutes, or a person resolves it'
         );
       }
+      const overriding = this.agentVerifiesContest(entry, own);
+      if (overriding) fail(overriding);
     }
     if (entry.type === 'RULING' && this.isAgent(entry.author)) {
       fail(`a ruling (${String(body.kind)}) is a person's act: agent '${entry.author}' can't file one`);
     }
+  }
+
+  /**
+   * Why an agent's ADDENDUM can't verify the UVs it links, if it can't:
+   * verifying a UV that contests a TB would override that TB, which agents
+   * never do, together or alone (their agreement goes to a person). Null for
+   * anyone else's line, and for a UV this ledger doesn't hold.
+   */
+  private agentVerifiesContest(entry: NewEntry, own: TruthLink[]): string | null {
+    if (entry.type !== 'ADDENDUM' || !this.isAgent(entry.author)) return null;
+    for (const link of own) {
+      if (link.type !== 'verifies') continue;
+      const uv = this.getEntry(link.toId);
+      const contested = uv?.type === 'UV' ? (uv.body as UvBody).contests : null;
+      if (contested) {
+        return (
+          `verifying UV ${uv!.id} would override TB ${contested}: agents never override a TB, together or alone — ` +
+          'a person does (an agent quorum that verifies a contest is raised to a person)'
+        );
+      }
+    }
+    return null;
   }
 
   /**
@@ -1643,7 +1676,8 @@ export class TruthLedger {
    * resolution meets (its author's and each quorum member's). Status joins
    * on the lattice, so a change whose effect is already in place (a TB
    * overridden here first) is recorded and changes nothing. One aimed at an
-   * entry this ledger doesn't hold, or that fails the contempt rule, is
+   * entry this ledger doesn't hold, that fails the contempt rule, or that is
+   * an agent's verification of a contest (which would override its TB), is
    * 'held': nothing is written, and a later import retries it.
    */
   importChange(entry: NewEntry, links: TruthLink[]): { outcome: 'inserted' | 'unchanged' } | { outcome: 'held'; reason: string } {
@@ -1662,6 +1696,9 @@ export class TruthLedger {
           return { outcome: 'held' as const, reason: `its target ${link.toId} is not held here` };
         }
       }
+      // An agent quorum never verifies a contest (admission refuses it): held, like any change this ledger won't apply
+      const overriding = this.agentVerifiesContest(entry, links.filter((l) => l.fromId === entry.id));
+      if (overriding) return { outcome: 'held' as const, reason: overriding };
       // A resolution is corroboration: the contempt rule a live resolveUv
       // meets, for its author and for every member of its quorum. One that
       // fails it is held, like any change this ledger can't apply.

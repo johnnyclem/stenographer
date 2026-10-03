@@ -23,13 +23,21 @@
  *
  * Every decision here runs in one write transaction, so two processes
  * attesting at once can't both complete the same quorum. Time is the
- * caller's clock (`now`, epoch ms), so the window is deterministic in tests.
+ * caller's clock (`now`, epoch ms, or a clock to read), so the window is
+ * deterministic in tests. A clock is read once the write lock is held: a
+ * process that waited for the lock behind another's opposite verdict reads
+ * a time after it, and sees it.
  */
 
 import type Database from 'better-sqlite3';
 import { chooseQuorum, literalSetKey, QUORUM_WINDOW_MS, type QuorumMember, type QuorumProgress } from './quorum.js';
 import type { TruthLedger } from './ledger.js';
 import { ulid, type AddendumEntry, type Evidence, type ProposalEntry, type TbEntry, type TombstonedLiteral, type UvEntry } from './types.js';
+
+/** Epoch ms, or a clock that attest and settleTombstoneQuorum read once they hold the write lock. */
+export type QuorumClock = number | (() => number);
+
+const readClock = (clock: QuorumClock): number => (typeof clock === 'function' ? clock() : clock);
 
 /** One agent session's verdict on an open UV. */
 export interface Attestation {
@@ -41,14 +49,18 @@ export interface Attestation {
   evidence: Evidence[];
   note: string | null;
   createdAt: string;
-  /** The addendum that settled it, 'raised' when its quorum went to a person, or null while it may still count. */
+  /**
+   * The addendum that settled it, 'raised' when its quorum went to a person,
+   * or null while it may still join a quorum. A raised verdict still stands
+   * as dissent within the window: a person has it, and it is no one's to undo.
+   */
   consumedBy: string | null;
 }
 
 export type AttestOutcome =
   /** Recorded; no quorum yet. */
   | { status: 'attested'; attestation: Attestation; uv: UvEntry; quorum: QuorumProgress }
-  /** Another session's opposite verdict stands within the window: no quorum forms. `raise` is set for the first attestation of a dispute. */
+  /** An opposite verdict stands within the window (from any session, this one included): no quorum forms. `raise` is set for the first attestation of a dispute. */
   | { status: 'disputed'; attestation: Attestation; uv: UvEntry; dissent: Attestation[]; raise: boolean }
   /** The quorum verified a contest: overriding its TB needs a person. Nothing was written to the ledger. */
   | { status: 'raised'; attestation: Attestation; uv: UvEntry; members: Attestation[]; tbId: string }
@@ -123,6 +135,11 @@ export class UvAttestations {
    * is open, there is evidence, the agent is independent of the UV and,
    * refuting a contest, of its TB): an attestation that fails them is not
    * recorded.
+   *
+   * Dissent is any opposite verdict filed within the window before now or
+   * after it (a clock another process read later, which committed first),
+   * that no addendum settled: one that may still join a quorum, or one
+   * whose quorum was raised to a person.
    */
   attest(
     input: {
@@ -133,9 +150,10 @@ export class UvAttestations {
       agentSessionId: string;
       note?: string | null;
     },
-    now: number
+    clock: QuorumClock
   ): AttestOutcome {
     return this.ledger.atomically((): AttestOutcome => {
+      const now = readClock(clock);
       const { evidence, uv, contestedTb } = this.ledger.checkResolution(input.uvId, input.resolution, input.evidence, input);
       const attestation: Attestation = {
         id: ulid(now),
@@ -164,11 +182,12 @@ export class UvAttestations {
           attestation.createdAt
         );
 
-      // Unconsumed attestations on this UV within the window of now
-      const others = this.list(uv.id).filter(
-        (a) => a.id !== attestation.id && a.consumedBy === null && Date.parse(a.createdAt) >= now - QUORUM_WINDOW_MS && Date.parse(a.createdAt) <= now
-      );
-      const dissent = others.filter((a) => a.resolution !== input.resolution);
+      // Other verdicts on this UV since the window opened. Those that may join a
+      // quorum are unconsumed and not after now; dissent is any opposite one no
+      // addendum settled, raised to a person or not, filed before now or after
+      const recent = this.list(uv.id).filter((a) => a.id !== attestation.id && Date.parse(a.createdAt) >= now - QUORUM_WINDOW_MS);
+      const others = recent.filter((a) => a.consumedBy === null && Date.parse(a.createdAt) <= now);
+      const dissent = recent.filter((a) => a.resolution !== input.resolution && (a.consumedBy === null || a.consumedBy === 'raised'));
       if (dissent.length > 0) {
         // The first attestation of a dispute raises it; later ones find both verdicts already standing
         const raise = !others.some((a) => a.resolution === input.resolution);
@@ -222,14 +241,16 @@ export type TombstoneQuorumProgress = QuorumProgress & { heldBy?: string };
  * other and of `now`, from different angles — unless an active or contested
  * TB already holds every literal. Otherwise says where the quorum stands.
  * Only agents' drafts settle together (the ledger's classifier says who is
- * one). Runs in one write transaction.
+ * one). Runs in one write transaction, which reads `now` once it holds the
+ * write lock.
  */
 export function settleTombstoneQuorum(
   ledger: TruthLedger,
   draft: ProposalEntry,
-  ctx: { author: string; agentSessionId: string; now: number }
+  ctx: { author: string; agentSessionId: string; now: QuorumClock }
 ): { tombstone: TbEntry } | { progress: TombstoneQuorumProgress } {
   return ledger.atomically(() => {
+    const now = readClock(ctx.now);
     const literalsOf = (p: ProposalEntry) => (p.body.draft.literals ?? []) as TombstonedLiteral[];
     const candidate = (p: ProposalEntry) => ({
       id: p.id,
@@ -241,7 +262,7 @@ export function settleTombstoneQuorum(
     const literals = literalsOf(draft);
     if (literals.length === 0) {
       // A quorum TB carries the literals its members agree on
-      const { progress } = chooseQuorum(candidate(draft), [], ctx.now);
+      const { progress } = chooseQuorum(candidate(draft), [], now);
       return { progress: { ...progress, missing: ['literals', ...progress.missing] } };
     }
 
@@ -258,7 +279,7 @@ export function settleTombstoneQuorum(
           literalSetKey(literalsOf(p)) === set
       )
       .map(candidate);
-    const { members, progress } = chooseQuorum(candidate(draft), agreeing, ctx.now);
+    const { members, progress } = chooseQuorum(candidate(draft), agreeing, now);
 
     // Already truth: an active or contested TB holds every literal of the set
     const wanted = JSON.parse(set) as string[];
@@ -270,7 +291,7 @@ export function settleTombstoneQuorum(
 
     const tombstone = ledger.mintTombstoneByQuorum(
       members.map((m) => m.id),
-      { author: ctx.author, agentSessionId: ctx.agentSessionId, timestamp: new Date(ctx.now).toISOString() }
+      { author: ctx.author, agentSessionId: ctx.agentSessionId, timestamp: new Date(now).toISOString() }
     );
     return { tombstone };
   });

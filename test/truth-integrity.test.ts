@@ -339,6 +339,8 @@ describe('evidence semantics', () => {
     const draft = ledger.draftTombstone({ claim: 'y is dead', evidence: [{ kind: 'command', ref: 'grep y' }] }, { author: 'agent:a' });
     expect((draft.body.draft as { evidence: Evidence[] }).evidence[0].kind).toBe('claimed-command');
     expect(isSelfSigningEvidence([EvidenceSchema.parse({ kind: 'command', ref: 'true' })])).toBe(false);
+    // A pre-1.0 entry's `command` is the same unchecked output (spec, Evidence classes): question-class, never self-signing
+    expect(isSelfSigningEvidence([{ kind: 'command', ref: 'npm test', detail: 'pass' } as unknown as Evidence])).toBe(false);
 
     // Neither spelling mints a TB without a person
     for (const kind of ['command', 'claimed-command'] as const) {

@@ -84,6 +84,10 @@ export {
   checkQuorum,
   chooseQuorum,
   evidenceKey,
+  evidenceRefKey,
+  sameEvidence,
+  trimWhiteSpace,
+  quorumTime,
   hasAgentPrefix,
   literalSetKey,
   quorumEvidence,
@@ -100,6 +104,7 @@ export {
   settleTombstoneQuorum,
   type Attestation,
   type AttestOutcome,
+  type QuorumClock,
   type TombstoneQuorumProgress,
 } from './truth/attestations.js';
 export {
