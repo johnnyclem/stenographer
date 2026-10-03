@@ -21,11 +21,11 @@ import addFormatsModule from 'ajv-formats';
 import { TruthLedger } from '../src/truth/ledger.js';
 import { SignerRegistry } from '../src/truth/identity.js';
 import { UvAttestations, settleTombstoneQuorum } from '../src/truth/attestations.js';
-import { quorumEvidence, type QuorumMember } from '../src/truth/quorum.js';
+import { evidenceRefKey, quorumEvidence, type QuorumMember } from '../src/truth/quorum.js';
 import { importProposalDrafts } from '../src/truth/intake.js';
 import { canonicalize } from '../src/truth/jcs.js';
 import { decodeWikiLine, exportWikiEntries, importWikiEntries, wikiLineHash, WIKI_STATUSES } from '../src/truth/wiki.js';
-import { EVIDENCE_KINDS, evidenceClass, type ProposalEntry, type TbEntry } from '../src/truth/types.js';
+import { EVIDENCE_KINDS, evidenceClass, identityKey, type ProposalEntry, type TbEntry } from '../src/truth/types.js';
 
 const SPEC = join(import.meta.dirname, '..', 'spec', 'truth-format');
 const FIXTURES = join(SPEC, 'fixtures');
@@ -374,7 +374,7 @@ function buildFixtures(): Map<string, string> {
     [story.lines.map(parse).find((l) => l.id === kimRefutes.id), { outcome: 'held', note: 'a refutation of a UV this ledger does not hold' }],
     [unawareStream.find((l) => l.type === 'TB'), { outcome: 'proposal', reason: 'agent-without-quorum', note: 'a TB an agent signed alone: agents settle claims only as a quorum' }],
     [unawareStream.find((l) => l.type === 'ADDENDUM'), { outcome: 'held', note: "an agent's verification without a quorum" }],
-    ...quorumRouting(quorumAddendum, 8),
+    ...quorumRouting(quorumAddendum, quorumTb, 8),
   ];
   files.set('valid/routing.jsonl', jsonl(routing.map(([line]) => line)));
   files.set('valid/routing.expected.json', json(routing.map(([, want], i) => ({ line: i + 1, ...want }))));
@@ -584,6 +584,21 @@ function quorumInvalid(
       'quorum rule 4 at its edge: 900 001 ms from the earliest member to the latest',
       '900001 ms',
     ],
+    // Identity keys and commit refs lowercase as ECMAScript's toLowerCase does, Final_Sigma
+    // included: a capital sigma that ends a word becomes ς (U+03C2), any other σ (U+03C3)
+    [
+      rehash({ ...members([m1, { ...m2, author: 'agent:οδυσσευσ' }]), author: 'agent:ΟΔΥΣΣΕΥΣ' }),
+      "quorum rule 2, identity keys lowercased with Final_Sigma: the line's author agent:ΟΔΥΣΣΕΥΣ keys to agent:οδυσσευς (final ς), " +
+        'not to the member agent:οδυσσευσ (σ), and no other member is it, so the writer is not a member. ' +
+        'This line breaks no other rule: a reader that lowercases every Σ to σ reads the author as that member and wrongly takes it',
+      'agent:ΟΔΥΣΣΕΥΣ is not a quorum member',
+    ],
+    [
+      members([{ ...m1, evidence: [...m1.evidence, { kind: 'commit', ref: 'abcΣ' }] }, { ...m2, evidence: [...m2.evidence, { kind: 'commit', ref: 'abcς' }] }]),
+      'quorum rule 3, commit refs lowercased with Final_Sigma: abcΣ lowercases to abcς, so two members cite one commit. ' +
+        'This line breaks no other rule: a reader that lowercases every Σ to σ reads abcσ, another commit, and wrongly takes it',
+      'both cite commit abcς',
+    ],
   ];
 }
 
@@ -594,9 +609,11 @@ function quorumInvalid(
  * imports it after the TB and the UV before it, `after`), and quorum
  * ADDENDUMs with values this version doesn't know or no links, which
  * decode and are held, and one whose members lie 900 000.9 ms apart, which
- * decodes (rule 4 reads timestamps to the millisecond).
+ * decodes (rule 4 reads timestamps to the millisecond). Then quorum TBs
+ * with an evidence kind this version doesn't know, which decode and are
+ * filed for a person (unknown-value), never truth.
  */
-function quorumRouting(addendum: Record<string, any>, first: number): Array<[unknown, Record<string, unknown>]> {
+function quorumRouting(addendum: Record<string, any>, quorumTb: Record<string, any>, first: number): Array<[unknown, Record<string, unknown>]> {
   // A person's TB and a person's contest of it, in a writer that let agents verify a contest
   const writer = new TruthLedger(new Database(':memory:'), { isAgent: () => false });
   const tb = writer.assertTombstone(
@@ -635,6 +652,18 @@ function quorumRouting(addendum: Record<string, any>, first: number): Array<[unk
   const noLinks = variant('01J9QUORUMNOLINKS000000000', (l) => ({ ...l, 'x-steno': { ...l['x-steno'], links: [] } }));
   const subMs = new Date(Date.parse(m1.ts) + 900_000).toISOString().replace('Z', '9Z');
   const edge = variant('01J9QUORUMSUBMILLISECOND00', (l) => ({ ...l, ts: subMs, quorum: [m1, { ...m2, ts: subMs }] }));
+
+  /** The ledger's quorum TB under another id, with these members and their evidence (rule 6): still one valid line of its stream. */
+  const tbWith = (newId: string, quorum: QuorumMember[]) => {
+    const links = quorumTb['x-steno'].links.map((l: Record<string, unknown>) => ({ ...l, fromId: newId }));
+    return rehash({ ...quorumTb, id: newId, quorum, evidence: quorumEvidence(quorum), 'x-steno': { ...quorumTb['x-steno'], links } });
+  };
+  const [t1, t2] = quorumTb.quorum as QuorumMember[];
+  const benchmark = { kind: 'benchmark', ref: 'bench/search.bench.ts' };
+  // One member cites only the unknown kind; the other a known settling kind, so the line spans one known settling kind
+  const tbUnknownOnly = tbWith('01J9QUORUMTBUNKNOWNONLY000', [t1, { ...t2, evidence: [benchmark] }]);
+  // The members keep rule 3 with two known settling kinds (commit, file), and one also cites the unknown kind
+  const tbUnknownToo = tbWith('01J9QUORUMTBUNKNOWNTOO0000', [t1, { ...t2, evidence: [...t2.evidence, benchmark] }]);
   return [
     [tbLine, { outcome: 'inserted', status: 'active', note: 'a TB a person signed' }],
     [uvLine, { outcome: 'inserted', status: 'open', note: 'a UV that contests it' }],
@@ -651,6 +680,26 @@ function quorumRouting(addendum: Record<string, any>, first: number): Array<[unk
     [unknownLink, { outcome: 'held', heldReason: "link type 'corroborates'", note: 'a quorum ADDENDUM whose only link has a type this version does not know: it decodes, and the import fails closed' }],
     [noLinks, { outcome: 'held', heldReason: 'lists no links', note: 'a quorum ADDENDUM that lists no links: checked for agreeing verdicts only, and held, since what it changes is unknown' }],
     [edge, { outcome: 'held', heldReason: 'is not held here', note: 'members 900 000.9 ms apart: rule 4 reads timestamps to the millisecond, so it decodes (held: its UV is not in this ledger)' }],
+    [
+      tbUnknownOnly,
+      {
+        outcome: 'proposal',
+        reason: 'unknown-value',
+        note:
+          "a TB an agent quorum signed, one of whose members cites only an evidence kind this version does not know ('benchmark'): " +
+          'it decodes (rule 3 refuses no line over an unknown kind), and the import fails closed: filed for a person, never truth, and not agent-without-quorum',
+      },
+    ],
+    [
+      tbUnknownToo,
+      {
+        outcome: 'proposal',
+        reason: 'unknown-value',
+        note:
+          "a TB an agent quorum signed whose members keep rule 3 with two known settling kinds (commit, file), one of them also citing 'benchmark': " +
+          'it decodes, and the import still fails closed on the unknown kind: filed for a person, never truth',
+      },
+    ],
   ];
 }
 
@@ -1044,6 +1093,29 @@ describe('the spec document', () => {
     expect([...classes.keys()].sort()).toEqual([...EVIDENCE_KINDS].sort());
     for (const [kind, cls] of classes) expect(cls, kind).toBe(evidenceClass(kind));
     expect(section).toMatch(/any kind (a|the) reader doesn't know is question-class/i);
+  });
+
+  it('says how keys lowercase (Final_Sigma, as the codec does) and that an agent settlement citing an unknown evidence kind fails closed', () => {
+    const readme = read('README.md');
+    const section = (heading: string) => {
+      const start = readme.indexOf(`\n## ${heading}\n`);
+      expect(start, heading).toBeGreaterThan(-1);
+      return readme.slice(start, readme.indexOf('\n## ', start + 1));
+    };
+    // Lowercasing is ECMAScript's: a final capital sigma becomes ς, so these keys differ, and these commits are one
+    expect(identityKey('agent:ΟΔΥΣΣΕΥΣ')).toBe('agent:οδυσσευς');
+    expect(identityKey('agent:ΟΔΥΣΣΕΥΣ')).not.toBe(identityKey('agent:οδυσσευσ'));
+    expect(evidenceRefKey({ kind: 'commit', ref: 'abcΣ' })).toBe(evidenceRefKey({ kind: 'commit', ref: 'abcς' }));
+    expect(section('Identities')).toMatch(/Final_Sigma/);
+    expect(section('Identities')).toContain('`agent:ΟΔΥΣΣΕΥΣ` keys to `agent:οδυσσευς`, which isn\'t `agent:οδυσσευσ`');
+    expect(section('Agent quorum')).toContain('`abcΣ` and `abcς` are one commit');
+    // A TB or ADDENDUM an agent signed, citing (or with a member citing) a kind this version doesn't know: filed or held
+    for (const heading of ['Agent quorum', "Importing (stenographer's rules)"]) {
+      expect(section(heading), heading).toMatch(/when the line or any member of its quorum cites an evidence kind (the reader|stenographer) doesn't know/);
+    }
+    expect(section('Agent quorum')).toMatch(/files such a TB as a reconciliation proposal with reason `unknown-value`.*and holds such an ADDENDUM/);
+    expect(section("Importing (stenographer's rules)")).toMatch(/TB an agent signed, when .* is filed as `unknown-value`/);
+    expect(section("Importing (stenographer's rules)")).toMatch(/ADDENDUM an agent wrote, when .* is held/);
   });
 
   it('documents the signer registry fields, keys included', () => {
