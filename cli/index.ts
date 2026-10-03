@@ -110,19 +110,21 @@ Options (start):
                            as Claude Code channel events
       --profile <name>     agent | operator  (default: agent)
                            agent:    read tools + propose_tombstone, assert_uv,
-                                     resolve_uv (no minting); writes carry the
-                                     agent identity, never a caller-named one
+                                     resolve_uv; one agent only drafts and
+                                     attests, a claim settles when 2+ agent
+                                     sessions agree from different angles
+                                     within 15 minutes, or a person signs;
+                                     writes carry the agent identity, never a
+                                     caller-named one
                            operator: sign/dismiss/override/rule/strike, direct
                                      TBs, wiki import/export, backfill — for a
                                      notary UI or CLI a person drives, never
                                      an agent
       --agent-identity <id>
                            who agent-profile writes are attributed to
-                           (default: agent:<MCP client name>)
-      --allow-agent-assert single-user opt-out: the agent profile may assert
-                           TBs, signed by the agent identity (off: agents
-                           draft and a person notarizes; REST notary routes
-                           use STENOGRAPHER_NOTARY_SECRET)
+                           (default: agent:<MCP client name>); people
+                           notarize drafts over REST with the secret in
+                           STENOGRAPHER_NOTARY_SECRET
       --signer-registry <path>
                            JSON allowlist of signers and roles
                            ({"signers": [{"id", "role": "human"|"agent"}]});

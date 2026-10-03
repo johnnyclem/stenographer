@@ -247,12 +247,20 @@ describe('agent-drafted tombstones (MCP + REST)', () => {
     await expect(call('assert_tombstone', { ...DRAFT, signedBy: 'johnny' })).rejects.toThrow(/propose_tombstone/);
   });
 
-  it('--allow-agent-assert lets a single-user agent assert, under its own identity only', async () => {
-    const { call } = await start({ allowAgentAssert: true });
+  it('a single-user setup has no agent assert: the draft waits for a person, and --allow-agent-assert is refused', async () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'steno-notary-'));
+    try {
+      expect(
+        () => new StenographerServer({ logPath: join(tmp, 'log.jsonl'), statePath: ':memory:', mode: 'catchup', allowAgentAssert: true } as StenographerConfig)
+      ).toThrow(/allowAgentAssert was removed.*MIGRATION/);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+    const { call } = await start();
     const { rationale: _rationale, ...tbArgs } = DRAFT;
-    await expect(call('assert_tombstone', { ...tbArgs, signedBy: 'johnny' })).rejects.toThrow(/signedBy/);
-    const tb = await call('assert_tombstone', tbArgs);
-    expect(tb.type).toBe('TB');
-    expect(tb.body.signedBy).toBe(AGENT);
+    await expect(call('assert_tombstone', tbArgs)).rejects.toThrow(/propose_tombstone/);
+    const result = await call('propose_tombstone', DRAFT);
+    expect(result.status).toMatch(/awaiting notarization/);
+    expect(result.quorum).toMatchObject({ agreeing: 1, needed: 2, missing: ['another session'] });
   });
 });

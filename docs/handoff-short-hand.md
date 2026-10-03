@@ -61,7 +61,7 @@ Pragmatic recommendation: **start with B.** It's an afternoon of work against a 
 From §13, unresolved as of this handoff:
 
 1. **UV TTL** — open UVs currently live forever (no expiry, no staleness marker). If you ingest UVs into compaction, assume the pile can grow.
-2. **Who counts as a signer** — the floor is: only a check stenographer executed itself self-signs (1.0 ships no runner, and submitted command output is recorded as `claimed-command`); everything else needs a human. Whether trusted agents get signing rights for some entry kinds is undecided. Relevant if short-hand's compactor would want to sign its own promotions (today it can't, and the contempt check would reject the obvious workaround).
+2. **Who counts as a signer** — decided for 1.0: a person signs, alone. An agent never signs or resolves alone: two or more agent sessions settle a claim together, as an agent quorum (spec/truth-format "Agent quorum": distinct sessions, each with settling evidence of its own, two settling kinds, within 15 minutes), and the TB or ADDENDUM carries the `quorum`. Agents never override, strike, dismiss or rule. Nothing signs for itself: 1.0 ships no runner, and submitted command output is recorded as `claimed-command`. Relevant if short-hand's compactor would want to sign its own promotions: it can't (a detector identity is no agent and no person, and the contempt check would reject the obvious workaround); it files PROPOSALs, which a person notarizes (a quorum mints only from agents' own drafts).
 3. **Contested-TB posture** — contested TBs stay authoritative-with-asterisk (stability over caution). If that flips to UV-grade trust, your compaction weighting changes.
 
 ## Pointers

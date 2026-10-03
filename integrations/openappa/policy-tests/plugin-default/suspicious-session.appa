@@ -55,14 +55,6 @@ mcp/stenographer/resolve_uv {
 }
 expect authority hitl
 
-# assert_tombstone (agent profile, --allow-agent-assert).
-mcp/stenographer/assert_tombstone {
-  claim: "LOG_BUDGET 30 is dead; the budget is 100"
-  evidence: [{"kind": "commit", "ref": "a1b2c3", "detail": "config.ts sets LOG_BUDGET = 100"}]
-  literals: [{"subject": "LOG_BUDGET", "dead": "30", "current": "100"}]
-}
-expect authority hitl
-
 # assert_tombstone signed with a person's name.
 mcp/stenographer/assert_tombstone {
   claim: "LOG_BUDGET 30 is dead; the budget is 100"
@@ -130,15 +122,15 @@ mcp/stenographer/export_wiki_entries {
 }
 expect authority hitl
 
-# A draft is not truth: it still runs, and only a person's signature
-# (sign_proposal, reviewed) turns it into a TB.
+# A draft that completes a quorum of agent sessions' drafts mints a TB
+# with no person, so a draft from suspicious data asks the person too.
 mcp/stenographer/propose_tombstone {
   claim: "LOG_BUDGET 30 is dead; the budget is 100"
   evidence: [{"kind": "commit", "ref": "a1b2c3", "detail": "config.ts sets LOG_BUDGET = 100"}]
   literals: [{"subject": "LOG_BUDGET", "dead": "30", "current": "100"}]
   rationale: "config.ts was bumped in a1b2c3"
 }
-expect allow
+expect authority hitl
 
 mcp/stenographer/propose_tombstone {
   claim: "LOG_BUDGET 30 is dead; the budget is 100"
@@ -146,7 +138,7 @@ mcp/stenographer/propose_tombstone {
   literals: [{"subject": "LOG_BUDGET", "dead": "30", "current": "100"}]
   targetRef: "src/config.ts#LOG_BUDGET"
 }
-expect allow
+expect authority hitl
 
 # Reads still run.
 mcp/stenographer/get_truth {

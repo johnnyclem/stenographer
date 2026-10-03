@@ -4,10 +4,13 @@
  * All indexing/query logic lives in the core engine (../core/stenographer.js).
  *
  * Authority model (see README "Notarization, identity and the threat model"):
- * - The server runs one tool profile. 'agent' (default) serves read tools
- *   and the drafting tools; no tool in it mints a TB without a person,
- *   signs, dismisses, overrides, strikes, or rules. 'operator' serves the
- *   judicial and destructive tools to a notary UI or CLI a person drives.
+ * - The server runs one tool profile. 'agent' (default) serves read tools,
+ *   drafting and attesting: an agent alone settles nothing. A claim settles
+ *   when two or more agent sessions agree from different angles within 15
+ *   minutes (the agent quorum, truth/attestations.ts), or when a person
+ *   signs. No tool in it signs with a person's name, dismisses, overrides,
+ *   strikes, or rules. 'operator' serves the judicial and destructive tools
+ *   to a notary UI or CLI a person drives.
  * - In the agent profile the server binds identity: every write carries
  *   the agent identity and this server's session, never a name from the
  *   tool arguments. Operator paths take the signer's name from the caller
@@ -28,7 +31,8 @@ import {
   type Tool,
   type ToolAnnotations,
 } from '@modelcontextprotocol/sdk/types.js';
-import { Stenographer } from '../core/stenographer.js';
+import { ALLOW_AGENT_ASSERT_REMOVED, Stenographer } from '../core/stenographer.js';
+import type { TombstoneQuorumProgress } from '../truth/attestations.js';
 import {
   CONSUMPTION_RULES,
   EvidenceSchema,
@@ -46,10 +50,17 @@ const VERSION = '1.0.0';
 export type ToolProfile = 'agent' | 'operator';
 const PROFILES: ToolProfile[] = ['agent', 'operator'];
 
-/** Read by clients that support Claude Code channels (claude/channel). */
+/** What an agent is told at initialize: its standing in the truth ledger. */
+export const AGENT_STANDING =
+  'Your confidence is not evidence and settles nothing. On your own you can only attest: a claim settles when two or ' +
+  'more agent sessions agree from different angles within 15 minutes, or when a person signs. Agents never override ' +
+  'or strike a tombstone.';
+
+/** Read by MCP clients at initialize; clients that support Claude Code channels (claude/channel) read the events part too. */
 const CHANNEL_INSTRUCTIONS: Record<ToolProfile, string> = {
   agent:
-    'Events from the stenographer channel are real-time objections: something you just asserted contradicts a ' +
+    AGENT_STANDING +
+    ' Events from the stenographer channel are real-time objections: something you just asserted contradicts a ' +
     'signed tombstone (TB) in the truth ledger. Each cites the TB (the exhibit) and the transcript line. Treat the TB ' +
     'as ground truth unless the objection says it is contested: correct course before continuing, and tell the user. ' +
     'If you believe the objection is wrong or immaterial, say so to the user — a person rules on objections, not the ' +
@@ -121,8 +132,11 @@ const Evidence = z
   .array(EvidenceSchema.strict())
   .min(1)
   .describe(
-    'At least one piece of evidence: {kind: commit|file|test|command|wiki|message, ref, detail?}. Command output ' +
-      'you report is recorded as kind claimed-command: stenographer did not run it, so it never signs for itself.'
+    'At least one piece of evidence: {kind: commit|file|test|command|wiki|message|chat|ticket|doc, ref, detail?}. ' +
+      'wiki is a truth-ledger entry id; chat a chat message or thread (Slack, Teams, Discord); ticket an issue or ' +
+      'ticket (Jira, Linear, GitHub issues); doc a document or page outside the truth ledger (design doc, team wiki ' +
+      'page, README). Command output you report is recorded as kind claimed-command: stenographer did not run it, so ' +
+      'it never signs for itself.'
   );
 const Literals = z
   .array(StrictTombstonedLiteralSchema)
@@ -161,6 +175,32 @@ const ResolveFields = {
   opinion: z.string().min(1).describe('Written reasoning, recorded with the resolution').optional(),
 };
 
+/**
+ * What propose_tombstone says of a draft that minted nothing: already truth
+ * (a TB holds every literal), or awaiting a person or a quorum, and what
+ * keeps this draft out of any quorum.
+ */
+function draftStatus(result: { dedupedInto?: string; quorum?: TombstoneQuorumProgress }, targetRef?: string): string {
+  const quorum = result.quorum;
+  if (quorum?.heldBy) {
+    return (
+      `already truth: TB ${quorum.heldBy} holds every literal this draft names, so nothing is minted; the draft stays ` +
+      'open for a person, who may dismiss it'
+    );
+  }
+  const waiting = result.dedupedInto
+    ? `deduped into your open draft ${result.dedupedInto} for ${targetRef} — it is unchanged and still awaiting ` +
+      'notarization; not truth until a person signs it or a quorum of agent sessions agrees'
+    : 'awaiting notarization — not truth until a person signs it or a quorum of agent sessions agrees';
+  const lacks = [
+    ...(quorum?.missing.includes('literals') ? ['names no literals'] : []),
+    ...(quorum?.missing.includes('a settling evidence item')
+      ? ['cites no settling evidence (commit, file, test, claimed-command or wiki)']
+      : []),
+  ];
+  return lacks.length > 0 ? `${waiting}. This draft can't count toward a quorum: it ${lacks.join(' and ')}` : waiting;
+}
+
 // ─────────────────────────────────────────────────────────────
 // MCP Server Implementation
 // ─────────────────────────────────────────────────────────────
@@ -172,16 +212,15 @@ export class StenographerServer {
   private tools: Map<string, ToolSpec>;
   private toolList: Tool[];
   private boundIdentity: string | null = null;
+  private boundSession: string | null = null;
 
   constructor(config: StenographerConfig) {
     const profile = config.profile ?? 'agent';
     if (!PROFILES.includes(profile)) {
       throw new Error(`Unknown profile '${profile}'. Available: ${PROFILES.join(', ')}`);
     }
-    if (config.allowAgentAssert && profile !== 'agent') {
-      throw new Error('--allow-agent-assert only applies to the agent profile');
-    }
     this.profile = profile;
+    // Refuses a config that still asks for agents to assert alone (allowAgentAssert)
     this.engine = new Stenographer(config);
 
     // A misconfigured identity fails at startup, not at the first write
@@ -287,8 +326,9 @@ export class StenographerServer {
   private unavailable(name: string): string {
     if (this.profile === 'agent' && name === 'assert_tombstone') {
       return (
-        'assert_tombstone is not available to agents: draft the tombstone with propose_tombstone and a person will ' +
-        'notarize it (single-user setups can start stenographer with --allow-agent-assert)'
+        'assert_tombstone is not available to agents: draft the tombstone with propose_tombstone. It becomes truth ' +
+        'when two or more agent sessions draft the same literals from different angles within 15 minutes, or when a ' +
+        'person signs it'
       );
     }
     if (this.profile === 'agent' && OPERATOR_TOOLS.has(name)) {
@@ -323,12 +363,17 @@ export class StenographerServer {
   }
 
   /**
-   * The agent session writes are attributed to, for the contempt check: this
-   * server's session. Subagents sharing the connection share it, which is
-   * the point — one session corroborating itself is one witness.
+   * The agent session writes are attributed to, for the contempt check and
+   * the agent quorum: this server's session when the connection first
+   * wrote, bound like the identity. Subagents sharing the connection share
+   * it, which is the point — one session corroborating itself is one
+   * witness — and so does every later write on it, whatever session the log
+   * the server follows names by then (a resumed transcript, a log that
+   * aggregates sessions): one connection is never a second witness.
    */
   private agentSessionId(): string {
-    return this.engine.getSessionId();
+    this.boundSession ??= this.engine.getSessionId();
+    return this.boundSession;
   }
 
   // ─────────────────────────────────────────────────────────
@@ -441,9 +486,7 @@ export class StenographerServer {
           sessionId: e.getSessionId(),
           mode: e.config.mode,
           profile: this.profile,
-          ...(this.profile === 'agent'
-            ? { agentIdentity: this.tryAgentIdentity(), allowAgentAssert: Boolean(e.config.allowAgentAssert) }
-            : {}),
+          ...(this.profile === 'agent' ? { agentIdentity: this.tryAgentIdentity() } : {}),
           restPort: e.restPort,
           version: VERSION,
         }),
@@ -466,7 +509,7 @@ export class StenographerServer {
         description:
           'Open UVs ranked for opportunistic verification: contested pairs first, then relevance to your ' +
           'stated working context, then age. ask-shaped UVs are deprioritized for agents. If your current ' +
-          'task would settle one cheaply, resolve it via resolve_uv. ' + CONSUMPTION_RULES,
+          'task can check one, file your verdict with resolve_uv. ' + CONSUMPTION_RULES,
         input: args({
           context: z.string().describe('Files/entities you are touching, for relevance ranking').optional(),
           k: limit('Number of UVs', 10, 100),
@@ -536,18 +579,23 @@ export class StenographerServer {
 
   private agentTools(): ToolSpec[] {
     const e = this.engine;
-    const allowAssert = Boolean(e.config.allowAgentAssert);
     const bound = 'Attributed to this server\'s agent identity and session — arguments cannot name anyone.';
 
-    const tools: ToolSpec[] = [
+    return [
       tool({
         name: 'propose_tombstone',
         description:
-          'Draft a tombstone for a person to notarize. Use this when you have found that a prior statement, decision ' +
-          'or value is provably dead: you gather the evidence and name the literals, a person approves. The draft is ' +
-          'raised to them immediately and is NOT truth until they sign it — you cannot sign or notarize it yourself, ' +
-          'and neither can any other agent. targetRef dedupes only against your own open drafts (reported as ' +
-          `dedupedInto). ${bound} Tell the user you have raised it and what it would object to.`,
+          'Draft a tombstone. Use this when you have found that a prior statement, decision or value is provably ' +
+          'dead: you gather the evidence and name the literals. The draft is raised to a person immediately and is ' +
+          'NOT truth on your word: you cannot sign or notarize it. It becomes truth when a person signs it, or when ' +
+          'two or more agent sessions draft the same set of literals from different angles within 15 minutes: then ' +
+          'the draft that completes the quorum mints the TB (status "settled by quorum"). Each draft must cite ' +
+          'settling evidence of its own (commit, file, test, claimed-command or wiki; not message, chat, ticket or ' +
+          'doc), no evidence another draft cites, and together they cite two settling kinds; a draft without ' +
+          'literals or settling evidence never counts toward a quorum. When an active or contested TB already holds ' +
+          'every literal, the claim is already truth and nothing is minted (status "already truth"). Otherwise the ' +
+          'result says what the quorum still misses. targetRef dedupes only against your own open drafts (reported ' +
+          `as dedupedInto). ${bound} Tell the user what you have raised and what it would object to.`,
         input: args({
           claim: Text('What is dead and what replaces it (if anything)'),
           evidence: Evidence,
@@ -566,15 +614,22 @@ export class StenographerServer {
             proposedBy: this.agentIdentity(),
             agentSessionId: this.agentSessionId(),
           });
+          if (result.tombstone) {
+            return {
+              status: 'settled by quorum',
+              tombstone: result.tombstone,
+              proposal: result.proposal,
+              raisedTo: result.raisedTo,
+              undelivered: result.undelivered,
+            };
+          }
           return {
             proposal: result.proposal,
-            status: result.dedupedInto
-              ? `deduped into your open draft ${result.dedupedInto} for ${a.targetRef} — it is unchanged and still ` +
-                'awaiting notarization; not truth until a person signs it'
-              : 'awaiting notarization — not truth until a person signs it',
+            status: draftStatus(result, a.targetRef),
             ...(result.dedupedInto ? { dedupedInto: result.dedupedInto } : {}),
             raisedTo: result.raisedTo,
             undelivered: result.undelivered,
+            ...(result.quorum ? { quorum: result.quorum } : {}),
           };
         },
       }),
@@ -591,58 +646,26 @@ export class StenographerServer {
       tool({
         name: 'resolve_uv',
         description:
-          'Resolve an open UV as verified or refuted, filing an evidence-bearing ADDENDUM. You must be ' +
-          'provenance-independent of the UV: not its author, not the same session (contempt of corpus). A refuted ' +
-          'contest closes: its TB is active again unless another contest is open or it has been overridden. ' +
-          (allowAssert
-            ? 'A verified contest overrides its TB and mints a successor, which needs a person\'s signature — evidence ' +
-              'you submit (command output included) is a claim, not an executed check — so it is refused here, as is ' +
-              'mintTombstone. Leave the UV open with your findings, or assert the successor with assert_tombstone. '
-            : 'Resolutions that would mint a TB — verifying a UV that contests a TB, which overrides it — are refused: ' +
-              'they need a person. Leave the UV open with your findings, or draft the successor with propose_tombstone. ') +
-          bound,
-        input: allowAssert
-          ? args({
-              ...ResolveFields,
-              mintTombstone: z
-                .string()
-                .min(1)
-                .describe('Claim text to mint a TB from this resolution (e.g. when a refuted UV propagated)')
-                .optional(),
-            })
-          : args(ResolveFields),
+          'File your verdict on an open UV — verified or refuted — with the evidence you checked. On its own it ' +
+          'settles nothing: it is recorded as your attestation (status "attested", with what the quorum still ' +
+          'misses). The UV settles when two or more agent sessions agree from different angles within 15 minutes: ' +
+          'each cites settling evidence (commit, file, test, claimed-command, wiki — not message, chat, ticket or ' +
+          'doc), none cites another\'s item, and together they cite two kinds (status "settled", with the ' +
+          'addendum). A verdict the other way within the window is a dispute (status "disputed"): no quorum forms, ' +
+          'and a person rules. Verifying a UV that contests a TB would override the TB, which agents never do: an ' +
+          'agreeing quorum is raised to a person (status "raised"). A refuted contest closes: its TB is active ' +
+          'again unless another contest is open or it has been overridden (an override is never undone). You must ' +
+          `be provenance-independent of the UV: not its author, not the same session (contempt of corpus). ${bound}`,
+        input: args(ResolveFields),
         annotations: APPEND,
-        run: (a: { uvId: string; resolution: 'verified' | 'refuted'; evidence: z.infer<typeof Evidence>; opinion?: string; mintTombstone?: string }) =>
-          e.resolveUv(a.uvId, a.resolution, a.evidence, {
+        run: (a) =>
+          e.attestUv(a.uvId, a.resolution, a.evidence, {
             author: this.agentIdentity(),
             opinion: a.opinion,
-            mintTombstone: a.mintTombstone,
             agentSessionId: this.agentSessionId(),
-            allowMint: allowAssert,
           }),
       }),
     ];
-
-    if (allowAssert) {
-      tools.push(
-        tool({
-          name: 'assert_tombstone',
-          description:
-            'Directly assert a TB, signed by this server\'s agent identity (never a person\'s name). Enabled only by ' +
-            '--allow-agent-assert, for single-user setups; otherwise agents draft with propose_tombstone. ' +
-            'A TB claims a prior statement/decision is provably stale or wrong; at least one piece of evidence is required.',
-          input: args({
-            claim: Text('What is dead and what replaces it (if anything)'),
-            evidence: Evidence,
-            literals: Literals.optional(),
-          }),
-          annotations: APPEND,
-          run: (a) =>
-            e.assertTombstone({ ...a, signedBy: this.agentIdentity(), agentSessionId: this.agentSessionId() }),
-        })
-      );
-    }
-    return tools;
   }
 
   // ─────────────────────────────────────────────────────────
@@ -793,8 +816,11 @@ export class StenographerServer {
           'Ingest a team llm-wiki JSONL file (truth format v2; v1 lines are still read) in one transaction: every ' +
           'line lands or none does, with a per-line error report, and the file\'s hash chain must hold. Entries ' +
           'keep their ids and authors. A TB lands as truth only when signed and verifiable (hash-chained, and ' +
-          'its signer listed in the signer registry when one is configured); otherwise it becomes a ' +
-          'reconciliation PROPOSAL, as does a line that contradicts a local entry or whose status is unknown. ' +
+          'its signer listed in the signer registry when one is configured) and, when an agent signed it, with a ' +
+          'valid quorum of agents; otherwise it becomes a reconciliation PROPOSAL (an agent\'s TB without one: ' +
+          'agent-without-quorum), as does a line that contradicts a local entry or whose status is unknown. An ' +
+          'agent\'s resolution of a UV applies only with a valid quorum of agents, never one that verifies a ' +
+          'contest; an override, strike or ruling never applies from an agent. Those are held, and reported. ' +
           'Re-importing a file changes nothing.',
         input: args({ file: WikiFile }),
         annotations: { ...APPEND, idempotentHint: true },
@@ -840,6 +866,12 @@ function errorMessage(error: unknown): string {
 const MODES: StenographerMode[] = ['live', 'catchup', 'watch', 'daemon'];
 
 export async function runCLI(args: string[]): Promise<void> {
+  // Refused before anything else is read: it used to let one agent sign alone
+  if (args.some((a) => a === '--allow-agent-assert' || a.startsWith('--allow-agent-assert='))) {
+    console.error(`❌ ${ALLOW_AGENT_ASSERT_REMOVED}`);
+    process.exit(1);
+  }
+
   const { positionals, values } = parseArgs({
     args,
     options: {
@@ -859,7 +891,6 @@ export async function runCLI(args: string[]): Promise<void> {
       'no-mcp-channel': { type: 'boolean' },
       profile: { type: 'string' },
       'agent-identity': { type: 'string' },
-      'allow-agent-assert': { type: 'boolean' },
       'signer-registry': { type: 'string' },
       'wiki-dir': { type: 'string' },
       // Accepted for 0.x configs: notarization is now the agent-profile default
@@ -887,14 +918,6 @@ export async function runCLI(args: string[]): Promise<void> {
   const profile = ((values.profile as string | undefined) ?? 'agent') as ToolProfile;
   if (!PROFILES.includes(profile)) {
     console.error(`Unknown profile '${profile}'. Available: ${PROFILES.join(', ')}`);
-    process.exit(1);
-  }
-  if (values['allow-agent-assert'] && profile !== 'agent') {
-    console.error('--allow-agent-assert only applies to the agent profile');
-    process.exit(1);
-  }
-  if (values['require-notary'] && values['allow-agent-assert']) {
-    console.error('--require-notary and --allow-agent-assert contradict each other');
     process.exit(1);
   }
   if (values['require-notary']) {
@@ -947,7 +970,6 @@ export async function runCLI(args: string[]): Promise<void> {
     notarySecret: process.env.STENOGRAPHER_NOTARY_SECRET || undefined,
     profile,
     agentIdentity: values['agent-identity'] as string | undefined,
-    allowAgentAssert: Boolean(values['allow-agent-assert']),
     signerRegistry: values['signer-registry'] as string | undefined,
     wikiDir: values['wiki-dir'] as string | undefined,
   };
@@ -960,9 +982,7 @@ export async function runCLI(args: string[]): Promise<void> {
   console.error(
     `🔏 Profile: ${profile}` +
       (profile === 'agent'
-        ? config.allowAgentAssert
-          ? ' — agents may assert TBs under their own identity (--allow-agent-assert)'
-          : ' — agents draft, a person notarizes'
+        ? ' — agents draft and attest; a person notarizes, or two or more agent sessions agree'
         : ' — judicial tools exposed; for a notary UI or CLI, never an agent')
   );
 

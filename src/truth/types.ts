@@ -12,6 +12,7 @@
  */
 
 import { z } from 'zod';
+import type { QuorumMember } from './quorum.js';
 
 // ─────────────────────────────────────────────────────────────
 // Authorship — the stand-behind-it standard
@@ -135,21 +136,43 @@ export const ProvenanceSchema = z.object({
 });
 export type Provenance = z.infer<typeof ProvenanceSchema>;
 
-export const EVIDENCE_KINDS = ['commit', 'file', 'test', 'command', 'claimed-command', 'wiki', 'message'] as const;
+/**
+ * The evidence kinds this version knows (spec/truth-format, "Evidence
+ * classes"). `wiki` is the id of an entry in a truth ledger, this one or a
+ * teammate's; a team wiki page is a `doc`. `chat` is a chat message or
+ * thread, `ticket` an issue or ticket, `doc` a document or page outside the
+ * truth ledger.
+ */
+export const EVIDENCE_KINDS = ['commit', 'file', 'test', 'command', 'claimed-command', 'wiki', 'message', 'chat', 'ticket', 'doc'] as const;
 export type EvidenceKind = (typeof EVIDENCE_KINDS)[number];
+
+/**
+ * Evidence that points at something a reader can check against the code or
+ * the ledger. Every other kind (`message`, `chat`, `ticket`, `doc`, pre-1.0
+ * `command`) is question-class: it can prompt a check, but isn't one. In 1.0
+ * the classes bind agents only; a person may sign on any evidence.
+ */
+export const SETTLING_EVIDENCE_KINDS = ['commit', 'file', 'test', 'claimed-command', 'wiki'] as const;
+export type EvidenceClass = 'settling' | 'question';
+
+/** An evidence kind's class. A kind this version doesn't know is question-class: it fails closed. */
+export function evidenceClass(kind: string): EvidenceClass {
+  return (SETTLING_EVIDENCE_KINDS as readonly string[]).includes(kind) ? 'settling' : 'question';
+}
 
 /**
  * Evidence as a caller submits it. A `command` the caller says it ran, with
  * the output it says it saw, is a claim: it is recorded as
- * `claimed-command`. `command` in the ledger is reserved for a check
- * stenographer executed itself — and 1.0 ships no runner, so nothing a
- * caller submits is recorded as `command`.
+ * `claimed-command`. `command` appears only on entries recorded before 1.0,
+ * where it means the same unchecked output: it is question-class, and keeps
+ * that meaning (spec, Evidence classes). A check stenographer runs itself,
+ * when a version adds one, gets a kind of its own.
  */
 export const EvidenceSchema = z.object({
   kind: z
     .enum(EVIDENCE_KINDS)
     .transform((kind): EvidenceKind => (kind === 'command' ? 'claimed-command' : kind)),
-  /** Commit sha, file/line, test name, command line, wiki entry id, or message id. */
+  /** Commit sha, file/line, test name, command line, truth entry id, message id, chat message or thread, ticket, or document. */
   ref: z.string().min(1),
   /** What the evidence shows (e.g. captured command output). */
   detail: z.string().optional(),
@@ -158,11 +181,13 @@ export type Evidence = z.infer<typeof EvidenceSchema>;
 
 /**
  * Evidence that signs for itself (summary judgment, §6): only a check
- * stenographer ran. Caller-submitted command output is `claimed-command`
- * after parsing, so it never self-signs: an unexecuted claim cannot mint truth.
+ * stenographer ran, and 1.0 has no kind for one (it ships no runner), so
+ * none does. Caller-submitted command output is `claimed-command`, and a
+ * pre-1.0 `command` is the same unchecked output: an unexecuted claim
+ * cannot mint truth.
  */
-export function isSelfSigningEvidence(evidence: Evidence[]): boolean {
-  return evidence.some((e) => e.kind === 'command');
+export function isSelfSigningEvidence(_evidence: Evidence[]): boolean {
+  return false;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -267,6 +292,14 @@ export interface TruthEnvelope {
   links: TruthLink[];
 }
 
+/**
+ * Fields a newer writer put on a wiki line that this version doesn't define,
+ * kept as the line gave them so the export writes them back verbatim
+ * (spec/truth-format, "Unknown values"). Only wiki import sets it; live
+ * writes never do.
+ */
+export type ExtraFields = Record<string, unknown>;
+
 /** TB — asserted tombstone: a prior statement is provably stale or wrong. */
 export interface TbBody {
   /** What is dead and what replaces it (if anything). */
@@ -278,6 +311,9 @@ export interface TbBody {
   status: TbStatus;
   /** Matchable dead literals — optional; only TBs carrying them can raise objections (§12). */
   literals?: TombstonedLiteral[];
+  /** The agent sessions that settled it together, when agents signed it (spec, Agent quorum). */
+  quorum?: QuorumMember[];
+  extra?: ExtraFields;
 }
 
 /** UV — unverified assertion: believed true, stated before verification exists. */
@@ -291,6 +327,7 @@ export interface UvBody {
   /** Id of a TB this UV disputes — this link puts the TB into `contested`. */
   contests?: string | null;
   status: UvStatus;
+  extra?: ExtraFields;
 }
 
 /** PROPOSAL — machine-drafted candidate. Never truth until signed. */
@@ -316,10 +353,11 @@ export interface ProposalBody {
   /** Engine bookkeeping (e.g. decision ids to close when signed). */
   meta?: Record<string, unknown>;
   /**
-   * Agent-drafted proposals must be notarized by a person before they mint:
-   * only the notary paths sign them (REST with the notary secret, the
-   * terminal notary, or sign_proposal in the operator profile) — never a
-   * tool in the agent profile.
+   * Agent-drafted proposals don't mint on their drafter's word: a person
+   * notarizes them (REST with the notary secret, the terminal notary, or
+   * sign_proposal in the operator profile), or two or more agent sessions'
+   * drafts of the same literals mint one TB together (the agent quorum,
+   * attestations.ts). Never one agent alone.
    */
   requiresNotary?: boolean;
   status: ProposalStatus;
@@ -332,6 +370,9 @@ export interface ProposalBody {
 export interface AddendumBody {
   evidence: Evidence[];
   note?: string | null;
+  /** The agent sessions whose agreeing verdicts it records, when agents resolved a UV (spec, Agent quorum). */
+  quorum?: QuorumMember[];
+  extra?: ExtraFields;
 }
 
 /** RULING — a signed judgment about an existing entry (§11). */
@@ -350,6 +391,7 @@ export interface RulingBody {
   /** Objection rulings (§12): the objection ruled on, and the outcome. */
   objectionId?: string;
   outcome?: 'sustained' | 'overruled';
+  extra?: ExtraFields;
 }
 
 /**
@@ -439,7 +481,7 @@ export const DraftEditsSchema = z
 export const CONSUMPTION_RULES = `Consumption rules by confidence type:
 - Active TB: treat as ground truth. A reviewer may block on it; a code agent may rely on it.
 - Contested TB: ground truth with a visible asterisk — cite both the TB and the contesting UV.
-- Open UV: FLAG, DON'T BLOCK. A finding grounded only in a UV is phrased as a question or heads-up, never a demanded change. If your current task would settle the UV cheaply, do so via resolve_uv.
+- Open UV: FLAG, DON'T BLOCK. A finding grounded only in a UV is phrased as a question or heads-up, never a demanded change. If your current task can check the UV, file your verdict and evidence with resolve_uv: it settles only when another agent session agrees from a different angle (other evidence, another kind) within 15 minutes, or when a person rules.
 - Refuted UV / overridden TB: retrievable for history, excluded from current-truth by default, never citable as support for a claim.`;
 
 // ─────────────────────────────────────────────────────────────

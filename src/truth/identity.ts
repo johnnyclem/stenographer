@@ -21,6 +21,7 @@
 import { readFileSync } from 'node:fs';
 import { z } from 'zod';
 import { TruthWriteError } from './ledger.js';
+import { hasAgentPrefix, type AgentClassifier } from './quorum.js';
 import {
   canonicalIdentity,
   identityKey,
@@ -36,6 +37,21 @@ export type SignerRole = 'human' | 'agent' | 'detector';
 /** An identity failed validation: anonymous, reserved, unregistered, or the wrong role. */
 export class IdentityError extends TruthWriteError {}
 
+/**
+ * A signer's public key. Reserved for key signing in 1.x: 1.0 checks the
+ * shape and otherwise ignores it, so a registry that lists keys loads on a
+ * 1.0 install. Nothing else goes in it: a registry never holds a private key.
+ */
+export const SignerKeySchema = z
+  .object({
+    /** The signature algorithm, e.g. `ed25519`. */
+    alg: z.string().min(1),
+    /** Names this key among the signer's keys, so a signature can say which one it used. */
+    id: z.string().min(1),
+    publicKey: z.string().min(1),
+  })
+  .strict();
+
 export const SignerRegistryFileSchema = z
   .object({
     signers: z.array(
@@ -46,6 +62,8 @@ export const SignerRegistryFileSchema = z
           role: z.enum(['human', 'agent', 'detector']),
           /** Other spellings that resolve to `id` (e.g. a short handle). */
           aliases: z.array(z.string().min(1)).optional(),
+          /** Public keys for 1.x key signing: accepted and ignored in 1.0. */
+          keys: z.array(SignerKeySchema).optional(),
         })
         .strict()
     ),
@@ -87,7 +105,7 @@ export class SignerRegistry {
     this.prefixes.sort((a, b) => b.prefix.length - a.prefix.length);
   }
 
-  /** Reads a registry file (JSON: `{"signers": [{"id", "role", "aliases?"}]}`). */
+  /** Reads a registry file (JSON: `{"signers": [{"id", "role", "aliases?", "keys?"}]}`). */
   static load(source: string | SignerRegistryFile): SignerRegistry {
     if (typeof source !== 'string') return new SignerRegistry(source);
     let raw: unknown;
@@ -150,4 +168,20 @@ export function resolveIdentity(
 
 function withArticle(role: SignerRole): string {
   return role === 'agent' ? 'an agent' : `a ${role}`;
+}
+
+/**
+ * Who is an agent, for the agent quorum (spec/truth-format, "Agent quorum"):
+ * the role a signer registry lists, and, for an identity it doesn't list or
+ * without one, the `agent:` prefix. `agentIdentities` are agents whatever
+ * their spelling: the identity a server binds its agent-profile writes to,
+ * which `--agent-identity` may set to a name without the prefix.
+ */
+export function agentClassifier(registry: SignerRegistry | null, agentIdentities: Array<string | undefined> = []): AgentClassifier {
+  const own = new Set(agentIdentities.filter((id): id is string => typeof id === 'string').map(identityKey));
+  return (identity) => {
+    if (own.has(identityKey(identity))) return true;
+    const listed = registry?.lookup(identity);
+    return listed ? listed.role === 'agent' : hasAgentPrefix(identity);
+  };
 }

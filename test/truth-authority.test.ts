@@ -10,6 +10,7 @@ import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { StenographerServer } from '../src/mcp/server.js';
+import { SignerRegistry } from '../src/truth/identity.js';
 import type { StenographerConfig } from '../src/types.js';
 import type { TbEntry, UvEntry, ProposalEntry } from '../src/truth/types.js';
 
@@ -174,7 +175,8 @@ describe('notarization cannot be bypassed from the agent profile (STENO-T-01)', 
     });
     expect(minted.error).toBeDefined();
 
-    // resolve_uv verifying a contest, which would override the human TB and mint its successor
+    // resolve_uv verifying a contest, which would override the human TB and mint its successor:
+    // one agent's verdict is an attestation, and writes nothing to the ledger
     const contest = await server!.engine.assertUv({
       assertion: 'LOG_BUDGET is still 30 in production.',
       basis: 'a dashboard',
@@ -187,7 +189,9 @@ describe('notarization cannot be bypassed from the agent profile (STENO-T-01)', 
       resolution: 'verified',
       evidence: [{ kind: 'command', ref: 'grep LOG_BUDGET config.ts', detail: 'LOG_BUDGET = 30' }],
     });
-    expect(verified.error).toMatch(/notar|person/);
+    expect(verified.error).toBeUndefined();
+    expect(verified.status).toBe('attested');
+    expect(verified.addendum).toBeUndefined();
     expect((ledger.getEntry(contest.id) as UvEntry).body.status).toBe('open');
     expect((ledger.getEntry(human.id) as TbEntry).body.status).toBe('contested');
 
@@ -211,7 +215,7 @@ describe('notarization cannot be bypassed from the agent profile (STENO-T-01)', 
     expect(ledger.getStats().rulings).toBe(0);
   });
 
-  it('a refuted contest still restores the TB: refuting mints nothing', async () => {
+  it('one agent refuting a contest only attests: the TB stays contested until a quorum or a person settles it', async () => {
     const { call, ledger, notarizedTb, engine } = await start();
     const human = await notarizedTb();
     const contest = await engine.assertUv({
@@ -227,7 +231,12 @@ describe('notarization cannot be bypassed from the agent profile (STENO-T-01)', 
       evidence: [{ kind: 'command', ref: 'grep LOG_BUDGET config.ts', detail: 'LOG_BUDGET = 100' }],
     });
     expect(res.error).toBeUndefined();
-    expect(res.tombstone).toBeNull();
+    expect(res.status).toBe('attested');
+    expect(res.tombstone).toBeUndefined();
+    expect((ledger.getEntry(contest.id) as UvEntry).body.status).toBe('open');
+    expect((ledger.getEntry(human.id) as TbEntry).body.status).toBe('contested');
+    // A person still settles it alone (operator path), and the TB is active again
+    await engine.resolveUv(contest.id, 'refuted', [{ kind: 'file', ref: 'config.ts:3', detail: 'LOG_BUDGET = 100' }], { author: 'alex' });
     expect((ledger.getEntry(human.id) as TbEntry).body.status).toBe('active');
   });
 });
@@ -322,6 +331,34 @@ describe('identity is bound by the server (STENO-T-18)', () => {
     ).toThrow(/invalid signer registry — signers\.0\.role/);
   });
 
+  it('accepts signing keys on a registry entry and ignores them: they are reserved for key signing in 1.x', () => {
+    const keys = [
+      { alg: 'ed25519', id: 'johnnyclem/2026-09', publicKey: 'Zm9yIGEgbGF0ZXIgcmVsZWFzZTsgMS4wIGlnbm9yZXMgaXQ' },
+      { alg: 'x-future-alg', id: 'johnnyclem/backup', publicKey: 'opaque' },
+    ];
+    const registry = SignerRegistry.load({ signers: [{ id: 'johnnyclem', role: 'human', aliases: ['johnny'], keys }, { id: 'agent:*', role: 'agent' }] });
+    expect(registry.lookup('Johnny')).toEqual({ id: 'johnnyclem', role: 'human' });
+    expect(registry.lookup('agent:claude-code')).toEqual({ id: 'agent:claude-code', role: 'agent' });
+    expect(SignerRegistry.load({ signers: [{ id: 'sam', role: 'human', keys: [] }] }).lookup('sam')).toEqual({ id: 'sam', role: 'human' });
+
+    // Each key is {alg, id, publicKey}, every one a non-empty string, and nothing else: no place for a private key
+    for (const [bad, error] of [
+      [[{ alg: 'ed25519', id: 'k1' }], /signers\.0\.keys\.0\.publicKey/],
+      [[{ alg: '', id: 'k1', publicKey: 'p' }], /signers\.0\.keys\.0\.alg/],
+      [[{ alg: 'ed25519', id: 'k1', publicKey: 7 }], /signers\.0\.keys\.0\.publicKey/],
+      [[{ alg: 'ed25519', id: 'k1', publicKey: 'p', privateKey: 's' }], /signers\.0\.keys\.0: Unrecognized key.*privateKey/],
+      [{ alg: 'ed25519', id: 'k1', publicKey: 'p' }, /signers\.0\.keys/],
+    ] as const) {
+      expect(() => SignerRegistry.load({ signers: [{ id: 'johnnyclem', role: 'human', keys: bad }] } as any), JSON.stringify(bad)).toThrow(error);
+    }
+
+    // A server starts with such a registry, and checks names against it as before
+    dir = mkdtempSync(join(tmpdir(), 'steno-authority-'));
+    const withKeys = { signers: [{ id: 'johnnyclem', role: 'human', keys }, { id: 'agent:*', role: 'agent' }] };
+    server = new StenographerServer({ logPath: join(dir, 'log.jsonl'), statePath: ':memory:', mode: 'catchup', agentIdentity: 'agent:solo', signerRegistry: withKeys as any });
+    expect(server.engine.resolveIdentity(' JohnnyClem ', ['human'], 'signer')).toBe('johnnyclem');
+  });
+
   it('refuses reserved identities as the agent identity', () => {
     dir = mkdtempSync(join(tmpdir(), 'steno-authority-'));
     for (const agentIdentity of ['migration', 'detector:supersession', 'assistant']) {
@@ -333,41 +370,33 @@ describe('identity is bound by the server (STENO-T-18)', () => {
     }
   });
 
-  it('--allow-agent-assert (single-user opt-out) signs direct TBs with the bound identity, never a caller-named one', async () => {
-    const { call, toolNames, engine } = await start({ allowAgentAssert: true, agentIdentity: 'agent:solo' });
-    expect(await toolNames()).toContain('assert_tombstone');
-    expect((await call('assert_tombstone', { ...DRAFT, signedBy: 'johnnyclem' })).error).toMatch(/signedBy/);
+  it('no flag lets one agent sign alone: --allow-agent-assert is gone, and a contest one agent verifies stays contested', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'steno-authority-'));
+    expect(
+      () =>
+        new StenographerServer({ logPath: join(dir, 'log.jsonl'), statePath: ':memory:', mode: 'catchup', allowAgentAssert: true, agentIdentity: 'agent:solo' } as StenographerConfig)
+    ).toThrow(/allowAgentAssert was removed/);
+    rmSync(dir, { recursive: true, force: true });
 
+    const { call, toolNames, engine, notarizedTb } = await start({ agentIdentity: 'agent:solo' });
+    expect(await toolNames()).not.toContain('assert_tombstone');
     const { rationale: _r, ...tbArgs } = DRAFT;
-    const tb = await call('assert_tombstone', tbArgs);
-    expect(tb.type).toBe('TB');
-    expect(tb.author).toBe('agent:solo');
-    expect(tb.body.signedBy).toBe('agent:solo');
+    expect((await call('assert_tombstone', tbArgs)).error).toMatch(/propose_tombstone/);
 
-    // Command output the agent says it saw is a claim, not an executed check:
-    // it no longer self-signs a successor TB, even here
+    // Command output the agent says it saw is a claim, not an executed check, and one
+    // agent's verdict settles nothing: the TB it would override stays contested
+    const tb = await notarizedTb('fetchV1 is dead', [{ dead: 'fetchV1' }] as any);
     const contest = await engine.assertUv({
-      assertion: 'LOG_BUDGET is 100 now.',
-      basis: 'config.ts',
-      verifyBy: { kind: 'command', value: 'grep LOG_BUDGET config.ts' },
+      assertion: 'fetchV1 is still used.',
+      basis: 'grep',
+      verifyBy: { kind: 'command', value: 'grep -rn fetchV1 src/' },
       contests: tb.id,
       author: 'sam',
     });
-    const res = await call('resolve_uv', { uvId: contest.id, resolution: 'verified', evidence: [{ kind: 'command', ref: 'grep LOG_BUDGET config.ts' }] });
-    expect(res.error).toMatch(/signedBy|person|human/);
+    const res = await call('resolve_uv', { uvId: contest.id, resolution: 'verified', evidence: [{ kind: 'command', ref: 'grep -rn fetchV1 src/' }] });
+    expect(res.status).toBe('attested');
+    expect(res.attestation.evidence).toEqual([{ kind: 'claimed-command', ref: 'grep -rn fetchV1 src/' }]);
     expect((engine.store.truth.getEntry(tb.id) as TbEntry).body.status).toBe('contested');
-
-    // ...and a judgment call still needs a person's signature
-    const other = await call('assert_tombstone', { claim: 'fetchV1 is dead', evidence: [{ kind: 'commit', ref: 'b' }] });
-    const contest2 = await engine.assertUv({
-      assertion: 'fetchV1 is still used.',
-      basis: 'grep',
-      verifyBy: { kind: 'inspect', value: 'src/' },
-      contests: other.id,
-      author: 'sam',
-    });
-    const judged = await call('resolve_uv', { uvId: contest2.id, resolution: 'verified', evidence: [{ kind: 'file', ref: 'src/a.ts:3' }] });
-    expect(judged.error).toMatch(/signedBy|person|human/);
   });
 
   it('operator paths validate signers against the registry and canonicalize them', async () => {
@@ -405,6 +434,23 @@ describe('identity is bound by the server (STENO-T-18)', () => {
 });
 
 describe('arguments are validated at the boundary (STENO-T-23)', () => {
+  it('takes chat, ticket and doc evidence, and the evidence description names every kind', async () => {
+    const { call, client } = await start();
+    for (const kind of ['chat', 'ticket', 'doc']) {
+      const res = await call('propose_tombstone', { ...DRAFT, targetRef: `kind:${kind}`, evidence: [{ kind, ref: `${kind}-1` }] });
+      expect(res.error, kind).toBeUndefined();
+      expect(res.proposal.body.draft.evidence, kind).toEqual([{ kind, ref: `${kind}-1` }]);
+    }
+    expect((await call('propose_tombstone', { ...DRAFT, evidence: [{ kind: 'screenshot', ref: 's' }] })).error).toMatch(/kind/);
+    const tools = (await client.listTools()).tools;
+    for (const name of ['propose_tombstone', 'resolve_uv']) {
+      const description = (tools.find((t) => t.name === name)!.inputSchema.properties as any).evidence.description as string;
+      for (const kind of ['commit', 'file', 'test', 'command', 'wiki', 'message', 'chat', 'ticket', 'doc']) {
+        expect(description.split(/[^a-z-]+/), `${name}: ${kind}`).toContain(kind);
+      }
+    }
+  });
+
   it('rejects an unknown enum with a validation error, not a SQL error', async () => {
     const { call } = await start();
     const res = await call('get_truth', { truthFilter: 'bogus' });

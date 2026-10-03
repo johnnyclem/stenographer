@@ -229,11 +229,15 @@ describe('TruthLedger', () => {
     );
 
     expect(() =>
-      ledger.resolveUv(uv.id, 'verified', commitEvidence, { author: 'agent:reviewer-1' })
+      ledger.resolveUv(uv.id, 'verified', commitEvidence, { author: 'alex' })
     ).toThrow(/signedBy/);
+    // Verifying a contest overrides its TB, a person's act: an agent can't be the resolver, even with a signer
+    expect(() =>
+      ledger.resolveUv(uv.id, 'verified', commitEvidence, { author: 'agent:reviewer-1', signedBy: 'johnny', opinion: 'sufficient' })
+    ).toThrow(/person's act/);
 
     const result = ledger.resolveUv(uv.id, 'verified', commitEvidence, {
-      author: 'agent:reviewer-1',
+      author: 'alex',
       signedBy: 'johnny',
       opinion: 'The commit plainly changes the window logic; evidence sufficient.',
     });

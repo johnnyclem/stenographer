@@ -37,9 +37,11 @@ The index tools `get_recent_messages`, `get_entities`, `get_relations`, `get_dec
 `get_decision_history`, `get_decision_chain`, `get_corrections`, `search_conversation`,
 `search_similar`, `get_context_frame` and `get_status` (11, the whole 0.1.0-alpha surface) are
 served in both profiles, with six truth-ledger reads. The `agent` profile (default) adds
-`propose_tombstone`, `assert_uv` and `resolve_uv` (20 tools; `assert_tombstone` too with
-`--allow-agent-assert`). The `operator` profile adds the notary and judicial tools and wiki
-import/export instead (28 tools). The README's tables list them all.
+`propose_tombstone`, `assert_uv` and `resolve_uv` (20 tools): an agent alone drafts and attests,
+and a claim settles only when two or more agent sessions agree from different angles within 15
+minutes (the agent quorum, `src/truth/quorum.ts` and `src/truth/attestations.ts`), or a person
+signs. The `operator` profile adds the notary and judicial tools and wiki import/export instead
+(28 tools). The README's tables list them all.
 
 ### REST surface (`src/api/rest.ts`)
 

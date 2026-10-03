@@ -28,11 +28,11 @@ const PERSON_ACTS = [
   'override_tombstone',
   'file_ruling',
   'rule_on_objection',
+  // Only the operator profile serves it, and always with a person's signedBy: no agent signs a TB alone
+  'assert_tombstone',
   // A wiki file applies overrides, strikes and rulings in its writers' names (STENO-REV-05)
   'import_wiki_entries',
 ];
-/** Writes that only draft for a person to notarize: not truth, so not trust-gated. */
-const DRAFTS = ['propose_tombstone'];
 
 interface Rule {
   name: string;
@@ -116,7 +116,7 @@ async function advertised(overrides: Partial<StenographerConfig>) {
 /** Every tool any profile serves, with whether every profile marks it read-only. */
 async function allTools(): Promise<Map<string, boolean>> {
   const tools = new Map<string, boolean>();
-  for (const config of [{}, { allowAgentAssert: true }, { profile: 'operator' as const }]) {
+  for (const config of [{}, { profile: 'operator' as const }]) {
     for (const t of await advertised(config)) {
       const readOnly = t.annotations?.readOnlyHint === true;
       tools.set(t.name, (tools.get(t.name) ?? readOnly) && readOnly);
@@ -198,7 +198,7 @@ describe('OpenAPPA battery: contracts', () => {
     const tools = await allTools();
     const rules = readRules(batteryText());
     for (const [name, readOnly] of tools) {
-      if (readOnly || DRAFTS.includes(name)) continue;
+      if (readOnly) continue;
       for (const rule of rules.filter((r) => r.tool === `${NAMESPACE}${name}`)) {
         // export_wiki_entries without a file is an inline read of the ledger
         if (name === 'export_wiki_entries' && rule.selector === null) {
@@ -220,16 +220,12 @@ describe('OpenAPPA battery: contracts', () => {
       expect(own.length, name).toBeGreaterThan(0);
       for (const rule of own) expect(hitl(rule), rule.name).toBe(true);
     }
-    // Operator calls that name a signer mint truth under a person's name
-    for (const name of ['assert_tombstone', 'resolve_uv']) {
-      const signed = rules.find((r) => r.name === `${NAMESPACE}${name}(signedBy:*)`);
-      expect(signed && hitl(signed), `${name}(signedBy:*)`).toBe(true);
-    }
-    // ...while the agent-profile spelling, with no signer, needs trust only
-    for (const name of ['assert_tombstone', 'resolve_uv']) {
-      const bare = rules.find((r) => r.name === `${NAMESPACE}${name}`);
-      expect(bare && hitl(bare), name).toBe(false);
-    }
+    // An operator resolution that names a signer mints truth under a person's name
+    const signed = rules.find((r) => r.name === `${NAMESPACE}resolve_uv(signedBy:*)`);
+    expect(signed && hitl(signed), 'resolve_uv(signedBy:*)').toBe(true);
+    // ...while the spelling without one (an agent's attestation, or a person's plain resolution) needs trust only
+    const bare = rules.find((r) => r.name === `${NAMESPACE}resolve_uv`);
+    expect(bare && hitl(bare), 'resolve_uv').toBe(false);
   });
 
   it('declares no write it could never allow: a rule that requires trusted keeps the trust', () => {
@@ -241,10 +237,19 @@ describe('OpenAPPA battery: contracts', () => {
     }
   });
 
-  it('never lets a draft mint truth: propose_tombstone records a proposal, not a change', () => {
+  it('gates propose_tombstone as a truth write: a draft that completes an agent quorum mints a TB', () => {
     const rules = readRules(batteryText()).filter((r) => r.tool === `${NAMESPACE}propose_tombstone`);
     expect(rules.length).toBeGreaterThan(0);
-    for (const rule of rules) expect(rule.effects, rule.name).toEqual(['stenographer.proposed']);
+    for (const rule of rules) {
+      expect(rule.requires?.trust, rule.name).toBe('trusted');
+      expect(rule.effects, rule.name).toEqual(['stenographer.proposed', 'stenographer.changed']);
+    }
+  });
+
+  it('serves no tool an agent could sign a TB with alone', async () => {
+    const agentTools = (await advertised({})).map((t) => t.name);
+    expect(agentTools).not.toContain('assert_tombstone');
+    expect(batteryText()).not.toMatch(/allow-agent-assert/);
   });
 });
 

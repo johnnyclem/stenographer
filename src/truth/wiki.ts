@@ -27,7 +27,9 @@
  * PROPOSAL. Status changes are applied from the ADDENDUM and RULING entries
  * that cause them, under the same trust rules; TRANSITION lines are checked
  * against their causes, since this ledger derives status itself.
- * Re-importing a file is a no-op.
+ * Re-importing a file is a no-op. A TB, UV, ADDENDUM or RULING line's fields
+ * this version doesn't define are kept with the entry (its body's `extra`)
+ * and exported again as written; TRANSITIONs are derived, so theirs aren't.
  *
  * v1 lines (0.x: no schemaVersion, a `status` field) are still read; see
  * the spec's upgrade notes.
@@ -36,8 +38,17 @@
 import { z } from 'zod';
 import { canonicalize, sha256Hex } from './jcs.js';
 import { deriveStatus, deriveStruck, recordedStatus, type InboundLink } from './status.js';
-import { resolveIdentity, type SignerRegistry, type SignerRole } from './identity.js';
-import { INBOUND_LINKS, OUTBOUND_LINKS, type LedgerRecord, type NewEntry, type TruthLedger } from './ledger.js';
+import { agentClassifier, resolveIdentity, type SignerRegistry, type SignerRole } from './identity.js';
+import { checkQuorum, type AgentClassifier, type QuorumMember } from './quorum.js';
+import {
+  INBOUND_LINKS,
+  LINE_BODY_FIELDS,
+  LINE_ENVELOPE_FIELDS,
+  OUTBOUND_LINKS,
+  type LedgerRecord,
+  type NewEntry,
+  type TruthLedger,
+} from './ledger.js';
 import {
   EVIDENCE_KINDS,
   EvidenceSchema,
@@ -55,6 +66,7 @@ import {
   type LinkType,
   type TruthEntryType,
   type TruthLink,
+  type UvEntry,
 } from './types.js';
 
 export const WIKI_SCHEMA_VERSION = 2;
@@ -162,6 +174,11 @@ const Literal = z.unknown().superRefine((value, ctx) => {
     }
   }
 });
+/** A quorum member's shape (spec, Agent quorum): the rules across members and the line are checkQuorum's. */
+const QuorumMember = z
+  .object({ author: z.string(), agentSessionId: z.string(), ts: Timestamp, evidence: z.array(Evidence).min(1, 'a quorum member cites evidence') })
+  .passthrough();
+const AddendumQuorumMember = QuorumMember.extend({ verdict: z.enum(['verified', 'refuted']) });
 const XSteno = z
   .object({
     origin: Text.optional(),
@@ -192,6 +209,7 @@ const TbLine = z
     evidence: z.array(Evidence).min(1, 'a TB requires at least one piece of evidence'),
     signedBy: Identity.nullable(),
     literals: z.array(Literal).min(1, 'omit literals rather than send none').optional(),
+    quorum: z.array(QuorumMember).optional(),
     status: Text.optional(),
   })
   .passthrough();
@@ -214,6 +232,7 @@ const AddendumLine = z
     author: Identity,
     evidence: z.array(Evidence).min(1, 'an addendum requires at least one piece of evidence'),
     note: z.string().nullable(),
+    quorum: z.array(AddendumQuorumMember).optional(),
   })
   .passthrough();
 const RulingLine = z
@@ -286,6 +305,10 @@ const LineV2 = z
           issue(`${line.type === 'ADDENDUM' ? 'an' : 'a'} ${line.type} line lists only the links it writes`, ['x-steno', 'links', String(i)]);
         }
       }
+    }
+    // Agents settle only together: a quorum keeps rules 1–6, and appears only on a TB or an ADDENDUM
+    if ('quorum' in line) {
+      for (const message of checkQuorum(line as Parameters<typeof checkQuorum>[0])) issue(message, ['quorum']);
     }
   });
 
@@ -368,6 +391,8 @@ export function decodeWikiLine(text: string): DecodedWikiLine {
   const version = obj.schemaVersion;
   if (version === undefined || version === 1) {
     parseOrThrow(LineV1, obj);
+    // 0.x wrote no quorum; an agent's settlement is a v2 line
+    if ('quorum' in obj) throw new WikiLineError('a v1 line carries no quorum: agents settle claims together only on v2 lines');
     return { version: 1, type: obj.type as 'TB' | 'UV', line: obj, seq: null, prevHash: null, hash: null };
   }
   if (version !== 2) throw new WikiLineError(`schemaVersion ${JSON.stringify(version)} is not one this stenographer reads (1, 2)`);
@@ -502,13 +527,21 @@ function buildStream(ledger: TruthLedger): { lines: WikiLine[]; skipped: Array<{
     const steno = { origin: r.origin, provenance: r.provenance, agentSessionId: r.agentSessionId, targetRef: r.targetRef, links: r.links, ledgerHash: r.hash };
     const envelope = { id: r.id, type: r.type, ts: r.createdAt, author: r.author };
     const b = r.body;
+    // The fields a newer writer's line carried, as it wrote them (admission keeps them off the line's own)
+    const extra = (b.extra ?? {}) as Record<string, unknown>;
     if (r.type === 'TB' || r.type === 'UV') {
       const status = wikiStatus(derived.get(r.id)!);
       const body =
         r.type === 'TB'
-          ? { claim: b.claim, evidence: b.evidence, signedBy: b.signedBy, ...(b.literals !== undefined ? { literals: b.literals } : {}) }
+          ? {
+              claim: b.claim,
+              evidence: b.evidence,
+              signedBy: b.signedBy,
+              ...(b.literals !== undefined ? { literals: b.literals } : {}),
+              ...(b.quorum !== undefined ? { quorum: b.quorum } : {}),
+            }
           : { assertion: b.assertion, basis: b.basis, verifyBy: b.verifyBy, contests: b.contests ?? null };
-      if (emit({ ...envelope, ...body, status, 'x-steno': steno }, r.id)) {
+      if (emit({ ...envelope, ...body, status, ...extra, 'x-steno': steno }, r.id)) {
         stated.set(r.id, status);
         written.add(r.id);
       }
@@ -516,8 +549,11 @@ function buildStream(ledger: TruthLedger): { lines: WikiLine[]; skipped: Array<{
       (r.type === 'ADDENDUM' || r.type === 'RULING') &&
       r.links.some((l) => STATUS_LINKS.includes(l.type) && (types.get(l.toId) === 'TB' || types.get(l.toId) === 'UV'))
     ) {
-      const body = r.type === 'ADDENDUM' ? { evidence: b.evidence, note: b.note ?? null } : { kind: b.kind, opinion: b.opinion, target: b.target };
-      if (emit({ ...envelope, ...body, 'x-steno': steno }, r.id)) written.add(r.id);
+      const body =
+        r.type === 'ADDENDUM'
+          ? { evidence: b.evidence, note: b.note ?? null, ...(b.quorum !== undefined ? { quorum: b.quorum } : {}) }
+          : { kind: b.kind, opinion: b.opinion, target: b.target };
+      if (emit({ ...envelope, ...body, ...extra, 'x-steno': steno }, r.id)) written.add(r.id);
     }
 
     // Every exported TB or UV whose status this entry changed gets a
@@ -592,7 +628,7 @@ export interface ImportOptions {
   embeddings?: ReadonlyMap<string, number[]>;
 }
 
-export type ReconciliationReason = 'unsigned' | 'unverifiable' | 'unknown-status' | 'unknown-value' | 'conflict';
+export type ReconciliationReason = 'unsigned' | 'unverifiable' | 'agent-without-quorum' | 'unknown-status' | 'unknown-value' | 'conflict';
 
 export interface ImportResult {
   /** False when any line failed: the file was rolled back, nothing was written, and `errors` says why. */
@@ -676,6 +712,9 @@ function applyLine(
   const line = d.line;
   const id = line.id as string;
   const signers = options.signers ?? null;
+  // Fail closed: an agent by this ledger's classifier or by the registry's say
+  const registry = signers ? agentClassifier(signers) : null;
+  const isAgent: AgentClassifier = (identity) => ledger.isAgent(identity) || Boolean(registry?.(identity));
 
   switch (d.type) {
     case 'PROPOSAL':
@@ -703,7 +742,7 @@ function applyLine(
         result.held.push({ line: lineNo, id, reason: change.unknown });
         return;
       }
-      const distrust = ledger.getEntry(id) ? null : changeDistrust(ledger, change.entry, change.links, signers);
+      const distrust = ledger.getEntry(id) ? null : changeDistrust(ledger, change.entry, change.links, signers, isAgent);
       if (distrust) {
         result.held.push({ line: lineNo, id, reason: distrust });
         return;
@@ -719,7 +758,7 @@ function applyLine(
     case 'UV': {
       const entry = entryOf(d);
       // An entry already held is compared, never re-routed: the same is a no-op, a different one a conflict
-      const route = entry.route ?? (ledger.getEntry(id) ? null : entryRoute(d, entry.entry, signers));
+      const route = entry.route ?? (ledger.getEntry(id) ? null : entryRoute(d, entry.entry, signers, isAgent));
       if (route) {
         reconcile(ledger, lineNo, d, entry.entry, route.reason, route.detail, options, result);
         return;
@@ -745,13 +784,20 @@ interface EntryOf {
 
 type Route = { reason: ReconciliationReason; detail: string };
 
-/** The first value in a v2 line this stenographer has no meaning for, if any. */
+/**
+ * The first value in a v2 line this stenographer has no meaning for, if any.
+ * Each field is read only on the line types that define it: on any other,
+ * a field of that name is a newer writer's unknown field, kept as written
+ * (Importing rule 10), whatever it holds.
+ */
 function unknownValue(line: Record<string, unknown>): string | null {
   const x = (line['x-steno'] ?? {}) as { origin?: string; provenance?: { kind: string }; links?: Array<{ type: string }> };
-  for (const e of (line.evidence ?? []) as Array<{ kind: string }>) {
-    if (!(EVIDENCE_KINDS as readonly string[]).includes(e.kind)) return `evidence kind '${e.kind}'`;
+  if ((line.type === 'TB' || line.type === 'ADDENDUM') && Array.isArray(line.evidence)) {
+    for (const e of line.evidence as Array<{ kind: string }>) {
+      if (!(EVIDENCE_KINDS as readonly string[]).includes(e.kind)) return `evidence kind '${e.kind}'`;
+    }
   }
-  const verifyBy = line.verifyBy as { kind: string } | undefined;
+  const verifyBy = line.type === 'UV' ? (line.verifyBy as { kind: string }) : undefined;
   if (verifyBy && !(VerifyBySchema.shape.kind.options as readonly string[]).includes(verifyBy.kind)) {
     return `verifyBy kind '${verifyBy.kind}'`;
   }
@@ -761,6 +807,17 @@ function unknownValue(line: Record<string, unknown>): string | null {
   for (const l of x.links ?? []) if (!(LINK_TYPES as readonly string[]).includes(l.type)) return `link type '${l.type}'`;
   if (line.type === 'RULING' && !RULING_KINDS.includes(line.kind as string)) return `ruling kind '${line.kind}'`;
   return null;
+}
+
+/**
+ * A line's top-level fields that this version doesn't define for its type,
+ * kept for the entry's body (`extra`) so the export writes them back as they
+ * came. `x-steno` is this ledger's own record, and is written afresh.
+ */
+function extraOf(line: Record<string, unknown>, type: keyof typeof LINE_BODY_FIELDS): { extra?: Record<string, unknown> } {
+  const unknown = Object.entries(line).filter(([key]) => !LINE_ENVELOPE_FIELDS.includes(key) && !LINE_BODY_FIELDS[type].includes(key));
+  // fromEntries defines each key as an own field, so even a `__proto__` field stays one
+  return unknown.length > 0 ? { extra: Object.fromEntries(unknown) } : {};
 }
 
 /** The ledger entry a TB or UV line describes, and why it can't be admitted as truth, if it can't. */
@@ -795,8 +852,16 @@ function entryOf(d: DecodedWikiLine): EntryOf {
   const floor = status && TERMINAL.has(status) ? { status } : {};
   const body =
     type === 'TB'
-      ? { claim: line.claim, evidence: line.evidence, signedBy: line.signedBy, ...(line.literals !== undefined ? { literals: line.literals } : {}), ...floor }
-      : { assertion: line.assertion, basis: line.basis, verifyBy: line.verifyBy, contests: line.contests, ...floor };
+      ? {
+          claim: line.claim,
+          evidence: line.evidence,
+          signedBy: line.signedBy,
+          ...(line.literals !== undefined ? { literals: line.literals } : {}),
+          ...(line.quorum !== undefined ? { quorum: line.quorum } : {}),
+          ...floor,
+          ...extraOf(line, type),
+        }
+      : { assertion: line.assertion, basis: line.basis, verifyBy: line.verifyBy, contests: line.contests, ...floor, ...extraOf(line, type) };
   return {
     entry: {
       id,
@@ -830,11 +895,12 @@ function entryOfV1(line: Record<string, unknown>, type: 'TB' | 'UV'): EntryOf {
       evidence: tb.evidence,
       signedBy: tb.signedBy ? canonicalIdentity(tb.signedBy) : null,
       ...(tb.literals && tb.literals.length > 0 ? { literals: tb.literals } : {}),
+      ...extraOf(line, type),
     };
   } else {
     const uv = parseOrThrow(UvBodyV1, line);
     author = canonicalIdentity(uv.author);
-    body = { assertion: uv.assertion, basis: uv.basis, verifyBy: uv.verifyBy, contests: uv.contests ?? null };
+    body = { assertion: uv.assertion, basis: uv.basis, verifyBy: uv.verifyBy, contests: uv.contests ?? null, ...extraOf(line, type) };
   }
 
   // Fail closed on a status a v1 line couldn't have meant; keep a terminal one as a floor
@@ -878,26 +944,31 @@ function changeOf(d: DecodedWikiLine): { entry: NewEntry; links: TruthLink[] } |
   const unknown = unknownValue(line);
   if (unknown) return { unknown: `it has ${unknown}, which this stenographer doesn't know` };
   const x = (line['x-steno'] ?? {}) as { provenance?: NewEntry['provenance']; agentSessionId?: string | null; links?: TruthLink[] };
-  if (!x.links) return { unknown: 'it lists no links (x-steno.links), so what it changes is unknown' };
+  // No links, or an empty list: either way the line says nothing it changes
+  if (!x.links || x.links.length === 0) return { unknown: 'it lists no links (x-steno.links), so what it changes is unknown' };
   const id = line.id as string;
+  const type = d.type as 'ADDENDUM' | 'RULING';
   return {
     entry: {
       id,
-      type: d.type as 'ADDENDUM' | 'RULING',
+      type,
       createdAt: line.ts as string,
       author: line.author as string,
       provenance: x.provenance ?? { kind: 'wiki', ref: id },
       agentSessionId: x.agentSessionId ?? null,
       origin: 'wiki',
-      body: d.type === 'ADDENDUM' ? { evidence: line.evidence, note: line.note } : { kind: line.kind, opinion: line.opinion, target: line.target },
+      body:
+        type === 'ADDENDUM'
+          ? { evidence: line.evidence, note: line.note, ...(line.quorum !== undefined ? { quorum: line.quorum } : {}), ...extraOf(line, type) }
+          : { kind: line.kind, opinion: line.opinion, target: line.target, ...extraOf(line, type) },
     },
     links: x.links.map((l) => ({ fromId: l.fromId, toId: l.toId, type: l.type })),
   };
 }
 
 /** Why a TB or UV line can't land as truth here, if it can't. */
-function entryRoute(d: DecodedWikiLine, entry: NewEntry, signers: SignerRegistry | null): Route | null {
-  const body = entry.body as { signedBy?: string | null };
+function entryRoute(d: DecodedWikiLine, entry: NewEntry, signers: SignerRegistry | null, isAgent: AgentClassifier): Route | null {
+  const body = entry.body as { signedBy?: string | null; quorum?: QuorumMember[] };
   if (entry.type === 'TB') {
     if (!body.signedBy) return { reason: 'unsigned', detail: `wiki TB ${entry.id} has no signer` };
     if (d.version === 1) {
@@ -911,13 +982,26 @@ function entryRoute(d: DecodedWikiLine, entry: NewEntry, signers: SignerRegistry
   } catch (err) {
     return { reason: 'unverifiable', detail: `wiki ${entry.type} ${entry.id}: ${messageOf(err)}` };
   }
+  // Agents settle only together: an agent's TB is truth only with a quorum of agents (the codec checked its rules)
+  if (entry.type === 'TB' && isAgent(body.signedBy!)) {
+    const why = !body.quorum ? 'no quorum' : nonAgentMember(body.quorum, signers, isAgent);
+    if (why) {
+      return {
+        reason: 'agent-without-quorum',
+        detail:
+          `wiki TB ${entry.id} is signed by agent ${body.signedBy} with ${why === 'no quorum' ? 'no quorum' : `a quorum that isn't all agents (${why})`}: ` +
+          'agents settle a claim only as two or more agent sessions agreeing from different angles within 15 minutes, or a person signs it',
+      };
+    }
+  }
   return null;
 }
 
 /**
  * Why an ADDENDUM or RULING can't be applied here, if it can't. An
  * override, a strike or any ruling is a person's act on live paths, so its
- * author must be one; a resolution may come from an agent.
+ * author must be one; a resolution may come from an agent, with a quorum of
+ * agents (each member's contempt check is importChange's).
  *
  * A line's hash shows it is unchanged, not who wrote it: anyone can write a
  * one-line stream. So without a signer registry to say who the people are,
@@ -929,13 +1013,43 @@ function changeDistrust(
   ledger: TruthLedger,
   entry: NewEntry,
   links: TruthLink[],
-  signers: SignerRegistry | null
+  signers: SignerRegistry | null,
+  isAgent: AgentClassifier
 ): string | null {
   const judicial = entry.type === 'RULING' || links.some((l) => l.type === 'overrides' || l.type === 'strikes');
   try {
     resolveIdentity(entry.author, judicial ? ['human'] : ['human', 'agent'], 'author', signers);
   } catch (err) {
     return messageOf(err);
+  }
+  // Agents settle only together, and never override, strike or rule (spec, Agent quorum)
+  if (isAgent(entry.author)) {
+    if (judicial) {
+      return `${entry.type === 'RULING' ? 'a ruling' : 'an override'} is a person's act, and ${entry.author} is an agent`;
+    }
+    if (links.some((l) => l.type === 'verifies' || l.type === 'refutes')) {
+      const quorum = (entry.body as { quorum?: QuorumMember[] }).quorum;
+      if (!quorum) {
+        return (
+          `${entry.author}'s resolution applies only with a quorum: two or more agent sessions agreeing from different ` +
+          'angles within 15 minutes'
+        );
+      }
+      const person = nonAgentMember(quorum, signers, isAgent);
+      if (person) return `${entry.author}'s resolution has a quorum that isn't all agents: ${person}`;
+      // Verifying a contest would override its TB: a person's act, whatever the agents agree
+      for (const link of links) {
+        if (link.type !== 'verifies' || link.fromId !== entry.id) continue;
+        const uv = ledger.getEntry(link.toId);
+        const contested = uv?.type === 'UV' ? (uv as UvEntry).body.contests : null;
+        if (contested) {
+          return (
+            `${entry.author}'s quorum verifies UV ${link.toId}, which contests TB ${contested}: verifying it would override TB ` +
+            `${contested}, which agents never do, together or alone — a person does`
+          );
+        }
+      }
+    }
   }
   if (judicial && !signers) {
     const target = (entry.body as { target?: unknown }).target;
@@ -950,6 +1064,27 @@ function changeDistrust(
         `a ${entry.type === 'RULING' ? 'ruling' : 'override'} from the wiki changes ${local}, which this ledger made itself: ` +
         'that applies only from a person a signer registry lists, and none is configured'
       );
+    }
+  }
+  return null;
+}
+
+/**
+ * Why a quorum isn't all agents, if it isn't: the first member who is not
+ * one. With a signer registry, an agent is an identity it lists with role
+ * `agent` (the spec's definition): an unlisted `agent:` name is no witness.
+ * Without one, the classifier says (the `agent:` prefix).
+ */
+function nonAgentMember(quorum: QuorumMember[], signers: SignerRegistry | null, isAgent: AgentClassifier): string | null {
+  for (const m of quorum) {
+    if (signers) {
+      try {
+        resolveIdentity(m.author, ['agent'], 'quorum member', signers);
+      } catch (err) {
+        return `quorum member ${m.author} is not an agent (${messageOf(err)})`;
+      }
+    } else if (!isAgent(m.author)) {
+      return `quorum member ${m.author} is not an agent`;
     }
   }
   return null;

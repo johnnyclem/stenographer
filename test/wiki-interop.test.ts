@@ -301,6 +301,52 @@ describe('STENO-T-03: import runs the write-time invariants', () => {
     expect(store.truth.verify()).toMatchObject({ ok: true, entries: 0 });
   });
 
+  it('keeps the unknown fields of an imported line in the body\'s `extra`, which can never name a field the line defines', () => {
+    const entry = {
+      id: '01EXTRATB00000000000000000',
+      type: 'TB' as const,
+      createdAt: '2026-01-15T00:00:00Z',
+      author: 'kim',
+      provenance: { kind: 'wiki' as const },
+      agentSessionId: null,
+      origin: 'wiki' as const,
+      body: { claim: 'c', evidence: [{ kind: 'commit', ref: 'a1' }], signedBy: 'kim', extra: { reviewers: ['sam'] } },
+    };
+    expect(store.truth.importEntry(entry, [])).toBe('inserted');
+    expect(store.truth.getEntry(entry.id)!.body).toMatchObject({ extra: { reviewers: ['sam'] } });
+    // The envelope, x-steno and the type's own fields are the line's, never extra: the export would write them twice
+    for (const key of ['schemaVersion', 'seq', 'id', 'type', 'ts', 'author', 'prevHash', 'hash', 'x-steno', 'claim', 'evidence', 'signedBy', 'literals', 'status']) {
+      const id = `01EXTRAKEY-${key}`;
+      expect(() => store.truth.importEntry({ ...entry, id, body: { ...entry.body, extra: { [key]: 'x' } } }, []), key).toThrow(/extra/);
+    }
+    const uv = { ...entry, id: '01EXTRAUV00000000000000000', type: 'UV' as const, body: { assertion: 'a', basis: 'b', verifyBy: { kind: 'ask', value: 'ops' }, contests: null } };
+    for (const key of ['assertion', 'basis', 'verifyBy', 'contests', 'status']) {
+      expect(() => store.truth.importEntry({ ...uv, body: { ...uv.body, extra: { [key]: 'x' } } }, []), key).toThrow(/extra/);
+    }
+    // ...and a field another type defines is just an unknown field here
+    expect(store.truth.importEntry({ ...uv, body: { ...uv.body, extra: { claim: 'x', note: null } } }, [])).toBe('inserted');
+    expect(() => store.truth.importEntry({ ...entry, id: '01EXTRATB0000000000000000Z', body: { ...entry.body, extra: ['x'] } }, [])).toThrow(/extra/);
+    expect(store.truth.verify().ok).toBe(true);
+  });
+
+  it('a TB line citing a chat, a ticket or a doc lands as truth: those are kinds it knows', () => {
+    for (const [i, kind] of ['chat', 'ticket', 'doc'].entries()) {
+      const id = `01WIKIKIND0000000000000000`.slice(0, -1) + i;
+      const line = streamLine({
+        id,
+        type: 'TB',
+        ts: '2026-01-15T00:00:00Z',
+        author: 'kim',
+        claim: `The cron box was retired (${kind})`,
+        evidence: [{ kind, ref: `${kind}-ref` }],
+        signedBy: 'kim',
+        status: 'active',
+      });
+      expect(importWikiEntries(store.truth, { lines: [line] }, { signers: TEAM }), kind).toMatchObject({ committed: true, inserted: 1, proposals: [] });
+      expect(status(store.truth, id), kind).toBe('active');
+    }
+  });
+
   it('a hashed line edited after export is refused', () => {
     const origin = new StateStore(':memory:');
     seedLedger(origin.truth);
