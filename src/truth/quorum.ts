@@ -21,8 +21,9 @@
  *   4. At the same time: the members' and the line's timestamps lie within
  *      15 minutes of each other, read to the millisecond.
  *   5. Agreeing: an ADDENDUM's members agree, and carry the verdict each
- *      of its resolution links applies, and a quorum never overrides. A TB
- *      carries the literals its members agreed on. (That the members
+ *      of its resolution links applies (those its `x-steno.links` lists: a
+ *      top-level `links` is an unknown field), and a quorum never overrides.
+ *      A TB carries the literals its members agreed on. (That the members
  *      drafted those literals is the writer's obligation: no reader sees
  *      the drafts.)
  *   6. The line shows its evidence: the members' items, and no others.
@@ -152,7 +153,13 @@ function identityIssue(identity: string): string | null {
   return null;
 }
 
-/** What checkQuorum reads: a wiki line (links from `x-steno.links`), or an entry about to be appended. */
+/**
+ * What `checkQuorum` reads: a wiki line, or an entry about to be appended
+ * (the ledger gives its own links as `x-steno.links`). Any parsed line
+ * object will do: it reads the fields below and no others, so a field this
+ * version doesn't define never hides a rule or triggers one, a top-level
+ * `links` among them (spec: Unknown values).
+ */
 export interface QuorumSubject {
   type: unknown;
   id?: unknown;
@@ -163,8 +170,10 @@ export interface QuorumSubject {
   signedBy?: unknown;
   /** A TB's literals: a quorum TB carries the ones its members agreed on. */
   literals?: unknown;
-  /** The links the line writes. Omitted: read from `x-steno.links` (those starting at `id`); absent there too, unknown. */
-  links?: ReadonlyArray<{ type: string; fromId?: string }> | null;
+  /**
+   * Where an ADDENDUM's links are read (rule 5): `x-steno.links`, those
+   * starting at `id`. Absent, or no list there: the line lists no link.
+   */
   'x-steno'?: unknown;
 }
 
@@ -175,11 +184,18 @@ function isEvidenceList(value: unknown): value is Array<{ kind: string; ref: str
   );
 }
 
-function linksOf(subject: QuorumSubject): ReadonlyArray<{ type: string }> | null {
-  if (subject.links !== undefined) return subject.links;
+/**
+ * The links an ADDENDUM writes, as rule 5 reads them: the ones its
+ * `x-steno.links` lists starting at its `id` (spec: Agent quorum, "on an
+ * ADDENDUM, rule 5 reads the links in `x-steno.links`"). Nothing else on the
+ * line: a top-level `links` is a field this version doesn't define.
+ */
+function linksOf(subject: QuorumSubject): ReadonlyArray<{ type: unknown }> {
   const x = subject['x-steno'] as { links?: unknown } | undefined;
-  if (!x || !Array.isArray(x.links)) return null;
-  return (x.links as Array<{ type: string; fromId?: string }>).filter((l) => l && typeof l === 'object' && l.fromId === subject.id);
+  if (!x || typeof x !== 'object' || !Array.isArray(x.links)) return [];
+  return (x.links as unknown[]).filter(
+    (l): l is { type: unknown; fromId: unknown } => !!l && typeof l === 'object' && (l as { fromId?: unknown }).fromId === subject.id
+  );
 }
 
 /**
@@ -276,9 +292,9 @@ export function checkQuorum(subject: QuorumSubject): string[] {
   }
 
   // Rule 5: agreeing. An ADDENDUM's verdicts agree, with each other and with
-  // the links it lists (one that lists no resolution link, or only types this
-  // version doesn't know, is checked for agreeing verdicts only); a TB
-  // carries the literals its members agreed on
+  // the links its x-steno.links lists (one that lists no resolution link, or
+  // only types this version doesn't know, is checked for agreeing verdicts
+  // only); a TB carries the literals its members agreed on
   if (subject.type === 'TB' && (!Array.isArray(subject.literals) || subject.literals.length === 0)) {
     issues.push('a quorum TB carries the literals its members agreed on (literals, at least one) (rule 5)');
   }
@@ -286,18 +302,16 @@ export function checkQuorum(subject: QuorumSubject): string[] {
     const verdicts = new Set(members.map((m) => m.verdict));
     if (verdicts.size > 1) issues.push(`the quorum's members disagree: ${[...verdicts].join(' and ')} (rule 5)`);
     const links = linksOf(subject);
-    if (links) {
-      if (links.some((l) => l.type === 'overrides')) {
-        issues.push('a quorum ADDENDUM never overrides a TB: overriding is a person\'s act (rule 5)');
-      }
-      const resolutions = links.filter((l) => Object.hasOwn(VERDICT_OF, l.type));
-      for (const link of resolutions) {
-        members.forEach((m, i) => {
-          if (m.verdict !== VERDICT_OF[link.type]) {
-            issues.push(`quorum member ${i + 1}'s verdict ${m.verdict} is not the one its line's ${link.type} link applies (${VERDICT_OF[link.type]}) (rule 5)`);
-          }
-        });
-      }
+    if (links.some((l) => l.type === 'overrides')) {
+      issues.push('a quorum ADDENDUM never overrides a TB: overriding is a person\'s act (rule 5)');
+    }
+    for (const type of links.map((l) => l.type)) {
+      if (typeof type !== 'string' || !Object.hasOwn(VERDICT_OF, type)) continue;
+      members.forEach((m, i) => {
+        if (m.verdict !== VERDICT_OF[type]) {
+          issues.push(`quorum member ${i + 1}'s verdict ${m.verdict} is not the one its line's ${type} link applies (${VERDICT_OF[type]}) (rule 5)`);
+        }
+      });
     }
   }
 

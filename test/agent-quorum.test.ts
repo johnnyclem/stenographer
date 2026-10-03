@@ -55,15 +55,18 @@ describe('checkQuorum: the rules a line with a quorum must keep', () => {
   });
   const second = (over: Partial<QuorumMember> = {}) =>
     member({ agentSessionId: 'sess-b', ts: at(5 * MIN), evidence: [{ kind: 'file', ref: 'config.ts:3' }], ...over });
+  // An ADDENDUM's links are the ones its x-steno.links lists starting at its id
+  const linked = (...types: string[]) => ({ 'x-steno': { links: types.map((type, i) => ({ fromId: 'ADD1', toId: `UV${i + 1}`, type })) } });
   const addendum = (over: Record<string, unknown> = {}) => {
     const quorum = (over.quorum as QuorumMember[] | undefined) ?? [member(), second()];
     return {
       type: 'ADDENDUM',
+      id: 'ADD1',
       author: AGENT,
       ts: at(5 * MIN),
       evidence: quorum.flatMap((m) => m.evidence),
       quorum,
-      links: [{ type: 'verifies' }],
+      ...linked('verifies'),
       ...over,
     };
   };
@@ -186,15 +189,25 @@ describe('checkQuorum: the rules a line with a quorum must keep', () => {
 
   it('rule 5: agreeing — every verdict is the one the link applies, and a quorum never overrides', () => {
     expect(checkQuorum(addendum({ quorum: [member(), second({ verdict: 'refuted' })] })).join()).toMatch(/verdict refuted.*verifies.*rule 5/);
-    expect(checkQuorum(addendum({ links: [{ type: 'refutes' }] })).join()).toMatch(/rule 5/);
-    expect(checkQuorum(addendum({ links: [{ type: 'verifies' }, { type: 'overrides' }] })).join()).toMatch(/never overrides.*rule 5/);
-    // A line that lists no resolution link (none at all, an empty list, or only types the reader doesn't know)
-    // is checked for agreeing verdicts only
-    for (const links of [undefined, [], [{ type: 'corroborates' }]]) {
-      const subject = { ...addendum(), links: links ?? null };
-      expect(checkQuorum(subject), JSON.stringify(links)).toEqual([]);
-      expect(checkQuorum({ ...subject, quorum: [member(), second({ verdict: 'refuted' })] }).join(), JSON.stringify(links)).toMatch(/disagree.*rule 5/);
+    expect(checkQuorum(addendum(linked('refutes'))).join()).toMatch(/rule 5/);
+    expect(checkQuorum(addendum(linked('verifies', 'overrides'))).join()).toMatch(/never overrides.*rule 5/);
+    // A line that lists no resolution link (no x-steno.links, an empty list, or only types the reader doesn't
+    // know) is checked for agreeing verdicts only
+    for (const xSteno of [undefined, {}, { links: [] }, linked('corroborates')['x-steno']]) {
+      const subject = { ...addendum(), 'x-steno': xSteno };
+      expect(checkQuorum(subject), JSON.stringify(xSteno)).toEqual([]);
+      expect(checkQuorum({ ...subject, quorum: [member(), second({ verdict: 'refuted' })] }).join(), JSON.stringify(xSteno)).toMatch(/disagree.*rule 5/);
     }
+  });
+
+  it("rule 5 reads an ADDENDUM's links from x-steno.links: those it writes", () => {
+    const line = addendum({ quorum: [member({ verdict: 'refuted' }), second({ verdict: 'refuted' })] });
+    const refutes = { ...line, 'x-steno': { links: [{ fromId: 'ADD1', toId: 'UV1', type: 'refutes' }] } };
+    expect(checkQuorum(refutes)).toEqual([]);
+    const verifies = { ...refutes, 'x-steno': { links: [{ fromId: 'ADD1', toId: 'UV1', type: 'verifies' }] } };
+    expect(checkQuorum(verifies).join()).toMatch(/verdict refuted.*verifies.*rule 5/);
+    // A link that starts at another entry is not one this line writes
+    expect(checkQuorum({ ...refutes, 'x-steno': { links: [{ fromId: 'ADD2', toId: 'UV1', type: 'verifies' }] } })).toEqual([]);
   });
 
   it('rule 5: a quorum TB carries the literals its members agreed on (at least one)', () => {
@@ -1322,5 +1335,105 @@ describe('wiki import: agent lines land only with a valid quorum of agents', () 
     expect(() => decodeWikiLine(stream([noLiterals])[0])).toThrow(/literals.*rule 5/);
     const v1 = { id: '01J9V1TB000000000000000000', type: 'TB', ts: at(0), author: 'johnnyclem', claim: 'x is dead', evidence: [COMMIT], signedBy: 'johnnyclem', quorum: noLiterals.quorum };
     expect(() => decodeWikiLine(JSON.stringify(v1))).toThrow(/v1 line carries no quorum/);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
+// Rule 5 reads x-steno.links: a line's top-level `links` is an unknown field
+// ─────────────────────────────────────────────────────────────
+
+describe("rule 5 reads an ADDENDUM's x-steno.links: a top-level links field is an unknown field (spec: Agent quorum, Unknown values)", () => {
+  // The lines a three-way differential test found this codec (and short-hand's) reading wrongly, against
+  // smallchat-swift and the spec, as it wrote them (cases 79, 163, 80, 164 and 81), and the UV they resolve.
+  // Each is correctly hashed, so a reader that refuses one refuses it for its quorum. checkQuorum read a
+  // top-level `links` in place of x-steno.links: null or [] hid a rule 5 break, a list refused a line that
+  // keeps rule 5, and a string threw a TypeError out of the codec
+  const UV1 =
+    '{"schemaVersion":2,"seq":1,"id":"UV-1","type":"UV","ts":"2026-09-01T09:00:00.000Z","author":"kim","assertion":"The search cache expires after 10 minutes.","basis":"The config file says so.","verifyBy":{"kind":"inspect","value":"src/cache.ts"},"contests":null,"status":"open","x-steno":{"origin":"local","provenance":{"kind":"manual"},"agentSessionId":null,"targetRef":null,"links":[]},"prevHash":null,"hash":"344b076227661a908303fa05a0a6100f8101a1b88812ef2e7a01c0f30761c9af"}';
+  const probe = (links: unknown, verdict: 'verified' | 'refuted', resolution: 'verifies' | 'refutes', hash: string) =>
+    JSON.stringify({
+      schemaVersion: 2,
+      seq: 1,
+      id: 'ADQ',
+      type: 'ADDENDUM',
+      ts: '2026-09-01T10:14:00.000Z',
+      author: 'agent:codex',
+      evidence: [
+        { kind: 'commit', ref: 'c4fe0b1' },
+        { kind: 'file', ref: 'src/api/search.ts:1' },
+      ],
+      note: null,
+      quorum: [
+        { author: 'agent:claude-code', agentSessionId: 'sess_a', ts: '2026-09-01T10:13:00.000Z', evidence: [{ kind: 'commit', ref: 'c4fe0b1' }], verdict },
+        { author: 'agent:codex', agentSessionId: 'sess_b', ts: '2026-09-01T10:14:00.000Z', evidence: [{ kind: 'file', ref: 'src/api/search.ts:1' }], verdict },
+      ],
+      links,
+      'x-steno': { origin: 'local', provenance: { kind: 'manual' }, agentSessionId: 'sess_b', targetRef: null, links: [{ fromId: 'ADQ', toId: 'UV-1', type: resolution }] },
+      prevHash: null,
+      hash,
+    });
+  const parse = (l: string) => JSON.parse(l) as Record<string, any>;
+  // Both members say verified, and the line's x-steno link refutes UV-1: rule 5 is broken, whatever links says
+  const HIDDEN = [
+    ['79', probe(null, 'verified', 'refutes', '9b470f9b4ebd01d35f371b48f8b80ca278830aa01e98deb9b8c9ece3a9361cb1')],
+    ['163', probe([], 'verified', 'refutes', '8237234f86768b859133c6e44851ef3a1d0ff68b06d99265f02ca4856e6d8110')],
+  ] as const;
+  // The verdicts are the ones the line's x-steno links apply: rule 5 is kept, whatever links holds
+  const KEPT = [
+    ['80', probe([{ type: 'overrides' }], 'verified', 'verifies', '64c385fd3b2b076132f836daf923e942defd62877f76b1225181b3ca1f2f3f26'), 'verified'],
+    ['164', probe([{ fromId: 'ADQ', toId: 'UV-1', type: 'verifies' }], 'refuted', 'refutes', 'ab56c7e44d916541035ec0e5f6b239784b4c40eafa2fb66cf4e4de138e57c5f4'), 'refuted'],
+    ['81', probe('corroborates', 'verified', 'verifies', '3278f0e12b68aca9ecabfc55bb81846af2ab5f77be87dd5c6bca35dea90ebb68'), 'verified'],
+  ] as const;
+  /** UV-1 imported on its own, then the probe on its own, into a fresh ledger: as the differential test did. */
+  const afterUv1 = (line: string) => {
+    const ledger = new TruthLedger(new Database(':memory:'));
+    expect(importWikiEntries(ledger, { lines: [UV1] })).toMatchObject({ committed: true, inserted: 1 });
+    return { ledger, result: importWikiEntries(ledger, { lines: [line] }) };
+  };
+  const RULE_5 = (n: number) => new RegExp(`quorum member ${n}'s verdict verified is not the one its line's refutes link applies \\(refuted\\) \\(rule 5\\)`);
+
+  it('the lines are the differential test\'s, correctly hashed', () => {
+    for (const [name, line] of [['UV-1', UV1], ...HIDDEN, ...KEPT]) expect(wikiLineHash(line), name).toBe(parse(line).hash);
+  });
+
+  it('refuses a quorum ADDENDUM whose verdicts break rule 5 against its x-steno links, whatever a links field says', () => {
+    for (const [name, line] of HIDDEN) {
+      expect(() => decodeWikiLine(line), name).toThrow(RULE_5(1));
+      expect(() => decodeWikiLine(line), name).toThrow(RULE_5(2));
+      // The import refuses the line for the same reason (it had decoded it, and only the ledger's admission refused it)
+      const { ledger, result } = afterUv1(line);
+      expect(result.committed, name).toBe(false);
+      expect(result.errors.map((e) => e.error).join(), name).toMatch(RULE_5(1));
+      expect((ledger.getEntry('UV-1') as UvEntry).body.status, name).toBe('open');
+    }
+  });
+
+  it('reads a quorum ADDENDUM that keeps rule 5 against its x-steno links, whatever a links field holds, and applies it', () => {
+    for (const [name, line, status] of KEPT) {
+      expect(decodeWikiLine(line), name).toMatchObject({ version: 2, type: 'ADDENDUM' });
+      const { ledger, result } = afterUv1(line);
+      expect(result, name).toMatchObject({ committed: true, inserted: 1, errors: [], proposals: [], held: [] });
+      expect((ledger.getEntry('UV-1') as UvEntry).body.status, name).toBe(status);
+      // The unknown field is kept with the entry, and exported again verbatim
+      const exported = exportWikiEntries(ledger).lines.map(parse).find((l) => l.id === 'ADQ')!;
+      expect(exported.links, name).toEqual(parse(line).links);
+    }
+  });
+
+  it("checkQuorum(line) reads the line's x-steno links, never its links field, and never throws on one", () => {
+    for (const [name, line] of HIDDEN) expect(checkQuorum(parse(line)).join(), name).toMatch(RULE_5(1));
+    for (const [name, line] of KEPT) expect(checkQuorum(parse(line)), name).toEqual([]);
+    // Any value a newer writer might put there, on an otherwise valid line
+    const line = parse(KEPT[0][1]);
+    for (const links of [null, [], 'corroborates', 7, true, {}, { type: 'overrides' }, [{ type: 'overrides' }], [{ type: 'refutes' }], [null], [7]]) {
+      const what = JSON.stringify(links);
+      expect(() => checkQuorum({ ...line, links }), what).not.toThrow();
+      expect(checkQuorum({ ...line, links }), what).toEqual([]);
+      const { hash: _h, ...rest } = { ...line, links };
+      expect(decodeWikiLine(JSON.stringify({ ...rest, hash: wikiLineHash(rest) })), what).toMatchObject({ version: 2, type: 'ADDENDUM' });
+      // ...and rule 5 still reads the x-steno links beside it
+      const refutes = { ...rest, 'x-steno': { ...line['x-steno'], links: [{ fromId: 'ADQ', toId: 'UV-1', type: 'refutes' }] } };
+      expect(() => decodeWikiLine(JSON.stringify({ ...refutes, hash: wikiLineHash(refutes) })), what).toThrow(RULE_5(1));
+    }
   });
 });

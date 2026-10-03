@@ -747,15 +747,17 @@ export class TruthLedger {
     const body = entry.body as { signedBy?: unknown; evidence?: unknown; quorum?: QuorumMember[]; kind?: unknown; literals?: unknown };
     const own = links.filter((l) => l.fromId === entry.id);
     if ((entry.type === 'TB' || entry.type === 'ADDENDUM') && body.quorum !== undefined) {
+      // Rule 5 reads the entry's own links where a line lists them: x-steno.links
       const issues = checkQuorum({
         type: entry.type,
+        id: entry.id,
         author: entry.author,
         ts: entry.createdAt,
         evidence: body.evidence,
         signedBy: body.signedBy,
         literals: body.literals,
         quorum: body.quorum,
-        links: own,
+        'x-steno': { links: own },
       });
       if (issues.length > 0) fail(issues.join('; '));
       // An agent's settlement rests on agents only: a person's draft or verdict is not a second agent witness

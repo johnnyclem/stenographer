@@ -453,6 +453,10 @@ function buildFixtures(): Map<string, string> {
       (({ schemaVersion: _v, seq: _s, prevHash: _p, hash: _h, status: _st, quorum, ...tb }) => ({ ...tb, status: 'active', quorum }))(quorumTb),
       'a v1 line (no schemaVersion) carrying a quorum: agents settle together only on v2 lines',
     ],
+    [
+      rehash({ ...quorumAddendum, quorum: [{ ...quorumAddendum.quorum[0], verdict: 'bogus' }, ...quorumAddendum.quorum.slice(1)] }),
+      "a quorum ADDENDUM member whose verdict is neither verified nor refuted (on a TB member, verdict is an unknown field; on an ADDENDUM member it is one of the two)",
+    ],
   ];
   files.set('invalid/schema.jsonl', jsonl(schemaInvalid.map(([line]) => line)));
   files.set('invalid/schema.expected.json', json(schemaInvalid.map(([, reason], i) => ({ line: i + 1, reason }))));
@@ -599,7 +603,21 @@ function quorumInvalid(
         'This line breaks no other rule: a reader that lowercases every Σ to σ reads abcσ, another commit, and wrongly takes it',
       'both cite commit abcς',
     ],
+    // Rule 5 reads the links in x-steno.links: a top-level `links` is a field this version doesn't define, which
+    // hides no break of the rule (a reader that read its links from there took these lines)
+    ...([null, []] as const).map((links): [Record<string, unknown>, string, string] => [
+      rehash(withTopLevelLinks({ ...addendum, 'x-steno': { ...addendum['x-steno'], links: addendum['x-steno'].links.map((l: object) => ({ ...l, type: 'refutes' })) } }, links)),
+      `quorum rule 5, read from x-steno.links: members who say verified on a line whose x-steno link refutes, beside a top-level links: ${JSON.stringify(links)}, ` +
+        'a field this version does not define, which neither hides the rule nor stands in for x-steno.links',
+      "quorum member 1's verdict verified is not the one its line's refutes link applies",
+    ]),
   ];
+}
+
+/** A line with a top-level `links`, a field the format doesn't define (rule 5 reads `x-steno.links`), placed before `x-steno`. */
+function withTopLevelLinks(line: Record<string, any>, links: unknown): Record<string, any> {
+  const { 'x-steno': x, prevHash, hash, ...rest } = line;
+  return { ...rest, links, 'x-steno': x, prevHash, hash };
 }
 
 /**
@@ -614,6 +632,11 @@ function quorumInvalid(
  * filed for a person (unknown-value), never truth, and one whose member
  * carries a `verdict` outside verified/refuted: a field only an ADDENDUM's
  * members define, so on a TB member an unknown one, and the TB is truth.
+ * Then quorum ADDENDUMs that keep rule 5 against their `x-steno.links` and
+ * carry a top-level `links`, a field the format doesn't define (an overrides
+ * link, a link at odds with the verdicts, a string): they decode, and are
+ * held only because their UV is not in this ledger. Last, a quorum TB whose
+ * link has a type this version doesn't know: filed (unknown-value).
  */
 function quorumRouting(addendum: Record<string, any>, quorumTb: Record<string, any>, first: number): Array<[unknown, Record<string, unknown>]> {
   // A person's TB and a person's contest of it, in a writer that let agents verify a contest
@@ -668,6 +691,29 @@ function quorumRouting(addendum: Record<string, any>, quorumTb: Record<string, a
   const tbUnknownToo = tbWith('01J9QUORUMTBUNKNOWNTOO0000', [t1, { ...t2, evidence: [...t2.evidence, benchmark] }]);
   // A member carrying `verdict`, which only an ADDENDUM's members define: on a TB member it is an unknown field, whatever its value
   const tbMemberVerdict = tbWith('01J9QUORUMTBMEMBERVERDICT0', [{ ...t1, verdict: 'bogus' } as unknown as QuorumMember, t2]);
+  // Quorum ADDENDUMs that keep rule 5 against their x-steno.links, each with a top-level `links`, a field the format
+  // doesn't define, whatever it holds: an overrides link, a link at odds with the verdicts, or a string
+  const [uvLink] = addendum['x-steno'].links as Array<Record<string, unknown>>;
+  const linksOverrides = variant('01J9QUORUMLINKSOVERRIDES00', (l) => withTopLevelLinks(l, [{ type: 'overrides' }]));
+  const linksVerifies = variant('01J9QUORUMLINKSVERIFIES000', (l) =>
+    withTopLevelLinks(
+      {
+        ...l,
+        quorum: l.quorum.map((m: QuorumMember) => ({ ...m, verdict: 'refuted' })),
+        'x-steno': { ...l['x-steno'], links: l['x-steno'].links.map((k: Record<string, unknown>) => ({ ...k, type: 'refutes' })) },
+      },
+      [{ fromId: l.id, toId: uvLink.toId, type: 'verifies' }]
+    )
+  );
+  const linksString = variant('01J9QUORUMLINKSSTRING00000', (l) => withTopLevelLinks(l, 'corroborates'));
+  // A TB an agent quorum signed whose only link has a type this version doesn't know
+  const tbUnknownLink = (() => {
+    const line = tbWith('01J9QUORUMTBUNKNOWNLINK000', [t1, t2]);
+    return rehash({ ...line, 'x-steno': { ...line['x-steno'], links: [{ fromId: line.id, toId: tbLine.id, type: 'corroborates' }] } });
+  })();
+  const keepsRule5 =
+    "it decodes (rule 5 reads x-steno.links, whose link the members' verdicts match, and a field the format doesn't define never refuses a line), " +
+    "and is held only because its UV is not in this ledger: imported after it, it resolves the UV and keeps the field";
   return [
     [tbLine, { outcome: 'inserted', status: 'active', note: 'a TB a person signed' }],
     [uvLine, { outcome: 'inserted', status: 'open', note: 'a UV that contests it' }],
@@ -712,6 +758,26 @@ function quorumRouting(addendum: Record<string, any>, quorumTb: Record<string, a
         note:
           "a TB an agent quorum signed, one of whose members carries verdict 'bogus': only an ADDENDUM's members define verdict, so on a TB member " +
           'it is an unknown field, whatever its value. It decodes, and the import takes the TB as truth and keeps the field, as for a TB member without it',
+      },
+    ],
+    [linksOverrides, { outcome: 'held', heldReason: 'is not held here', note: `a quorum ADDENDUM that verifies its UV, with a top-level links: [{"type":"overrides"}]: ${keepsRule5}` }],
+    [
+      linksVerifies,
+      {
+        outcome: 'held',
+        heldReason: 'is not held here',
+        note: `a quorum ADDENDUM whose members say refuted and whose x-steno link refutes its UV, with a top-level links holding a verifies link: ${keepsRule5}`,
+      },
+    ],
+    [linksString, { outcome: 'held', heldReason: 'is not held here', note: `a quorum ADDENDUM that verifies its UV, with a top-level links: "corroborates", a string: ${keepsRule5}` }],
+    [
+      tbUnknownLink,
+      {
+        outcome: 'proposal',
+        reason: 'unknown-value',
+        note:
+          "a TB an agent quorum signed whose x-steno.links carries a link type this version does not know ('corroborates'): " +
+          'it decodes (the link rules and the quorum rules refuse no line over an unknown link type), and the import fails closed: filed for a person, never truth',
       },
     ],
   ];
@@ -999,6 +1065,24 @@ describe('valid/routing.jsonl: lines stenographer does not simply take as truth'
       if (w.outcome !== 'inserted') expect(ledger.getEntry(id)).toBeNull();
     }
   });
+
+  it("quorum ADDENDUMs with a top-level links field: imported after their UV, each resolves it as its x-steno link says, and keeps the field", () => {
+    const fixture = lines('fixtures/valid/routing.jsonl').filter((l) => parse(l).type === 'ADDENDUM' && 'links' in parse(l));
+    expect(fixture.map((l) => typeof parse(l).links)).toEqual(['object', 'object', 'string']);
+    const ledgerLines = lines('fixtures/valid/ledger.jsonl');
+    for (const line of fixture) {
+      const parsed = parse(line);
+      const [link] = parsed['x-steno'].links;
+      const uv = ledgerLines.find((l) => parse(l).id === link.toId)!;
+      const ledger = fresh();
+      expect(importWikiEntries(ledger, { lines: [uv] }, { signers: signers() }), parsed.id).toMatchObject({ committed: true, inserted: 1 });
+      const result = importWikiEntries(ledger, { lines: [line] }, { signers: signers() });
+      expect(result, parsed.id).toMatchObject({ committed: true, inserted: 1, proposals: [], held: [], errors: [] });
+      expect((ledger.getEntry(link.toId)!.body as { status: string }).status, parsed.id).toBe(link.type === 'verifies' ? 'verified' : 'refuted');
+      const exported = exportWikiEntries(ledger).lines.map(parse).find((l) => l.id === parsed.id)!;
+      expect(canonicalize(exported.links), parsed.id).toBe(canonicalize(parsed.links));
+    }
+  });
 });
 
 describe('v1/legacy.jsonl: 0.x lines are still read', () => {
@@ -1142,6 +1226,28 @@ describe('the spec document', () => {
     expect(section('Agent quorum')).toMatch(/A TB's members don't: on a TB member, `verdict` is a field this version doesn't define/);
     expect(section('Unknown values')).toMatch(/a `verdict` on a TB member is one, whatever its value/);
     expect(section("Importing (stenographer's rules)")).toMatch(/A quorum member's unknown fields, such as a TB member's `verdict`, are kept/);
+  });
+
+  it("says rule 5 reads x-steno.links only, that an agent TB's unknown link type fails closed, and which Unicode data keys identities", () => {
+    const readme = read('README.md');
+    const section = (heading: string) => {
+      const start = readme.indexOf(`\n## ${heading}\n`);
+      expect(start, heading).toBeGreaterThan(-1);
+      return readme.slice(start, readme.indexOf('\n## ', start + 1));
+    };
+    // A top-level `links` is an unknown field: it neither hides a rule 5 break nor refuses a line that keeps rule 5
+    expect(section('Agent quorum')).toMatch(/rule 5 reads the links in `x-steno.links`.*a top-level `links` is a field this version doesn't define/);
+    expect(section('Agent quorum')).toMatch(/neither hides a break of rule 5 nor refuses a line that keeps it/);
+    // routing.jsonl holds every reader to it: a TB an agent signed whose x-steno.links has a type the reader doesn't know
+    expect(section('Agent quorum')).toMatch(/A link type the reader doesn't know in the line's `x-steno.links` fails closed the same way/);
+    // Identity keys and commit refs depend on the reader's Unicode data
+    const identities = section('Identities');
+    expect(identities).toMatch(/computed with the reader's Unicode data/);
+    expect(identities).toMatch(/Node 22 is Unicode 16, Node 24 is Unicode 17/);
+    expect(identities).toMatch(/Swift's Foundation on Linux is Unicode 15/);
+    expect(identities).toMatch(/assigned or changed after Unicode 15\.0 may key differently between readers/);
+    expect(identities).toMatch(/Identities SHOULD NOT use such characters/);
+    expect(identities).toMatch(/Key signatures \(planned for 1\.x\) remove this dependence/);
   });
 
   it('documents the signer registry fields, keys included', () => {
