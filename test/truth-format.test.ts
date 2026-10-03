@@ -611,7 +611,9 @@ function quorumInvalid(
  * decode and are held, and one whose members lie 900 000.9 ms apart, which
  * decodes (rule 4 reads timestamps to the millisecond). Then quorum TBs
  * with an evidence kind this version doesn't know, which decode and are
- * filed for a person (unknown-value), never truth.
+ * filed for a person (unknown-value), never truth, and one whose member
+ * carries a `verdict` outside verified/refuted: a field only an ADDENDUM's
+ * members define, so on a TB member an unknown one, and the TB is truth.
  */
 function quorumRouting(addendum: Record<string, any>, quorumTb: Record<string, any>, first: number): Array<[unknown, Record<string, unknown>]> {
   // A person's TB and a person's contest of it, in a writer that let agents verify a contest
@@ -664,6 +666,8 @@ function quorumRouting(addendum: Record<string, any>, quorumTb: Record<string, a
   const tbUnknownOnly = tbWith('01J9QUORUMTBUNKNOWNONLY000', [t1, { ...t2, evidence: [benchmark] }]);
   // The members keep rule 3 with two known settling kinds (commit, file), and one also cites the unknown kind
   const tbUnknownToo = tbWith('01J9QUORUMTBUNKNOWNTOO0000', [t1, { ...t2, evidence: [...t2.evidence, benchmark] }]);
+  // A member carrying `verdict`, which only an ADDENDUM's members define: on a TB member it is an unknown field, whatever its value
+  const tbMemberVerdict = tbWith('01J9QUORUMTBMEMBERVERDICT0', [{ ...t1, verdict: 'bogus' } as unknown as QuorumMember, t2]);
   return [
     [tbLine, { outcome: 'inserted', status: 'active', note: 'a TB a person signed' }],
     [uvLine, { outcome: 'inserted', status: 'open', note: 'a UV that contests it' }],
@@ -698,6 +702,16 @@ function quorumRouting(addendum: Record<string, any>, quorumTb: Record<string, a
         note:
           "a TB an agent quorum signed whose members keep rule 3 with two known settling kinds (commit, file), one of them also citing 'benchmark': " +
           'it decodes, and the import still fails closed on the unknown kind: filed for a person, never truth',
+      },
+    ],
+    [
+      tbMemberVerdict,
+      {
+        outcome: 'inserted',
+        status: 'active',
+        note:
+          "a TB an agent quorum signed, one of whose members carries verdict 'bogus': only an ADDENDUM's members define verdict, so on a TB member " +
+          'it is an unknown field, whatever its value. It decodes, and the import takes the TB as truth and keeps the field, as for a TB member without it',
       },
     ],
   ];
@@ -1116,6 +1130,18 @@ describe('the spec document', () => {
     expect(section('Agent quorum')).toMatch(/files such a TB as a reconciliation proposal with reason `unknown-value`.*and holds such an ADDENDUM/);
     expect(section("Importing (stenographer's rules)")).toMatch(/TB an agent signed, when .* is filed as `unknown-value`/);
     expect(section("Importing (stenographer's rules)")).toMatch(/ADDENDUM an agent wrote, when .* is held/);
+  });
+
+  it("says a TB member's verdict is an unknown field, kept whatever its value, where the quorum, its unknown values and import are defined", () => {
+    const readme = read('README.md');
+    const section = (heading: string) => {
+      const start = readme.indexOf(`\n## ${heading}\n`);
+      expect(start, heading).toBeGreaterThan(-1);
+      return readme.slice(start, readme.indexOf('\n## ', start + 1));
+    };
+    expect(section('Agent quorum')).toMatch(/A TB's members don't: on a TB member, `verdict` is a field this version doesn't define/);
+    expect(section('Unknown values')).toMatch(/a `verdict` on a TB member is one, whatever its value/);
+    expect(section("Importing (stenographer's rules)")).toMatch(/A quorum member's unknown fields, such as a TB member's `verdict`, are kept/);
   });
 
   it('documents the signer registry fields, keys included', () => {

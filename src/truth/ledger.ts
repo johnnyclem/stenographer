@@ -159,17 +159,22 @@ const extraFields = (type: keyof typeof LINE_BODY_FIELDS) =>
     .optional();
 
 /**
- * A quorum member as stored: who, which session, when, the evidence it
- * brought and, on an addendum, its verdict. The rules across members and
- * the line are checkQuorum's (quorum.ts).
+ * A quorum member as stored: who, which session, when, and the evidence it
+ * brought. The rules across members and the line are checkQuorum's
+ * (quorum.ts). A member's unknown fields are stored as they came.
  */
 const QuorumMemberSchema = z.object({
   author: z.string(),
   agentSessionId: z.string(),
   ts: z.string().refine(isRfc3339DateTime, 'a quorum member\'s ts is an RFC 3339 date-time naming a real time'),
   evidence: z.array(EvidenceSchema).min(1, 'a quorum member cites evidence'),
-  verdict: z.enum(['verified', 'refuted']).optional(),
 });
+/**
+ * An addendum's member also carries its verdict (checkQuorum requires it).
+ * A TB's member defines none: there `verdict` is an unknown field, kept
+ * whatever its value (spec, Agent quorum and Unknown values).
+ */
+const AddendumQuorumMemberSchema = QuorumMemberSchema.extend({ verdict: z.enum(['verified', 'refuted']).optional() });
 
 // What admit() checks, per entry type. Bodies are checked as stored: the
 // same building blocks the write-time input schemas use (types.ts), without
@@ -203,7 +208,7 @@ const STORED_BODY: Partial<Record<TruthEntryType, z.ZodTypeAny>> = {
     .object({
       evidence: z.array(EvidenceSchema).min(1, 'an addendum requires at least one piece of evidence'),
       note: z.string().nullable().optional(),
-      quorum: z.array(QuorumMemberSchema).optional(),
+      quorum: z.array(AddendumQuorumMemberSchema).optional(),
       extra: extraFields('ADDENDUM'),
     })
     .strict(),

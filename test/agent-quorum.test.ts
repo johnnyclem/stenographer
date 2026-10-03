@@ -1111,6 +1111,30 @@ describe('wiki import: agent lines land only with a valid quorum of agents', () 
     }
   });
 
+  // A TB's members carry no verdict: only an ADDENDUM's do. On a TB member,
+  // `verdict` is a field this version doesn't define, so whatever its value
+  // the line is kept like one with any other unknown field (spec, Unknown
+  // values). Admission held every member to an ADDENDUM's verdict enum, so a
+  // file with `verdict: "bogus"` on a TB member rolled back whole.
+  it('takes a quorum TB whose member carries a verdict, a field a TB member does not define, whatever its value', () => {
+    const { lines, tb } = writer();
+    const tbLine = lines.find((l) => l.id === tb.id)!;
+    for (const verdict of ['bogus', 'verified', 7]) {
+      const line = { ...tbLine, quorum: [{ ...tbLine.quorum[0], verdict }, tbLine.quorum[1]] };
+      const [encoded] = stream([line]);
+      expect(() => decodeWikiLine(encoded), String(verdict)).not.toThrow();
+      for (const signers of [null, SignerRegistry.load(REGISTRY)]) {
+        const ledger = new TruthLedger(new Database(':memory:'));
+        const result = importWikiEntries(ledger, { lines: [encoded] }, { signers });
+        expect(result, String(verdict)).toMatchObject({ committed: true, errors: [], proposals: [], held: [] });
+        expect((ledger.getEntry(tb.id) as TbEntry).body).toMatchObject({ status: 'active', quorum: line.quorum });
+        // Kept as it came, and exported again verbatim
+        const exported = exportWikiEntries(ledger).lines.map(parse).find((l) => l.id === tb.id)!;
+        expect(exported.quorum).toEqual(line.quorum);
+      }
+    }
+  });
+
   it('files an agent-signed TB without a valid quorum of agents as a proposal', () => {
     const { lines, tb } = writer();
     const tbLine = lines.find((l) => l.id === tb.id)!;
