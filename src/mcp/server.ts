@@ -56,15 +56,22 @@ export const AGENT_STANDING =
   'more agent sessions agree from different angles within 15 minutes, or when a person signs. Agents never override ' +
   'or strike a tombstone.';
 
-/** Read by MCP clients at initialize; clients that support Claude Code channels (claude/channel) read the events part too. */
-const CHANNEL_INSTRUCTIONS: Record<ToolProfile, string> = {
-  agent:
-    AGENT_STANDING +
-    ' Events from the stenographer channel are real-time objections: something you just asserted contradicts a ' +
+/** An agent's standing on a ledger whose agent quorum is off: only a person settles. */
+export const AGENT_STANDING_QUORUM_OFF =
+  'Your confidence is not evidence and settles nothing. On this ledger the agent quorum is off: nothing an agent ' +
+  'files settles a claim, however many agree; only a person signs or resolves. Draft and attest, and say what you ' +
+  'checked. Agents never override or strike a tombstone.';
+
+const AGENT_CHANNEL_EVENTS =
+  ' Events from the stenographer channel are real-time objections: something you just asserted contradicts a ' +
     'signed tombstone (TB) in the truth ledger. Each cites the TB (the exhibit) and the transcript line. Treat the TB ' +
     'as ground truth unless the objection says it is contested: correct course before continuing, and tell the user. ' +
     'If you believe the objection is wrong or immaterial, say so to the user — a person rules on objections, not the ' +
-    'session they were raised against.',
+    'session they were raised against.';
+
+/** Read by MCP clients at initialize; clients that support Claude Code channels (claude/channel) read the events part too. */
+const CHANNEL_INSTRUCTIONS: Record<ToolProfile, string> = {
+  agent: AGENT_STANDING + AGENT_CHANNEL_EVENTS,
   operator:
     'Events from the stenographer channel are real-time objections: an agent asserted something that contradicts a ' +
     'signed tombstone (TB) in the truth ledger. Each cites the TB (the exhibit) and the transcript line. ' +
@@ -188,10 +195,15 @@ function draftStatus(result: { dedupedInto?: string; quorum?: TombstoneQuorumPro
       'open for a person, who may dismiss it'
     );
   }
+  const until = quorum?.quorumOff
+    ? 'not truth until a person signs it (the agent quorum is off on this ledger)'
+    : 'not truth until a person signs it or a quorum of agent sessions agrees';
   const waiting = result.dedupedInto
     ? `deduped into your open draft ${result.dedupedInto} for ${targetRef} — it is unchanged and still awaiting ` +
-      'notarization; not truth until a person signs it or a quorum of agent sessions agrees'
-    : 'awaiting notarization — not truth until a person signs it or a quorum of agent sessions agrees';
+      `notarization; ${until}`
+    : `awaiting notarization — ${until}`;
+  // With the quorum off, what a quorum would still miss is beside the point
+  if (quorum?.quorumOff) return waiting;
   const lacks = [
     ...(quorum?.missing.includes('literals') ? ['names no literals'] : []),
     ...(quorum?.missing.includes('a settling evidence item')
@@ -239,7 +251,10 @@ export class StenographerServer {
         // claude/channel: Claude Code's built-in channel protocol — lets this
         // server push objections into the attached session as they're raised
         capabilities: { tools: {}, experimental: { 'claude/channel': {} } },
-        instructions: CHANNEL_INSTRUCTIONS[profile],
+        instructions:
+          profile === 'agent' && this.engine.agentQuorum() === 'off'
+            ? AGENT_STANDING_QUORUM_OFF + AGENT_CHANNEL_EVENTS
+            : CHANNEL_INSTRUCTIONS[profile],
       }
     );
 
@@ -325,11 +340,12 @@ export class StenographerServer {
 
   private unavailable(name: string): string {
     if (this.profile === 'agent' && name === 'assert_tombstone') {
-      return (
-        'assert_tombstone is not available to agents: draft the tombstone with propose_tombstone. It becomes truth ' +
-        'when two or more agent sessions draft the same literals from different angles within 15 minutes, or when a ' +
-        'person signs it'
-      );
+      return this.engine.agentQuorum() === 'off'
+        ? 'assert_tombstone is not available to agents: draft the tombstone with propose_tombstone. It becomes truth ' +
+            'when a person signs it (the agent quorum is off on this ledger)'
+        : 'assert_tombstone is not available to agents: draft the tombstone with propose_tombstone. It becomes truth ' +
+            'when two or more agent sessions draft the same literals from different angles within 15 minutes, or when a ' +
+            'person signs it';
     }
     if (this.profile === 'agent' && OPERATOR_TOOLS.has(name)) {
       return `${name} is an operator tool: it is not available in the agent profile — a person runs it from a notary UI or CLI (--profile operator)`;
@@ -580,6 +596,29 @@ export class StenographerServer {
   private agentTools(): ToolSpec[] {
     const e = this.engine;
     const bound = 'Attributed to this server\'s agent identity and session — arguments cannot name anyone.';
+    const quorumOff = e.agentQuorum() === 'off';
+    const draftSettles = quorumOff
+      ? 'It becomes truth only when a person signs it: the agent quorum is off on this ledger, so drafts that agree ' +
+        'mint nothing. Cite settling evidence (commit, file, test) so the person can check it. When an active or ' +
+        'contested TB already holds every literal, the claim is already truth (status "already truth").'
+      : 'It becomes truth when a person signs it, or when ' +
+        'two or more agent sessions draft the same set of literals from different angles within 15 minutes: then ' +
+        'the draft that completes the quorum mints the TB (status "settled by quorum"). Each draft must cite ' +
+        'settling evidence of its own (commit, file, test, claimed-command or wiki; not message, chat, ticket or ' +
+        'doc), no evidence another draft cites, and together they cite two settling kinds; a draft without ' +
+        'literals or settling evidence never counts toward a quorum. When an active or contested TB already holds ' +
+        'every literal, the claim is already truth and nothing is minted (status "already truth"). Otherwise the ' +
+        'result says what the quorum still misses.';
+    const verdictSettles = quorumOff
+      ? 'The agent quorum is off on this ledger: when another agent session agrees, the UV is raised to a person ' +
+        '(status "raised"), who settles it. A verdict the other way within 15 minutes is a dispute (status ' +
+        '"disputed"), raised to a person too.'
+      : 'The UV settles when two or more agent sessions agree from different angles within 15 minutes: ' +
+        'each cites settling evidence (commit, file, test, claimed-command, wiki — not message, chat, ticket or ' +
+        'doc), none cites another\'s item, and together they cite two kinds (status "settled", with the ' +
+        'addendum). A verdict the other way within the window is a dispute (status "disputed"): no quorum forms, ' +
+        'and a person rules. Verifying a UV that contests a TB would override the TB, which agents never do: an ' +
+        'agreeing quorum is raised to a person (status "raised").';
 
     return [
       tool({
@@ -587,14 +626,9 @@ export class StenographerServer {
         description:
           'Draft a tombstone. Use this when you have found that a prior statement, decision or value is provably ' +
           'dead: you gather the evidence and name the literals. The draft is raised to a person immediately and is ' +
-          'NOT truth on your word: you cannot sign or notarize it. It becomes truth when a person signs it, or when ' +
-          'two or more agent sessions draft the same set of literals from different angles within 15 minutes: then ' +
-          'the draft that completes the quorum mints the TB (status "settled by quorum"). Each draft must cite ' +
-          'settling evidence of its own (commit, file, test, claimed-command or wiki; not message, chat, ticket or ' +
-          'doc), no evidence another draft cites, and together they cite two settling kinds; a draft without ' +
-          'literals or settling evidence never counts toward a quorum. When an active or contested TB already holds ' +
-          'every literal, the claim is already truth and nothing is minted (status "already truth"). Otherwise the ' +
-          'result says what the quorum still misses. targetRef dedupes only against your own open drafts (reported ' +
+          'NOT truth on your word: you cannot sign or notarize it. ' +
+          draftSettles +
+          ' targetRef dedupes only against your own open drafts (reported ' +
           `as dedupedInto). ${bound} Tell the user what you have raised and what it would object to.`,
         input: args({
           claim: Text('What is dead and what replaces it (if anything)'),
@@ -648,12 +682,9 @@ export class StenographerServer {
         description:
           'File your verdict on an open UV — verified or refuted — with the evidence you checked. On its own it ' +
           'settles nothing: it is recorded as your attestation (status "attested", with what the quorum still ' +
-          'misses). The UV settles when two or more agent sessions agree from different angles within 15 minutes: ' +
-          'each cites settling evidence (commit, file, test, claimed-command, wiki — not message, chat, ticket or ' +
-          'doc), none cites another\'s item, and together they cite two kinds (status "settled", with the ' +
-          'addendum). A verdict the other way within the window is a dispute (status "disputed"): no quorum forms, ' +
-          'and a person rules. Verifying a UV that contests a TB would override the TB, which agents never do: an ' +
-          'agreeing quorum is raised to a person (status "raised"). A refuted contest closes: its TB is active ' +
+          'misses). ' +
+          verdictSettles +
+          ' A refuted contest closes: its TB is active ' +
           'again unless another contest is open or it has been overridden (an override is never undone). You must ' +
           `be provenance-independent of the UV: not its author, not the same session (contempt of corpus). ${bound}`,
         input: args(ResolveFields),
@@ -892,6 +923,7 @@ export async function runCLI(args: string[]): Promise<void> {
       profile: { type: 'string' },
       'agent-identity': { type: 'string' },
       'signer-registry': { type: 'string' },
+      'agent-quorum': { type: 'string' },
       'wiki-dir': { type: 'string' },
       // Accepted for 0.x configs: notarization is now the agent-profile default
       'require-notary': { type: 'boolean' },
@@ -918,6 +950,11 @@ export async function runCLI(args: string[]): Promise<void> {
   const profile = ((values.profile as string | undefined) ?? 'agent') as ToolProfile;
   if (!PROFILES.includes(profile)) {
     console.error(`Unknown profile '${profile}'. Available: ${PROFILES.join(', ')}`);
+    process.exit(1);
+  }
+  const agentQuorum = values['agent-quorum'] as StenographerConfig['agentQuorum'];
+  if (agentQuorum !== undefined && agentQuorum !== 'on' && agentQuorum !== 'off') {
+    console.error(`Unknown --agent-quorum '${agentQuorum}'. Available: on, off`);
     process.exit(1);
   }
   if (values['require-notary']) {
@@ -971,6 +1008,7 @@ export async function runCLI(args: string[]): Promise<void> {
     profile,
     agentIdentity: values['agent-identity'] as string | undefined,
     signerRegistry: values['signer-registry'] as string | undefined,
+    agentQuorum,
     wikiDir: values['wiki-dir'] as string | undefined,
   };
 
@@ -1000,6 +1038,11 @@ export async function runCLI(args: string[]): Promise<void> {
     console.error(`❌ ${errorMessage(err)}`);
     process.exit(1);
   }
+  console.error(
+    server.engine.agentQuorum() === 'off'
+      ? '🗳  Agent quorum: off — nothing an agent files settles; only a person signs or resolves'
+      : '🗳  Agent quorum: on — two or more agent sessions agreeing from different angles within 15 minutes settle'
+  );
   await server.start();
 
   console.error('✅ Stenographer is running. Press Ctrl+C to stop.');

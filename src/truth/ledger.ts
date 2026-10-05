@@ -262,6 +262,9 @@ function formatIssues(error: z.ZodError): string {
   return error.issues.map((i) => (i.path.length > 0 ? `${i.path.join('.')}: ${i.message}` : i.message)).join('; ');
 }
 
+/** Whether agent quorums settle claims on a ledger (TruthLedger.agentQuorum). */
+export type AgentQuorumSetting = 'on' | 'off';
+
 export interface TruthLedgerOptions {
   /**
    * Who is an agent, for the agent quorum (spec/truth-format, "Agent
@@ -288,6 +291,33 @@ export class TruthLedger {
   /** Whether `identity` is an agent's, by this ledger's classifier. */
   isAgent(identity: string): boolean {
     return typeof identity === 'string' && this.classifyAgent(identity);
+  }
+
+  /**
+   * Whether agent quorums may settle claims on this ledger. 'on' (the
+   * default, and what a ledger without the setting reads as): two or more
+   * agent sessions agreeing from different angles mint a TB or resolve a UV.
+   * 'off': only a person settles; agreeing agents are raised to one. Kept in
+   * truth_meta, so every process on this state file reads the same answer.
+   */
+  agentQuorum(): AgentQuorumSetting {
+    const row = this.db.prepare(`SELECT value FROM truth_meta WHERE key = 'agent_quorum'`).get() as { value: string } | undefined;
+    return row?.value === 'off' ? 'off' : 'on';
+  }
+
+  /** Turns the agent quorum on or off for every process on this state file. */
+  setAgentQuorum(setting: AgentQuorumSetting): void {
+    if (setting !== 'on' && setting !== 'off') throw new TruthWriteError(`agent quorum is 'on' or 'off', got '${String(setting)}'`);
+    this.tx(() => {
+      this.db.prepare(`INSERT INTO truth_meta (key, value) VALUES ('agent_quorum', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(setting);
+    });
+  }
+
+  /** Refuses a quorum write while the quorum is off. Read inside the write's transaction. */
+  private requireAgentQuorum(what: string): void {
+    if (this.agentQuorum() === 'off') {
+      throw new NotarizationRequiredError(`${what}: the agent quorum is off on this ledger — a person settles it`);
+    }
   }
 
   /**
@@ -1215,6 +1245,7 @@ export class TruthLedger {
   ): { uv: UvEntry; addendum: AddendumEntry } {
     const author = this.accountable(ctx.author, 'resolver');
     const addendumId = this.tx(() => {
+      this.requireAgentQuorum(`settling UV ${uvId} by an agent quorum`);
       const uv = this.mustGetTyped<UvEntry>(uvId, 'UV');
       if (uv.body.status !== 'open') {
         throw new TruthWriteError(`UV ${uvId} is already ${uv.body.status}`);
@@ -1262,6 +1293,7 @@ export class TruthLedger {
   mintTombstoneByQuorum(proposalIds: string[], ctx: WriteContext): TbEntry {
     const author = this.accountable(ctx.author, 'signer');
     return this.tx(() => {
+      this.requireAgentQuorum('minting a TB by an agent quorum');
       const drafts = proposalIds
         .map((id) => this.mustGetTyped<ProposalEntry>(id, 'PROPOSAL'))
         .sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt) || (a.id < b.id ? -1 : 1));

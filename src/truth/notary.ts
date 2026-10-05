@@ -131,7 +131,7 @@ export async function raiseForNotarization(
  * the TB (`contest-verified`).
  */
 export interface UvRaise {
-  reason: 'dispute' | 'contest-verified';
+  reason: 'dispute' | 'contest-verified' | 'quorum-off';
   uv: UvEntry;
   /** One line saying what the agents did and what is left to a person. */
   detail: string;
@@ -155,7 +155,7 @@ export function formatUvNotice(raise: UvRaise): string {
  * rules on it (resolve_uv in the operator profile).
  */
 export async function raiseUvForPerson(sinks: ObjectionSinkConfig[], raise: UvRaise): Promise<Array<{ url: string; error?: string }>> {
-  const kind = raise.reason === 'dispute' ? 'uv_dispute' : 'uv_contest_verified';
+  const kind = { dispute: 'uv_dispute', 'contest-verified': 'uv_contest_verified', 'quorum-off': 'uv_agents_agree' }[raise.reason];
   return Promise.all(
     sinks.map(async (sink) => {
       try {
