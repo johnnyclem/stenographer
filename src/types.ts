@@ -288,6 +288,19 @@ export interface StenographerConfig {
    */
   profile?: 'agent' | 'operator';
   /**
+   * Whether agent quorums may settle claims on this ledger (`--agent-quorum`).
+   * The setting is kept in the state file, so every process on it obeys it.
+   * - 'off': nothing an agent files settles. Agreeing drafts stay open and
+   *   agreeing verdicts are raised to a person; only a person signs or
+   *   resolves. Any process may turn it off.
+   * - 'on': two or more agent sessions agreeing from different angles within
+   *   15 minutes settle (the agent quorum). Turning it back on over a ledger
+   *   set to 'off' takes the operator profile; an agent-profile process
+   *   asking for it fails to start.
+   * - unset (default): leave the ledger as it is ('on' for a new ledger).
+   */
+  agentQuorum?: 'on' | 'off';
+  /**
    * The identity agent-profile writes are attributed to (`--agent-identity`).
    * Default: `agent:<name>` from the MCP client's clientInfo. This ledger
    * treats it as an agent's whatever its spelling; other readers go by

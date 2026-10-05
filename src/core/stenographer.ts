@@ -172,6 +172,12 @@ export class Stenographer implements StenographerAPI {
     this.store = new StateStore(config.statePath || './stenographer.db', {
       isAgent: agentClassifier(this.signers, [config.agentIdentity]),
     });
+    try {
+      this.applyAgentQuorum(config.agentQuorum, config.profile ?? 'agent');
+    } catch (err) {
+      this.store.close();
+      throw err;
+    }
     this.detector = new ImportanceDetector();
     // Vector candidates come from the persistent index (chunks, session partitions)
     this.retriever = new GraphRAGRetriever(undefined, {
@@ -184,6 +190,29 @@ export class Stenographer implements StenographerAPI {
     // Validate sinks up front: a bad or non-loopback URL fails at startup,
     // not at the first objection
     this.sinkTransports = (config.objectionSinks ?? []).map(createSinkTransport);
+  }
+
+  /**
+   * The ledger's agent quorum setting, kept in the state file. Any process
+   * may turn it off. Turning it back on is a person's act: an agent-profile
+   * process asking for 'on' over a ledger set to 'off' fails to start,
+   * rather than quietly re-enabling what a person turned off.
+   */
+  private applyAgentQuorum(wanted: StenographerConfig['agentQuorum'], profile: 'agent' | 'operator'): void {
+    if (wanted === undefined) return;
+    if (wanted !== 'on' && wanted !== 'off') throw new Error(`agentQuorum is 'on' or 'off', got '${String(wanted)}'`);
+    const truth = this.store.truth;
+    if (wanted === 'on' && truth.agentQuorum() === 'off' && profile !== 'operator') {
+      throw new Error(
+        "the agent quorum is off on this ledger, and only the operator profile turns it back on: a person's act"
+      );
+    }
+    if (truth.agentQuorum() !== wanted) truth.setAgentQuorum(wanted);
+  }
+
+  /** Whether agent quorums settle claims on this ledger ('off': only a person does). */
+  agentQuorum(): 'on' | 'off' {
+    return this.store.truth.agentQuorum();
   }
 
   /** Now, by the configured clock: the agent quorum's 15-minute window reads it. */
@@ -1491,6 +1520,18 @@ export class Stenographer implements StenographerAPI {
         };
       }
       case 'raised': {
+        if (outcome.reason === 'quorum-off') {
+          const detail =
+            `${outcome.members.length} agent sessions ${outcome.attestation.resolution === 'verified' ? 'verified' : 'refuted'} this UV ` +
+            'from different angles; the agent quorum is off on this ledger, so a person settles it';
+          return {
+            status: 'raised',
+            uv: outcome.uv,
+            attestation: outcome.attestation,
+            ...(await raise({ reason: 'quorum-off', uv: outcome.uv, detail })),
+            detail,
+          };
+        }
         const detail =
           `${outcome.members.length} agent sessions verified this contest from different angles; ` +
           `overriding TB ${outcome.tbId} needs a person`;

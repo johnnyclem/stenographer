@@ -120,6 +120,13 @@ Options (start):
                                      TBs, wiki import/export, backfill — for a
                                      notary UI or CLI a person drives, never
                                      an agent
+      --agent-quorum <on|off>
+                           whether agent quorums settle claims on this
+                           ledger; kept in the state file, so every process
+                           on it obeys. off: agreeing drafts stay open and
+                           agreeing verdicts are raised to a person. Any
+                           process may turn it off; turning it back on takes
+                           --profile operator (default: leave it as it is)
       --agent-identity <id>
                            who agent-profile writes are attributed to
                            (default: agent:<MCP client name>); people

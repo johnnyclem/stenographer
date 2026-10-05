@@ -62,8 +62,12 @@ export type AttestOutcome =
   | { status: 'attested'; attestation: Attestation; uv: UvEntry; quorum: QuorumProgress }
   /** An opposite verdict stands within the window (from any session, this one included): no quorum forms. `raise` is set for the first attestation of a dispute. */
   | { status: 'disputed'; attestation: Attestation; uv: UvEntry; dissent: Attestation[]; raise: boolean }
-  /** The quorum verified a contest: overriding its TB needs a person. Nothing was written to the ledger. */
-  | { status: 'raised'; attestation: Attestation; uv: UvEntry; members: Attestation[]; tbId: string }
+  /**
+   * A quorum formed that agents may not act on, so it is raised to a person and nothing is written to the
+   * ledger: it verified a contest (overriding the TB needs a person), or the ledger's agent quorum is off.
+   */
+  | { status: 'raised'; reason: 'contest-verified'; attestation: Attestation; uv: UvEntry; members: Attestation[]; tbId: string }
+  | { status: 'raised'; reason: 'quorum-off'; attestation: Attestation; uv: UvEntry; members: Attestation[] }
   /** The quorum settled the UV with one ADDENDUM. */
   | { status: 'settled'; attestation: Attestation; uv: UvEntry; addendum: AddendumEntry; members: Attestation[] };
 
@@ -200,7 +204,11 @@ export class UvAttestations {
       const members = chosen.members;
       if (contestedTb && input.resolution === 'verified') {
         this.consume(members, 'raised');
-        return { status: 'raised', attestation: { ...attestation, consumedBy: 'raised' }, uv, members, tbId: contestedTb.id };
+        return { status: 'raised', reason: 'contest-verified', attestation: { ...attestation, consumedBy: 'raised' }, uv, members, tbId: contestedTb.id };
+      }
+      if (this.ledger.agentQuorum() === 'off') {
+        this.consume(members, 'raised');
+        return { status: 'raised', reason: 'quorum-off', attestation: { ...attestation, consumedBy: 'raised' }, uv, members };
       }
       const quorum: QuorumMember[] = members.map((m) => ({
         author: m.author,
@@ -232,8 +240,13 @@ export class UvAttestations {
   }
 }
 
-/** Where a draft's tombstone quorum stands; `heldBy` names an active or contested TB that already holds every literal. */
-export type TombstoneQuorumProgress = QuorumProgress & { heldBy?: string };
+/**
+ * Where a draft's tombstone quorum stands; `heldBy` names an active or
+ * contested TB that already holds every literal. `quorumOff` is set when the
+ * ledger's agent quorum is off: nothing an agent drafts mints, however many
+ * agree, and the drafts wait for a person.
+ */
+export type TombstoneQuorumProgress = QuorumProgress & { heldBy?: string; quorumOff?: true };
 
 /**
  * After an agent files `draft`: mints a TB when open agent drafts from
@@ -251,6 +264,7 @@ export function settleTombstoneQuorum(
 ): { tombstone: TbEntry } | { progress: TombstoneQuorumProgress } {
   return ledger.atomically(() => {
     const now = readClock(ctx.now);
+    const off = ledger.agentQuorum() === 'off';
     const literalsOf = (p: ProposalEntry) => (p.body.draft.literals ?? []) as TombstonedLiteral[];
     const candidate = (p: ProposalEntry) => ({
       id: p.id,
@@ -263,7 +277,7 @@ export function settleTombstoneQuorum(
     if (literals.length === 0) {
       // A quorum TB carries the literals its members agree on
       const { progress } = chooseQuorum(candidate(draft), [], now);
-      return { progress: { ...progress, missing: ['literals', ...progress.missing] } };
+      return { progress: { ...progress, missing: ['literals', ...progress.missing], ...(off ? { quorumOff: true as const } : {}) } };
     }
 
     const set = literalSetKey(literals);
@@ -287,7 +301,10 @@ export function settleTombstoneQuorum(
       const held = new Set(JSON.parse(literalSetKey(tb.body.literals ?? [])) as string[]);
       return wanted.every((l) => held.has(l));
     })?.id;
-    if (heldBy || !members) return { progress: { ...progress, ...(heldBy ? { heldBy } : {}) } };
+    if (heldBy) return { progress: { ...progress, heldBy } };
+    // On a ledger whose quorum is off, agreeing drafts mint nothing: a person signs one of them
+    if (off) return { progress: { ...progress, quorumOff: true } };
+    if (!members) return { progress };
 
     const tombstone = ledger.mintTombstoneByQuorum(
       members.map((m) => m.id),
