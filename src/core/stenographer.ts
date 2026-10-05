@@ -67,6 +67,8 @@ import type {
 
 // Until the embedder is known; each embedder carries its calibrated threshold
 const DEFAULT_SUPERSEDE_THRESHOLD = 0.45;
+/** Matches within this of the best score are near-ties: each gets a proposal. */
+const DEFAULT_SUPERSEDE_MARGIN = 0.05;
 const DEFAULT_DAEMON_REST_PORT = 8787;
 
 /** index_meta key holding the identity of the embedder the vectors were made with. */
@@ -116,6 +118,12 @@ interface SupersessionContext {
   embeddings: Map<string, number[]>;
 }
 
+/** An active decision a text supersedes, and how closely it matched. */
+interface SupersessionMatch {
+  decision: IndexedDecision;
+  score: number;
+}
+
 export class Stenographer implements StenographerAPI {
   readonly config: StenographerConfig;
   readonly store: StateStore;
@@ -134,6 +142,7 @@ export class Stenographer implements StenographerAPI {
   private sessionsSeen = new Set<string>();
   private indexing: Promise<void> = Promise.resolve();
   private supersedeThreshold: number;
+  private supersedeMargin: number;
   private truthMode: 'shadow' | 'assert';
   private objectionMode: ObjectionMode;
   private sinkTransports: ObjectionTransport[];
@@ -145,6 +154,13 @@ export class Stenographer implements StenographerAPI {
     if ((config as { allowAgentAssert?: unknown }).allowAgentAssert) {
       throw new Error('allowAgentAssert' + ALLOW_AGENT_ASSERT_REMOVED.slice('--allow-agent-assert'.length));
     }
+    const margin: unknown = config.supersedeMargin ?? DEFAULT_SUPERSEDE_MARGIN;
+    if (typeof margin !== 'number' || !Number.isFinite(margin) || margin < 0 || margin >= 1) {
+      throw new Error(
+        `supersedeMargin must be a finite number in [0, 1), got ${typeof margin === 'string' ? `'${margin}'` : String(margin)}`
+      );
+    }
+    this.supersedeMargin = margin;
     this.config = config;
     // Until a line names its harness session (Claude Code's sessionId), a
     // log's session is its basename — stable across restarts, never minted
@@ -691,7 +707,7 @@ export class Stenographer implements StenographerAPI {
   ): void {
     // Derived from the source line, so re-deriving it can't mint a twin
     const newId = contentId('decision', 'decision', msg.id, String(index), description);
-    const match = this.matchSuperseded(sessionId, description, supersession);
+    const matches = this.matchSuperseded(sessionId, description, supersession);
 
     this.store.addDecision(sessionId, {
       id: newId,
@@ -700,8 +716,8 @@ export class Stenographer implements StenographerAPI {
       timestamp: msg.timestamp,
     });
 
-    if (match) {
-      this.recordSupersession(sessionId, match, { id: newId, description, timestamp: msg.timestamp }, msg, {
+    if (matches.length > 0) {
+      this.recordSupersession(sessionId, matches, { id: newId, description, timestamp: msg.timestamp }, msg, {
         id: contentId('tombstone', 'decision', msg.id, String(index), description),
         reason: 'Superseded by newer decision',
       });
@@ -716,10 +732,10 @@ export class Stenographer implements StenographerAPI {
     supersession: SupersessionContext
   ): void {
     const correctedStatement = correction.to;
-    const match = this.matchSuperseded(sessionId, correctedStatement, supersession);
+    const matches = this.matchSuperseded(sessionId, correctedStatement, supersession);
     const tombstoneId = contentId('tombstone', 'correction', msg.id, String(index), correctedStatement);
 
-    if (match) {
+    if (matches.length > 0) {
       // The correction is the fresher version of a settled decision:
       // record it as a new decision; closing the old one is truth-mode-gated.
       const newId = contentId('decision', 'correction', msg.id, String(index), correctedStatement);
@@ -731,7 +747,7 @@ export class Stenographer implements StenographerAPI {
       });
       this.recordSupersession(
         sessionId,
-        match,
+        matches,
         { id: newId, description: correctedStatement, timestamp: msg.timestamp },
         msg,
         { id: tombstoneId, reason: 'Correction superseded prior decision' }
@@ -774,21 +790,40 @@ export class Stenographer implements StenographerAPI {
    * A new decision and an active one are versions of one fact: the newer
    * closes the older, whichever was indexed first — watch mode replays logs
    * in directory order, not time order. Detection is proposal-only (the
-   * detector may never write truth); in shadow mode (Phase 0) the auto-close
-   * and the inferred tombstone continue alongside the proposal.
+   * detector may never write truth): the best match gets a proposal, and so
+   * does each near-tied runner-up, so which of them went stale is a
+   * person's call instead of being dropped. A runner-up the detector already
+   * proposes as superseded into one of the near-tied versions' chains is
+   * skipped: signing that proposal closes it into the same chain, and
+   * proposing it again against every restatement would only multiply
+   * proposals. In shadow mode (Phase 0) the best match's auto-close and the
+   * inferred tombstone continue alongside the proposals.
    */
   private recordSupersession(
     sessionId: string,
-    match: { decision: IndexedDecision; score: number },
+    matches: SupersessionMatch[],
     incoming: { id: string; description: string; timestamp: string },
     msg: ConversationMessage,
     tombstone: { id: string; reason: string }
   ): void {
-    const late = isAfter(match.decision.timestamp, incoming.timestamp);
-    const [older, newer] = late ? [incoming, match.decision] : [match.decision, incoming];
-    this.writeSupersessionProposal(sessionId, older, newer, match.score, msg);
+    const ordered = (match: SupersessionMatch) => {
+      const late = isAfter(match.decision.timestamp, incoming.timestamp);
+      return { late, older: late ? incoming : match.decision, newer: late ? match.decision : incoming };
+    };
+    // Decided before anything is filed: this message's own proposals cover nothing
+    const versions = new Set(matches.map((match) => match.decision.id));
+    const proposed = matches.filter(
+      (match, i) => i === 0 || ordered(match).late || !this.proposedInto(match.decision.id, versions)
+    );
+    for (const match of proposed) {
+      const { older, newer } = ordered(match);
+      const nearTies = proposed.filter((other) => other !== match).map((other) => other.decision.id);
+      this.writeSupersessionProposal(sessionId, older, newer, match.score, msg, nearTies);
+    }
 
     if (this.truthMode === 'shadow') {
+      // Only the best match closes: a near-tied runner-up stays active, its proposal open
+      const { late, older, newer } = ordered(matches[0]);
       this.store.supersedeDecision(older.id, newer.id);
       this.store.addTombstone(sessionId, {
         id: tombstone.id,
@@ -808,14 +843,17 @@ export class Stenographer implements StenographerAPI {
    * accountable author) is what closes the superseded decision in assert
    * mode; dismissing it costs nothing. Proposals are deduped per
    * (superseded, successor) pair, so a second successor of one decision
-   * gets its own proposal instead of being swallowed by the first.
+   * gets its own proposal instead of being swallowed by the first. Each of
+   * a near-tie's proposals names, in `signal.detail`, the decisions proposed
+   * alongside it, for the person reviewing; the hashed body gains nothing else.
    */
   private writeSupersessionProposal(
     sessionId: string,
     superseded: { id: string; description: string },
     successor: { id: string; description: string },
     score: number,
-    msg: ConversationMessage
+    msg: ConversationMessage,
+    nearTies: string[]
   ): void {
     this.fileDetectorProposal(msg, () =>
       this.store.truth.addProposal(
@@ -829,6 +867,7 @@ export class Stenographer implements StenographerAPI {
             source: 'supersession-detector',
             score,
             threshold: this.supersedeThreshold,
+            ...(nearTies.length > 0 ? { detail: `near-tie with ${nearTies.join(', ')}` } : {}),
           },
           targetRef: `${superseded.id}->${successor.id}`,
           meta: {
@@ -862,22 +901,60 @@ export class Stenographer implements StenographerAPI {
   }
 
   /**
-   * Applies a signed supersession. When the superseded decision was already
-   * closed by another version, the newer of that chain's current version
-   * and the signed successor closes the other — so signing every proposal
-   * against one decision, in any order, leaves one current version.
+   * Whether the detector has an open proposal superseding this decision by
+   * one of `versions`, or by a decision closed into one of them since:
+   * signing it closes this decision into that version's chain.
+   */
+  private proposedInto(decisionId: string, versions: Set<string>): boolean {
+    return this.store.truth.openProposalsByTargetPrefix(`${decisionId}->`).some((proposal) => {
+      const meta = proposal.body.meta;
+      if (proposal.body.signal?.source !== 'supersession-detector' || meta?.supersededDecisionId !== decisionId) {
+        return false;
+      }
+      const current = this.currentVersion(meta.successorDecisionId as string);
+      // A chain that ends in this decision already closes nothing into it
+      return current !== null && current.id !== decisionId && versions.has(current.id);
+    });
+  }
+
+  /**
+   * The current version of the chain a decision is in: itself, or the end
+   * of what closed it — the last entry of its decision chain, found by
+   * following `supersededBy` forward alone.
+   */
+  private currentVersion(id: string): IndexedDecision | null {
+    let current = this.store.getDecision(id);
+    const seen = new Set<string>();
+    while (current?.supersededBy && !seen.has(current.id)) {
+      seen.add(current.id);
+      const next = this.store.getDecision(current.supersededBy);
+      if (!next) break;
+      current = next;
+    }
+    return current;
+  }
+
+  /**
+   * Applies a signed supersession. A successor closed since the proposal was
+   * filed still takes the superseded decision into its chain (a near-tied
+   * runner-up's proposal names the version it near-tied, which a later one
+   * may have closed). When the superseded decision was already closed by
+   * another version, the newer of the two chains' current versions closes
+   * the other — so signing every proposal, in any order, leaves one current
+   * version.
    */
   private applySupersession(supersededId: string, successorId: string): void {
     const superseded = this.store.getDecision(supersededId);
-    const successor = this.store.getDecision(successorId);
-    if (!superseded || !successor || successor.superseded) return;
+    const successor = this.currentVersion(successorId);
+    if (!superseded || !successor) return;
     if (!superseded.superseded) {
-      this.store.supersedeDecision(supersededId, successorId);
+      // Into the successor signed, closed since or not, unless its chain
+      // already ends in this decision
+      if (successor.id !== supersededId) this.store.supersedeDecision(supersededId, successorId);
       return;
     }
-    const chain = this.store.getDecisionChain(supersededId);
-    const current = chain[chain.length - 1];
-    if (!current || current.superseded || current.id === successorId) return;
+    const current = this.currentVersion(supersededId);
+    if (!current || current.superseded || current.id === successor.id) return;
     const [older, newer] = isAfter(successor.timestamp, current.timestamp) ? [current, successor] : [successor, current];
     this.store.supersedeDecision(older.id, newer.id);
   }
@@ -919,33 +996,35 @@ export class Stenographer implements StenographerAPI {
     return context;
   }
 
-  /** The still-active candidate most similar to the given text, if above threshold. */
-  private matchSuperseded(
-    sessionId: string,
-    text: string,
-    supersession: SupersessionContext
-  ): { decision: IndexedDecision; score: number } | null {
+  /**
+   * The still-active decisions the given text supersedes: those at or above
+   * the threshold and within `supersedeMargin` of the best score, best
+   * first, equal scores in decision-id order. Usually one. A near-tie
+   * returns each, since which of them went stale is a person's call.
+   */
+  private matchSuperseded(sessionId: string, text: string, supersession: SupersessionContext): SupersessionMatch[] {
     const textEmbedding = supersession.embeddings.get(text);
-    if (!textEmbedding) return null;
+    if (!textEmbedding) return [];
 
     // Re-read inside the transaction: an earlier text in this message (or a
     // signing while this one was being derived) may have closed a candidate
     const active = new Set(this.store.getActiveDecisions(this.supersessionScope(sessionId)).map((d) => d.id));
-    let best: IndexedDecision | null = null;
-    let bestScore = 0;
+    const matches: SupersessionMatch[] = [];
+    let best = 0;
 
     for (const { decision, embedding } of supersession.candidates) {
       if (!active.has(decision.id)) continue;
       const score = cosineSimilarity(textEmbedding, embedding);
-      if (score > bestScore) {
-        bestScore = score;
-        best = decision;
+      // Positive as well, as the single best match had to be
+      if (score > 0 && score >= this.supersedeThreshold) {
+        matches.push({ decision, score });
+        best = Math.max(best, score);
       }
     }
 
-    return best && bestScore >= this.supersedeThreshold
-      ? { decision: best, score: bestScore }
-      : null;
+    return matches
+      .filter((m) => m.score >= best - this.supersedeMargin)
+      .sort((a, b) => b.score - a.score || (a.decision.id < b.decision.id ? -1 : a.decision.id > b.decision.id ? 1 : 0));
   }
 
   // ─────────────────────────────────────────────────────────
