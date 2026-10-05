@@ -123,6 +123,32 @@ describe('TruthLedger', () => {
     expect(ledger.listProposals('open')).toHaveLength(1);
   });
 
+  it('finds the open proposals whose target starts with a prefix, and no others', () => {
+    const file = (targetRef: string) =>
+      ledger.addProposal(
+        {
+          kind: 'tombstone',
+          draft: { claim: targetRef, evidence: [{ kind: 'message', ref: 'm1' }] },
+          signal: { source: 'supersession-detector' },
+          targetRef,
+        },
+        { author: 'detector:supersession' }
+      );
+    const first = file('decision_a->decision_b');
+    const second = file('decision_a->decision_c');
+    const dismissed = file('decision_a->decision_d');
+    ledger.dismissProposal(dismissed.id, 'johnny', 'not the same decision');
+    // Neighbours of the range on either side
+    file('decision_ab->decision_b');
+    file('decision_a-');
+    file('decision_a-?');
+    file('decision_->decision_a');
+
+    expect(ledger.openProposalsByTargetPrefix('decision_a->').map((p) => p.id)).toEqual([first.id, second.id]);
+    expect(ledger.openProposalsByTargetPrefix('decision_z->')).toEqual([]);
+    expect(ledger.openProposalsByTargetPrefix('')).toEqual([]);
+  });
+
   it('dismissal requires a reason and is kept as detector training data', () => {
     const proposal = ledger.addProposal(
       {

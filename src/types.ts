@@ -221,6 +221,19 @@ export interface StenographerConfig {
    *  calibrated threshold (MiniLM 0.45, hashed 0.75). */
   supersedeThreshold?: number;
   /**
+   * How close to the best match another active decision must score to be
+   * proposed as superseded too: every active decision at or above
+   * `supersedeThreshold` and within this margin of the best score gets a
+   * PROPOSAL, best first, each naming the others proposed with it in
+   * `signal.detail` ("near-tie with <ids>"). A runner-up that already has
+   * an open supersession proposal into one of those decisions' chains is
+   * not proposed again, so restating a decision doesn't re-propose its
+   * near-ties. Shadow mode still auto-closes only the best match. A finite
+   * number in [0, 1); the constructor throws otherwise. 0 proposes exact
+   * ties only. Default 0.05.
+   */
+  supersedeMargin?: number;
+  /**
    * TB/UV v2 rollout mode for the asserted-truth ledger:
    * - 'shadow' (default, Phase 0): the supersession detector keeps its
    *   auto-close behavior AND writes PROPOSALs to the truth ledger.

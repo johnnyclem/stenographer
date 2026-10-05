@@ -1741,6 +1741,24 @@ export class TruthLedger {
     return rows.map((r) => this.rowToEntry(r) as ProposalEntry);
   }
 
+  /**
+   * Open PROPOSALs whose target starts with `prefix`, oldest first. The
+   * supersession detector targets `<superseded>-><successor>`, so
+   * `<decision id>->` finds its open proposals against one decision.
+   */
+  openProposalsByTargetPrefix(prefix: string): ProposalEntry[] {
+    if (!prefix) return [];
+    // A range on the target index: a string that starts with `prefix` sorts
+    // at or after it, and before `prefix` with its last character bumped
+    const end = prefix.slice(0, -1) + String.fromCharCode(prefix.charCodeAt(prefix.length - 1) + 1);
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM truth_entries WHERE type = 'PROPOSAL' AND status = 'open' AND target_ref >= ? AND target_ref < ? ORDER BY seq`
+      )
+      .all(prefix, end) as any[];
+    return rows.map((r) => this.rowToEntry(r) as ProposalEntry);
+  }
+
   /** The proposal the intake filed from the envelope with this id (`meta.intake.id`), whatever became of it. */
   intakeProposal(envelopeId: string): ProposalEntry | null {
     const row = this.db
