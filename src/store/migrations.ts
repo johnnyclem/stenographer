@@ -189,6 +189,16 @@ export const MIGRATIONS: Migration[] = [
   (db) => {
     ensureAttestationSchema(db);
   },
+
+  // 6 — derivation (1.1): a derives link keeps its premise's content hash
+  // (truth_links.content_hash), standing is cached beside status
+  // (truth_entries.standing), and truth_premises indexes what each entry
+  // rests on. The ledger's setup adds them and backfills existing rows,
+  // without rewriting anything the chain covers; this step records that a
+  // 1.0 build must not open the file, since it would write no standing.
+  (db) => {
+    TruthLedger.ensureSchema(db);
+  },
 ];
 
 /** The schema version this build writes. */

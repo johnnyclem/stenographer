@@ -116,7 +116,30 @@ export {
   type IntegrityFailure,
   type IntegrityFailureKind,
 } from './truth/chain.js';
-export { deriveStatus, deriveStruck, deriveAll, type InboundLink, type DerivedState } from './truth/status.js';
+export {
+  deriveStatus,
+  deriveStruck,
+  deriveAll,
+  recordedStatus,
+  deriveStanding,
+  premiseFailure,
+  standingOf,
+  type InboundLink,
+  type DerivedState,
+  type StandingNode,
+  type DerivedStanding,
+} from './truth/status.js';
+export {
+  contentHash,
+  contentRecord,
+  lineContentHash,
+  premisesOf,
+  premisesOfLine,
+  pinnedPremises,
+  citedPremises,
+  type PremiseRef,
+} from './truth/derivation.js';
+export { LINE_ENVELOPE_FIELDS, LINE_BODY_FIELDS, OUTBOUND_LINKS, INBOUND_LINKS, MARKERS } from './truth/format.js';
 export { canonicalize, sha256Hex, CanonicalizationError } from './truth/jcs.js';
 export { runVerifyCLI, verifyStateFile, formatLedgerCheck, startupLedgerCheck, type LedgerCheck } from './truth/verify-cli.js';
 export {

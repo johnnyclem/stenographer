@@ -20,7 +20,7 @@
 
 import { readFileSync } from 'node:fs';
 import { z } from 'zod';
-import { TruthWriteError } from './ledger.js';
+import { TruthWriteError } from './errors.js';
 import { hasAgentPrefix, type AgentClassifier } from './quorum.js';
 import {
   canonicalIdentity,

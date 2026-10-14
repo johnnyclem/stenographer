@@ -52,6 +52,7 @@ import type {
   ProposalBody,
   TombstonedLiteral,
   FiledRulingKind,
+  Premise,
 } from '../truth/types.js';
 import type {
   StenographerAPI,
@@ -1237,6 +1238,8 @@ export class Stenographer implements StenographerAPI {
     literals?: TombstonedLiteral[];
     rationale?: string;
     targetRef?: string;
+    premises?: Premise[];
+    inference?: string;
     proposedBy: string;
     agentSessionId?: string;
   }): Promise<{
@@ -1375,6 +1378,8 @@ export class Stenographer implements StenographerAPI {
     evidence: Evidence[];
     signedBy: string;
     literals?: TombstonedLiteral[];
+    premises?: Premise[];
+    inference?: string;
     author?: string;
     agentSessionId?: string;
   }): Promise<TbEntry> {
@@ -1382,7 +1387,7 @@ export class Stenographer implements StenographerAPI {
     const author = input.author ? this.resolveIdentity(input.author, ['human', 'agent'], 'author') : signedBy;
     const embedding = await (await this.ensureEmbedder()).embed(input.claim);
     return this.store.truth.assertTombstone(
-      { claim: input.claim, evidence: input.evidence, signedBy, literals: input.literals },
+      { claim: input.claim, evidence: input.evidence, signedBy, literals: input.literals, premises: input.premises, inference: input.inference },
       {
         author,
         agentSessionId: input.agentSessionId ?? null,
@@ -1396,6 +1401,8 @@ export class Stenographer implements StenographerAPI {
     basis: string;
     verifyBy: VerifyBy;
     contests?: string | null;
+    premises?: Premise[];
+    inference?: string;
     author: string;
     agentSessionId?: string;
   }): Promise<UvEntry> {
@@ -1407,6 +1414,8 @@ export class Stenographer implements StenographerAPI {
         basis: input.basis,
         verifyBy: input.verifyBy,
         contests: input.contests,
+        premises: input.premises,
+        inference: input.inference,
       },
       { author, agentSessionId: input.agentSessionId ?? null, embedding }
     );

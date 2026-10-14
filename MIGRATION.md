@@ -1,3 +1,14 @@
+# Migrating to 1.1
+
+1.1 adds derivation and standing to the truth ledger and publishes the codec as `@stenographer/core/truth-format`. Nothing to run by hand: the first 1.1 opener (`start`, `verify`, `notarize`, `proposals`) migrates the state file in place (`PRAGMA user_version` 5 → 6), adding `truth_links.content_hash`, `truth_entries.standing` and the `truth_premises` index, and backfills the index and every entry's standing from what is already stored. Nothing the hash chain covers changes, so the head hash you keep elsewhere stays valid. A 1.0 build refuses the upgraded file, as it refuses any newer schema; back up `stenographer.db` first if you may need to go back. `stenographer gate` opens the file read-only and can't upgrade it: on a file 1.1 hasn't opened yet it fails with a message saying to run `stenographer verify` once.
+
+Behavior changes to check:
+
+- **A `wiki` evidence ref must resolve, alive.** A live write (`assert_tombstone`, `resolve_uv`, `override_tombstone`, `propose_tombstone`) that cites a ledger entry this ledger doesn't hold, or one that is overridden, refuted, struck or unsupported, is refused. Cite the successor, or use `doc` evidence for history. Imported lines and notarized drafts keep refs to entries not held here.
+- **`current` truth leaves unsupported entries out.** An entry whose premise (a `derives` link, or a `wiki` evidence ref that resolves) is overridden, refuted or struck is `unsupported`: `get_truth`, `search_truth`, the context frame and the gate's wiki mode no longer return it by default. `get_truth` with `truthFilter: "all"` still does, with its `standing` and `reasons`.
+- **Teammates on 1.0** keep a derived line you export and file it as an `unknown-value` proposal, never as truth, until they upgrade. The format stays at version 2; nothing else about your stream changes.
+- **Library users:** `TruthLedger` reads and writes the three new columns and the index; a program that writes the SQLite file directly must keep them in step, or `stenographer verify` reports `premises`, `link-hash` or `standing`. `TruthWriteError` and the codec moved to `errors.ts` and `wiki-codec.ts`; `ledger.ts` and `wiki.ts` re-export them. A reader that only needs the codec imports `@stenographer/core/truth-format`, which never loads `better-sqlite3`.
+
 # Migrating from 0.1.0-alpha.x to 1.0
 
 1.0 is a major release. Most of its breaking changes close audit findings about the truth ledger's authority model, ingestion across restarts and REST exposure; the [CHANGELOG](CHANGELOG.md) lists each one with its finding id. This guide says what to change, in the order to do it.

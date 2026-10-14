@@ -23,7 +23,7 @@
  * write and checked by `stenographer verify`.
  */
 
-import type { LinkType, TruthEntryType, TruthLink } from './types.js';
+import type { LinkType, Standing, StandingReason, StandingReasonKind, TruthEntryType, TruthLink } from './types.js';
 
 const ORDER: Partial<Record<TruthEntryType, readonly string[]>> = {
   TB: ['active', 'contested', 'overridden'],
@@ -134,4 +134,129 @@ export function deriveAll(
   for (const entry of entries) if (entry.type !== 'TB') derive(entry);
   for (const entry of entries) if (entry.type === 'TB') derive(entry);
   return derived;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Standing: what happened underneath an entry
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * What the standing fold reads of an entry: its type, its derived status
+ * and struck flag, and the ids of its premises (the targets of its
+ * `derives` links, and the `wiki` evidence refs it cites). The ledger reads
+ * nodes from its tables; a stream reader builds them from the lines it
+ * folded (derivation.ts premisesOfLine).
+ */
+export interface StandingNode {
+  type: TruthEntryType;
+  status: string | null;
+  struck: boolean;
+  premises: Array<{ id: string; kind: 'derives' | 'wiki' }>;
+  /**
+   * The standing this reader has cached for the entry, when it has one and
+   * it is current. A sound premise outside the set being derived is not
+   * walked: it contributes nothing. Leave it out to walk everything.
+   */
+  standing?: Standing | null;
+}
+
+export interface DerivedStanding {
+  standing: Standing;
+  /** The nearest failing premise on each path below the entry, in premise order. */
+  reasons: StandingReason[];
+}
+
+const UNSUPPORTING: readonly StandingReasonKind[] = ['premise-overridden', 'premise-refuted', 'premise-struck'];
+
+/** Why a premise fails on its own, if it does: dead (unsupporting), or weak (clouding). */
+export function premiseFailure(node: StandingNode): StandingReasonKind | null {
+  if (node.struck) return 'premise-struck';
+  if (node.type === 'TB') {
+    if (node.status === 'overridden') return 'premise-overridden';
+    if (node.status === 'contested') return 'premise-under-appeal';
+    return null;
+  }
+  if (node.type === 'UV') {
+    if (node.status === 'refuted') return 'premise-refuted';
+    if (node.status === 'open') return 'premise-open';
+    return null;
+  }
+  return null;
+}
+
+/** The standing a set of reasons adds up to: the worst of them. */
+export function standingOf(reasons: readonly StandingReason[]): Standing {
+  if (reasons.some((r) => UNSUPPORTING.includes(r.reason))) return 'unsupported';
+  return reasons.length > 0 ? 'clouded' : 'sound';
+}
+
+/**
+ * Derives the standing of `ids` from the premises below each, all the way
+ * down (spec/truth-format, "Standing"). `node` reads one entry; it answers
+ * undefined for an id the reader doesn't hold.
+ *
+ * A pinned premise (`derives`) the reader doesn't hold clouds the entry
+ * (`premise-missing`); an unpinned one (a `wiki` evidence ref) that doesn't
+ * resolve is no premise at all. A premise that fails on its own — struck,
+ * overridden, refuted, under appeal, or an open UV — is the nearest failing
+ * premise on that path, and nothing below it is read. A premise that holds
+ * on its own passes its own reasons up, each marked `via` that premise. An
+ * entry with no premises, or whose premises all hold, is sound. The walk is
+ * memoized and cycle-safe: a premise reached again on the path it is on
+ * contributes nothing (the ledger never writes a `derives` cycle, but
+ * imported `wiki` refs can cross).
+ *
+ * `ids` are derived in full. A premise outside them whose node carries a
+ * cached standing of `sound` is taken at its word, so a write re-derives
+ * what it touched and what rests on that, not the whole ledger below.
+ */
+export function deriveStanding(
+  ids: Iterable<string>,
+  node: (id: string) => StandingNode | undefined,
+  memo: Map<string, DerivedStanding> = new Map()
+): Map<string, DerivedStanding> {
+  const dirty = new Set(ids);
+  const visiting = new Set<string>();
+  const walk = (id: string, entry: StandingNode): DerivedStanding => {
+    const done = memo.get(id);
+    if (done) return done;
+    visiting.add(id);
+    // Each failing premise once per direct premise it is reached through: two
+    // premises resting on one dead root give two reasons, not one per path
+    // (a deep chain has exponentially many paths)
+    const seen = new Set<string>();
+    const reasons: StandingReason[] = [];
+    const add = (r: StandingReason) => {
+      const key = `${r.premise}\u0000${r.reason}\u0000${r.via ?? ''}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        reasons.push(r);
+      }
+    };
+    for (const premise of entry.premises) {
+      if (premise.id === id || visiting.has(premise.id)) continue;
+      const below = node(premise.id);
+      if (!below) {
+        if (premise.kind === 'derives') add({ premise: premise.id, reason: 'premise-missing' });
+        continue;
+      }
+      const own = premiseFailure(below);
+      if (own) {
+        add({ premise: premise.id, reason: own });
+        continue;
+      }
+      if (!dirty.has(premise.id) && !memo.has(premise.id) && below.standing === 'sound') continue;
+      for (const r of walk(premise.id, below).reasons) add({ premise: r.premise, reason: r.reason, via: premise.id });
+    }
+    visiting.delete(id);
+    const derived = { standing: standingOf(reasons), reasons };
+    memo.set(id, derived);
+    return derived;
+  };
+  const out = new Map<string, DerivedStanding>();
+  for (const id of dirty) {
+    const entry = node(id);
+    if (entry) out.set(id, walk(id, entry));
+  }
+  return out;
 }

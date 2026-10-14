@@ -1,22 +1,9 @@
 /**
- * Stenographer — Team llm-wiki interop: the truth format, v2 (§8)
+ * Stenographer — Team llm-wiki interop: export and import (§8)
  *
- * The normative spec is spec/truth-format/README.md, with a JSON Schema
- * (wiki-line.v2.schema.json) and golden fixtures. In short:
- *
- * - A wiki file is one ledger's append-only, hash-chained line stream:
- *   every line has `seq` (1, 2, 3, … per ledger), `prevHash` (the previous
- *   line's hash) and `hash` (SHA-256 of the line's JCS form without `hash`).
- *   One writer per file.
- * - Entry lines are the ledger's records: TB and UV (with the status they
- *   had when written), and the ADDENDUM and RULING entries that change a
- *   status. Every later status change is an appended TRANSITION line
- *   naming its target, the new status and its cause. A reader's current
- *   status for an entry is the status of the highest-seq TRANSITION that
- *   targets it, else the entry line's own. Nothing is rewritten.
- * - Unknown or missing statuses are excluded from current truth (fail
- *   closed). Proposals never travel in a wiki file; PROPOSAL lines are the
- *   intake's format (intake.ts).
+ * The line format and its codec are wiki-codec.ts (spec/truth-format).
+ * This module replays the ledger into its hash-chained stream, and admits
+ * a teammate's stream into the ledger.
  *
  * Import validates every line and the chain, then runs the file in one
  * transaction: either every line lands, or none does and the result lists
@@ -30,59 +17,60 @@
  * Re-importing a file is a no-op. A TB, UV, ADDENDUM or RULING line's fields
  * this version doesn't define are kept with the entry (its body's `extra`)
  * and exported again as written; TRANSITIONs are derived, so theirs aren't.
- *
- * v1 lines (0.x: no schemaVersion, a `status` field) are still read; see
- * the spec's upgrade notes.
  */
 
 import { z } from 'zod';
 import { canonicalize, sha256Hex } from './jcs.js';
 import { deriveStatus, deriveStruck, recordedStatus, type InboundLink } from './status.js';
 import { agentClassifier, resolveIdentity, type SignerRegistry, type SignerRole } from './identity.js';
-import { checkQuorum, type AgentClassifier, type QuorumMember } from './quorum.js';
-import {
-  INBOUND_LINKS,
-  LINE_BODY_FIELDS,
-  LINE_ENVELOPE_FIELDS,
-  OUTBOUND_LINKS,
-  type LedgerRecord,
-  type NewEntry,
-  type TruthLedger,
-} from './ledger.js';
+import { type AgentClassifier, type QuorumMember } from './quorum.js';
+import { LINE_BODY_FIELDS, LINE_ENVELOPE_FIELDS } from './format.js';
+import type { LedgerRecord, NewEntry, TruthLedger } from './ledger.js';
 import {
   EVIDENCE_KINDS,
-  EvidenceSchema,
   LINK_TYPES,
   MIGRATION_AUTHOR,
   ProvenanceSchema,
-  TombstonedLiteralSchema,
   VerifyBySchema,
   canonicalIdentity,
-  hasControlCharacters,
   identityKey,
-  isAnonymousIdentity,
-  isReservedIdentity,
-  isRfc3339DateTime,
   type LinkType,
   type TruthEntryType,
   type TruthLink,
   type UvEntry,
 } from './types.js';
+import {
+  Identity,
+  TbBodyV1,
+  UvBodyV1,
+  WIKI_SCHEMA_VERSION,
+  WIKI_STATUSES,
+  WikiLineError,
+  checkWikiChain,
+  decodeWikiLine,
+  parseOrThrow,
+  wikiLineHash,
+  type CauseKind,
+  type DecodedWikiLine,
+  type WikiLine,
+} from './wiki-codec.js';
 
-export const WIKI_SCHEMA_VERSION = 2;
+export {
+  WIKI_SCHEMA_VERSION,
+  WIKI_STATUSES,
+  CAUSE_KINDS,
+  WikiLineError,
+  checkWikiChain,
+  decodeWikiLine,
+  wikiLineHash,
+  wikiLineTexts,
+  type CauseKind,
+  type DecodedWikiLine,
+  type WikiLine,
+} from './wiki-codec.js';
 
 /** The detector identity reconciliation proposals are filed under. */
 export const WIKI_SYNC_DETECTOR = 'detector:wiki-sync';
-
-/** The statuses a TB or UV line, or a TRANSITION, can carry. `struck` is sticky. */
-export const WIKI_STATUSES = {
-  TB: ['active', 'contested', 'overridden', 'struck'],
-  UV: ['open', 'verified', 'refuted', 'struck'],
-} as const;
-
-/** What caused a TRANSITION. `dismiss` and `promote` are for proposal streams; a wiki export never carries them. */
-export const CAUSE_KINDS = ['contest', 'override', 'strike', 'verify', 'refute', 'dismiss', 'promote'] as const;
-export type CauseKind = (typeof CAUSE_KINDS)[number];
 
 /** Links whose arrival changes the status of a TB or UV. */
 const STATUS_LINKS: readonly LinkType[] = ['contests', 'overrides', 'verifies', 'refutes', 'strikes'];
@@ -90,353 +78,8 @@ const STATUS_LINKS: readonly LinkType[] = ['contests', 'overrides', 'verifies', 
 /** Ruling kinds the ledger knows (types.ts RulingKind). */
 const RULING_KINDS = ['strike', 'promotion', 'contempt', 'objection', 'dismissal'];
 
-// ─────────────────────────────────────────────────────────────
-// Line shapes
-// ─────────────────────────────────────────────────────────────
-
-/** One v2 line, as written: fields in the spec, plus whatever a newer writer added (preserved, not interpreted). */
-export type WikiLine = Record<string, unknown> & {
-  schemaVersion: 2;
-  seq: number;
-  id: string;
-  type: 'TB' | 'UV' | 'ADDENDUM' | 'RULING' | 'PROPOSAL' | 'TRANSITION';
-  ts: string;
-  author: string;
-  prevHash: string | null;
-  hash: string;
-};
-
-/** A line read back and validated. `line` is the parsed object, unknown fields included. */
-export interface DecodedWikiLine {
-  version: 1 | 2;
-  type: WikiLine['type'];
-  line: Record<string, unknown>;
-  /** v2 only. */
-  seq: number | null;
-  prevHash: string | null;
-  hash: string | null;
-}
-
-export class WikiLineError extends Error {}
-
-// ─────────────────────────────────────────────────────────────
-// Structure (mirrors spec/truth-format/wiki-line.v2.schema.json)
-//
-// Lenient where the spec says readers must be: unknown fields pass
-// through, and enum-like fields (status, evidence kind, …) are open
-// strings. What stenographer can admit into its ledger is decided at
-// import (see unknownValue), not here.
-// ─────────────────────────────────────────────────────────────
-
-const ID = z
-  .string()
-  .regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/, 'an id is 1–256 characters: letters, digits, . _ : -');
-const Timestamp = z.string().refine(isRfc3339DateTime, 'ts must be an RFC 3339 date-time naming a real time');
-const Hex64 = z.string().regex(/^[0-9a-f]{64}$/, 'a hash is 64 lowercase hex digits');
-const Text = z.string().min(1);
-const Blankless = z.string().refine((s) => s.trim().length > 0, 'cannot be blank');
-
-/** An identity someone stands behind: the write-time rules (types.ts AuthorSchema), without canonicalizing. */
-function identityIssue(s: string, opts: { reserved?: 'detector' } = {}): string | null {
-  if (isAnonymousIdentity(s)) {
-    return 'anonymous or generic identities cannot assert truth — use a registered human handle or agent identity';
-  }
-  if (hasControlCharacters(s)) return 'identities cannot contain control characters';
-  if (isReservedIdentity(s)) {
-    const detector = identityKey(s).startsWith('detector:');
-    if (opts.reserved === 'detector' && detector) return null;
-    return `'migration' and 'detector:*' are reserved for the backfill and detector paths`;
-  }
-  return null;
-}
-const identity = (opts: { reserved?: 'detector' } = {}) =>
-  z.string().superRefine((s, ctx) => {
-    const issue = identityIssue(s, opts);
-    if (issue) ctx.addIssue({ code: z.ZodIssueCode.custom, message: issue });
-  });
-const Identity = identity();
-
-const Evidence = z.object({ kind: Text, ref: Text, detail: z.string().optional() }).passthrough();
-const VerifyBy = z.object({ kind: Text, value: Text, detail: z.string().optional() }).passthrough();
-const Link = z.object({ fromId: ID, toId: ID, type: Text }).passthrough();
-const Provenance = z.object({ kind: Text, ref: z.string().optional(), line: z.number().int().optional() }).passthrough();
-/** A dead literal as live writes accept it (types.ts), with values as written: no surrounding whitespace. */
-const Literal = z.unknown().superRefine((value, ctx) => {
-  const parsed = TombstonedLiteralSchema.safeParse(value);
-  if (!parsed.success) {
-    for (const issue of parsed.error.issues) ctx.addIssue({ ...issue, path: issue.path });
-    return;
-  }
-  const raw = value as Record<string, unknown>;
-  for (const key of ['dead', 'subject', 'current'] as const) {
-    if (typeof raw[key] === 'string' && raw[key] !== (raw[key] as string).trim()) {
-      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'literal values cannot have surrounding whitespace', path: [key] });
-    }
-  }
-});
-/** A quorum member's shape (spec, Agent quorum): the rules across members and the line are checkQuorum's. */
-const QuorumMember = z
-  .object({ author: z.string(), agentSessionId: z.string(), ts: Timestamp, evidence: z.array(Evidence).min(1, 'a quorum member cites evidence') })
-  .passthrough();
-const AddendumQuorumMember = QuorumMember.extend({ verdict: z.enum(['verified', 'refuted']) });
-const XSteno = z
-  .object({
-    origin: Text.optional(),
-    provenance: Provenance.optional(),
-    agentSessionId: z.string().nullable().optional(),
-    targetRef: z.string().nullable().optional(),
-    links: z.array(Link).optional(),
-    ledgerHash: Hex64.optional(),
-  })
-  .passthrough();
-
-const Envelope = {
-  schemaVersion: z.literal(2),
-  seq: z.number().int().positive(),
-  id: ID,
-  ts: Timestamp,
-  author: z.string(),
-  prevHash: Hex64.nullable(),
-  hash: Hex64,
-  'x-steno': XSteno.optional(),
-};
-
-const TbLine = z
-  .object({
-    ...Envelope,
-    type: z.literal('TB'),
-    claim: Text,
-    evidence: z.array(Evidence).min(1, 'a TB requires at least one piece of evidence'),
-    signedBy: Identity.nullable(),
-    literals: z.array(Literal).min(1, 'omit literals rather than send none').optional(),
-    quorum: z.array(QuorumMember).optional(),
-    status: Text.optional(),
-  })
-  .passthrough();
-const UvLine = z
-  .object({
-    ...Envelope,
-    type: z.literal('UV'),
-    author: Identity,
-    assertion: Text,
-    basis: Text,
-    verifyBy: VerifyBy,
-    contests: ID.nullable(),
-    status: Text.optional(),
-  })
-  .passthrough();
-const AddendumLine = z
-  .object({
-    ...Envelope,
-    type: z.literal('ADDENDUM'),
-    author: Identity,
-    evidence: z.array(Evidence).min(1, 'an addendum requires at least one piece of evidence'),
-    note: z.string().nullable(),
-    quorum: z.array(AddendumQuorumMember).optional(),
-  })
-  .passthrough();
-const RulingLine = z
-  .object({ ...Envelope, type: z.literal('RULING'), author: Identity, kind: Text, opinion: Blankless, target: ID })
-  .passthrough();
-const ProposalLine = z
-  .object({
-    ...Envelope,
-    type: z.literal('PROPOSAL'),
-    // Detectors file proposals
-    author: identity({ reserved: 'detector' }),
-    kind: Text,
-    draft: z.record(z.unknown()),
-    targetRef: z.string().nullable(),
-    signal: z.object({ source: Text }).passthrough(),
-    agentSessionId: z.string().nullable().optional(),
-  })
-  .passthrough();
-const TransitionLine = z
-  .object({
-    ...Envelope,
-    type: z.literal('TRANSITION'),
-    // A transition's author is its cause's: a person or an agent, never 'migration' or a detector
-    author: Identity,
-    target: ID,
-    status: Text,
-    cause: z.object({ kind: Text, ref: ID.nullable() }).passthrough(),
-  })
-  .passthrough();
-
-const LineV2 = z
-  .discriminatedUnion('type', [TbLine, UvLine, AddendumLine, RulingLine, ProposalLine, TransitionLine])
-  .superRefine((line, ctx) => {
-    const issue = (message: string, path: string[] = []) => ctx.addIssue({ code: z.ZodIssueCode.custom, message, path });
-    if ((line.seq === 1) !== (line.prevHash === null)) {
-      issue('prevHash is null on the first line of a stream (seq 1), and only there', ['prevHash']);
-    }
-    if (line.type === 'TB') {
-      // The backfill's second-class TBs are the one place 'migration' authors one, unsigned
-      const migration = identityKey(line.author) === MIGRATION_AUTHOR && line.signedBy === null;
-      const authorIssue = migration ? null : identityIssue(line.author);
-      if (authorIssue) issue(authorIssue, ['author']);
-    }
-    const links = line['x-steno']?.links ?? [];
-    const keys = links.map((l) => JSON.stringify([l.fromId, l.toId, l.type]));
-    if (new Set(keys).size !== keys.length) issue('a line lists each link once', ['x-steno', 'links']);
-    if (line.type === 'TB' || line.type === 'UV') {
-      // A line speaks for itself: links from it of a kind its type writes, or its own history
-      for (const [i, l] of links.entries()) {
-        if (!(LINK_TYPES as readonly string[]).includes(l.type)) continue; // an unknown kind: decided at import
-        const type = l.type as LinkType;
-        const own =
-          (l.fromId === line.id && OUTBOUND_LINKS[line.type].includes(type)) ||
-          (l.toId === line.id && l.fromId !== line.id && (INBOUND_LINKS[line.type] ?? []).includes(type));
-        if (!own) issue(`a ${line.type} line cannot carry the link ${l.fromId} -${l.type}-> ${l.toId}`, ['x-steno', 'links', String(i)]);
-      }
-    }
-    if (line.type === 'UV' && line['x-steno']?.links) {
-      const contestLinks = links.filter((l) => l.type === 'contests' && l.fromId === line.id);
-      if (line.contests && !contestLinks.some((l) => l.toId === line.contests)) {
-        issue('a UV that contests a TB lists its contests link in x-steno.links', ['x-steno', 'links']);
-      }
-      if (contestLinks.some((l) => l.toId !== line.contests)) {
-        issue('a contests link points at the TB the contests field names', ['x-steno', 'links']);
-      }
-    }
-    if (line.type === 'ADDENDUM' || line.type === 'RULING') {
-      for (const [i, l] of links.entries()) {
-        if (l.fromId !== line.id) {
-          issue(`${line.type === 'ADDENDUM' ? 'an' : 'a'} ${line.type} line lists only the links it writes`, ['x-steno', 'links', String(i)]);
-        }
-      }
-    }
-    // Agents settle only together: a quorum keeps rules 1–6, and appears only on a TB or an ADDENDUM
-    if ('quorum' in line) {
-      for (const message of checkQuorum(line as Parameters<typeof checkQuorum>[0])) issue(message, ['quorum']);
-    }
-  });
-
-// ─────────────────────────────────────────────────────────────
-// v1 (0.x): no version, a `status` field, no hash
-// ─────────────────────────────────────────────────────────────
-
-const LineV1 = z
-  .object({
-    schemaVersion: z.literal(1).optional(),
-    id: ID,
-    type: z.enum(['TB', 'UV']),
-    ts: z.string().refine((s) => Number.isFinite(Date.parse(s)), 'ts must be a timestamp'),
-    author: z.string(),
-    status: z.string().optional(),
-    'x-steno': z
-      .object({
-        origin: z.enum(['local', 'wiki']).optional(),
-        provenance: ProvenanceSchema.optional(),
-        agentSessionId: z.string().nullable().optional(),
-        links: z.array(z.object({ fromId: ID, toId: ID, type: z.enum(LINK_TYPES) })).optional(),
-      })
-      .passthrough()
-      .optional(),
-  })
-  .passthrough();
-
-const TbBodyV1 = z.object({
-  claim: z.string().min(1),
-  evidence: z.array(EvidenceSchema).min(1, 'a TB requires at least one piece of evidence'),
-  signedBy: Identity.nullable().optional(),
-  literals: z.array(TombstonedLiteralSchema).optional(),
-});
-
-const UvBodyV1 = z.object({
-  author: Identity,
-  assertion: z.string().min(1),
-  basis: z.string().min(1),
-  verifyBy: VerifyBySchema,
-  contests: ID.nullable().optional(),
-});
-
 /** Terminal statuses: the only recorded statuses the ledger's fold reads (status.ts). */
 const TERMINAL = new Set(['overridden', 'verified', 'refuted']);
-
-// ─────────────────────────────────────────────────────────────
-// Codec
-// ─────────────────────────────────────────────────────────────
-
-function formatIssues(error: z.ZodError): string {
-  return error.issues.map((i) => (i.path.length > 0 ? `${i.path.join('.')}: ${i.message}` : i.message)).join('; ');
-}
-
-function parseOrThrow<T>(schema: z.ZodType<T, z.ZodTypeDef, unknown>, value: unknown): T {
-  const parsed = schema.safeParse(value);
-  if (!parsed.success) throw new WikiLineError(formatIssues(parsed.error));
-  return parsed.data;
-}
-
-/** sha256hex(JCS(line without `hash`)): the hash a v2 line carries. Doesn't validate the line. */
-export function wikiLineHash(line: string | Record<string, unknown>): string {
-  const { hash: _hash, ...rest } = typeof line === 'string' ? (JSON.parse(line) as Record<string, unknown>) : line;
-  return sha256Hex(canonicalize(rest));
-}
-
-/**
- * Reads one wiki line: validates it (v2, or v1 from 0.x) and checks its
- * hash. Throws WikiLineError when it is not a valid line. Chain continuity
- * across lines is checkWikiChain's. This is the codec the spec's fixtures pin.
- */
-export function decodeWikiLine(text: string): DecodedWikiLine {
-  let raw: unknown;
-  try {
-    raw = JSON.parse(text);
-  } catch (err) {
-    throw new WikiLineError(`not JSON: ${err instanceof Error ? err.message : String(err)}`);
-  }
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new WikiLineError('a line is a JSON object');
-  const obj = raw as Record<string, unknown>;
-  const version = obj.schemaVersion;
-  if (version === undefined || version === 1) {
-    parseOrThrow(LineV1, obj);
-    // 0.x wrote no quorum; an agent's settlement is a v2 line
-    if ('quorum' in obj) throw new WikiLineError('a v1 line carries no quorum: agents settle claims together only on v2 lines');
-    return { version: 1, type: obj.type as 'TB' | 'UV', line: obj, seq: null, prevHash: null, hash: null };
-  }
-  if (version !== 2) throw new WikiLineError(`schemaVersion ${JSON.stringify(version)} is not one this stenographer reads (1, 2)`);
-
-  const line = parseOrThrow(LineV2, obj);
-  let hash: string;
-  try {
-    hash = wikiLineHash(obj);
-  } catch (err) {
-    throw new WikiLineError(`the line can't be canonicalized: ${err instanceof Error ? err.message : String(err)}`);
-  }
-  if (hash !== line.hash) {
-    throw new WikiLineError(`hash mismatch: the line hashes to ${hash}, not ${line.hash} — it was changed after it was written`);
-  }
-  return { version: 2, type: line.type, line: obj, seq: line.seq, prevHash: line.prevHash, hash: line.hash };
-}
-
-/**
- * Checks that decoded v2 lines form one stream: each line's seq follows the
- * one before it, and its prevHash is that line's hash. A stream may start
- * part-way (an incremental export), but not skip, repeat, reorder or
- * interleave two writers. Returns the index and error of each break.
- */
-export function checkWikiChain(lines: Array<DecodedWikiLine | null>): Array<{ index: number; error: string }> {
-  const breaks: Array<{ index: number; error: string }> = [];
-  let prev: DecodedWikiLine | null = null;
-  lines.forEach((d, index) => {
-    if (!d) {
-      prev = null; // an unreadable line: don't pile chain errors on top of its own
-      return;
-    }
-    if (d.version !== 2) return;
-    if (prev && d.seq !== prev.seq! + 1) {
-      breaks.push({ index, error: `chain broken: seq ${d.seq} follows ${prev.seq} — a line is missing, repeated or out of order` });
-    } else if (prev && d.prevHash !== prev.hash) {
-      breaks.push({
-        index,
-        error: `chain broken: prevHash ${d.prevHash} is not the previous line's hash ${prev.hash} — two writers' lines, or an edited one`,
-      });
-    }
-    prev = d;
-  });
-  return breaks;
-}
 
 // ─────────────────────────────────────────────────────────────
 // Export: the ledger as one hash-chained line stream
@@ -539,8 +182,15 @@ function buildStream(ledger: TruthLedger): { lines: WikiLine[]; skipped: Array<{
               signedBy: b.signedBy,
               ...(b.literals !== undefined ? { literals: b.literals } : {}),
               ...(b.quorum !== undefined ? { quorum: b.quorum } : {}),
+              ...(b.inference !== undefined ? { inference: b.inference } : {}),
             }
-          : { assertion: b.assertion, basis: b.basis, verifyBy: b.verifyBy, contests: b.contests ?? null };
+          : {
+              assertion: b.assertion,
+              basis: b.basis,
+              verifyBy: b.verifyBy,
+              contests: b.contests ?? null,
+              ...(b.inference !== undefined ? { inference: b.inference } : {}),
+            };
       if (emit({ ...envelope, ...body, status, ...extra, 'x-steno': steno }, r.id)) {
         stated.set(r.id, status);
         written.add(r.id);
@@ -758,7 +408,9 @@ function applyLine(
     case 'UV': {
       const entry = entryOf(d);
       // An entry already held is compared, never re-routed: the same is a no-op, a different one a conflict
-      const route = entry.route ?? (ledger.getEntry(id) ? null : entryRoute(d, entry.entry, signers, isAgent));
+      const route =
+        entry.route ??
+        (ledger.getEntry(id) ? null : (entryRoute(d, entry.entry, signers, isAgent) ?? premiseConflict(ledger, entry.entry, entry.links)));
       if (route) {
         reconcile(ledger, lineNo, d, entry.entry, route.reason, route.detail, options, result);
         return;
@@ -858,10 +510,19 @@ function entryOf(d: DecodedWikiLine): EntryOf {
           signedBy: line.signedBy,
           ...(line.literals !== undefined ? { literals: line.literals } : {}),
           ...(line.quorum !== undefined ? { quorum: line.quorum } : {}),
+          ...(line.inference !== undefined ? { inference: line.inference } : {}),
           ...floor,
           ...extraOf(line, type),
         }
-      : { assertion: line.assertion, basis: line.basis, verifyBy: line.verifyBy, contests: line.contests, ...floor, ...extraOf(line, type) };
+      : {
+          assertion: line.assertion,
+          basis: line.basis,
+          verifyBy: line.verifyBy,
+          contests: line.contests,
+          ...(line.inference !== undefined ? { inference: line.inference } : {}),
+          ...floor,
+          ...extraOf(line, type),
+        };
   return {
     entry: {
       id,
@@ -873,7 +534,7 @@ function entryOf(d: DecodedWikiLine): EntryOf {
       origin: 'wiki',
       body,
     },
-    links: (x.links ?? []).map((l) => ({ fromId: l.fromId, toId: l.toId, type: l.type })),
+    links: (x.links ?? []).map(importedLink),
     targetRef: x.targetRef ?? null,
     ...(route ? { route } : {}),
   };
@@ -991,6 +652,27 @@ function entryRoute(d: DecodedWikiLine, entry: NewEntry, signers: SignerRegistry
         detail:
           `wiki TB ${entry.id} is signed by agent ${body.signedBy} with ${why === 'no quorum' ? 'no quorum' : `a quorum that isn't all agents (${why})`}: ` +
           'agents settle a claim only as two or more agent sessions agreeing from different angles within 15 minutes, or a person signs it',
+      };
+    }
+  }
+  return null;
+}
+
+/**
+ * A derived line whose pin names content this ledger doesn't hold: the
+ * premise it rests on is held here with another body (which the stream
+ * filed as a conflict when it arrived), so what the signer attested to
+ * isn't what this ledger has. Filed as a conflict too. A premise not held
+ * here is no conflict: the entry lands, clouded (`premise-missing`).
+ */
+function premiseConflict(ledger: TruthLedger, entry: NewEntry, links: TruthLink[]): Route | null {
+  for (const l of links) {
+    if (l.type !== 'derives' || l.fromId !== entry.id) continue;
+    const held = ledger.contentHashOf(l.toId);
+    if (held !== null && held !== l.contentHash) {
+      return {
+        reason: 'conflict',
+        detail: `wiki ${entry.type} ${entry.id} derives from ${l.toId} pinned by content hash ${l.contentHash}, but the copy this ledger holds hashes to ${held}`,
       };
     }
   }
@@ -1154,23 +836,9 @@ function reconcile(
   if (reason === 'conflict') result.conflicts.push({ id, proposalId: proposal.id });
 }
 
-/**
- * The claim or assertion of each TB/UV line, by id — what the engine embeds
- * before an import. Lines that don't parse are skipped (import reports them).
- */
-export function wikiLineTexts(lines: string[]): Map<string, string> {
-  const texts = new Map<string, string>();
-  for (const text of lines) {
-    if (text.trim().length === 0) continue;
-    try {
-      const line = JSON.parse(text) as { id?: unknown; type?: unknown; claim?: unknown; assertion?: unknown };
-      const salient = line.type === 'TB' ? line.claim : line.type === 'UV' ? line.assertion : undefined;
-      if (typeof line.id === 'string' && typeof salient === 'string' && salient.length > 0) texts.set(line.id, salient);
-    } catch {
-      // reported by the import
-    }
-  }
-  return texts;
+/** A link as a line carries it: its content hash too, on a `derives` link. */
+function importedLink(l: TruthLink): TruthLink {
+  return { fromId: l.fromId, toId: l.toId, type: l.type, ...(l.contentHash !== undefined ? { contentHash: l.contentHash } : {}) };
 }
 
 function idOf(text: string): { id?: string } {

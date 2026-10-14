@@ -251,6 +251,7 @@ export const LINK_TYPES = [
   'overrides',
   'strikes',
   'dismisses',
+  'derives',
 ] as const;
 export type LinkType = (typeof LINK_TYPES)[number];
 
@@ -258,6 +259,67 @@ export interface TruthLink {
   fromId: string;
   toId: string;
   type: LinkType;
+  /**
+   * On a `derives` link only: the premise's content hash when the derived
+   * entry was written (spec/truth-format, "Derivation"). A premise whose
+   * content no longer hashes to it is not the one the signer attested to.
+   */
+  contentHash?: string;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Derivation and standing — what an entry rests on
+// ─────────────────────────────────────────────────────────────
+
+/** The most premises one entry may derive from. A deeper argument writes intermediate entries. */
+export const MAX_PREMISES = 16;
+
+const HEX64 = /^[0-9a-f]{64}$/;
+
+/** A premise as a writer names it: the entry id, pinned by its content hash. */
+export const PremiseSchema = z.object({
+  id: z.string().min(1),
+  contentHash: z.string().regex(HEX64, 'a contentHash is 64 lowercase hex digits'),
+});
+export type Premise = z.infer<typeof PremiseSchema>;
+
+export const PremisesSchema = z
+  .array(PremiseSchema)
+  .min(1, 'a derivation names at least one premise')
+  .max(MAX_PREMISES, `an entry derives from at most ${MAX_PREMISES} premises`)
+  .refine((premises) => new Set(premises.map((p) => p.id)).size === premises.length, 'a premise is named once');
+
+/** The sentence stating the inference from the premises to the claim. */
+export const InferenceSchema = z.string().refine((s) => s.trim().length > 0, 'an inference is a sentence, not blank');
+
+/** `premises` and `inference` come together: a derivation names what it rests on and says how. */
+const DERIVATION_TOGETHER = {
+  message: 'premises and inference come together: a derived entry names its premises and states the inference',
+  path: ['inference'],
+};
+const derivationTogether = (v: { premises?: unknown; inference?: unknown }) => (v.premises === undefined) === (v.inference === undefined);
+
+/**
+ * Standing: what happened underneath an entry, as opposed to status, which
+ * says what happened to it (spec/truth-format, "Standing"). Computed on
+ * read over the premises, all the way down; never stored in a stream.
+ */
+export type Standing = 'sound' | 'clouded' | 'unsupported';
+
+export type StandingReasonKind =
+  | 'premise-missing'
+  | 'premise-open'
+  | 'premise-under-appeal'
+  | 'premise-overridden'
+  | 'premise-refuted'
+  | 'premise-struck';
+
+/** The nearest failing premise on one path below an entry, and the direct premise it was reached through. */
+export interface StandingReason {
+  premise: string;
+  reason: StandingReasonKind;
+  /** Set when `premise` is not a direct premise: the direct premise under which it was found. */
+  via?: string;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -290,6 +352,14 @@ export interface TruthEnvelope {
   /** 'wiki' entries are authoritative in the wiki file; content is mirrored here. */
   origin: 'local' | 'wiki';
   links: TruthLink[];
+  /**
+   * Read-side, on a TB or UV: its standing and the premises that set it
+   * (status.ts deriveStanding), and the hash a derived entry pins it by.
+   * Never stored, never on a wiki line.
+   */
+  standing?: Standing;
+  reasons?: StandingReason[];
+  contentHash?: string;
 }
 
 /**
@@ -313,6 +383,8 @@ export interface TbBody {
   literals?: TombstonedLiteral[];
   /** The agent sessions that settled it together, when agents signed it (spec, Agent quorum). */
   quorum?: QuorumMember[];
+  /** The inference from its premises (the `derives` links) to the claim, when it is derived. */
+  inference?: string;
   extra?: ExtraFields;
 }
 
@@ -326,6 +398,8 @@ export interface UvBody {
   verifyBy: VerifyBy;
   /** Id of a TB this UV disputes — this link puts the TB into `contested`. */
   contests?: string | null;
+  /** The inference from its premises (the `derives` links) to the assertion, when it is derived. */
+  inference?: string;
   status: UvStatus;
   extra?: ExtraFields;
 }
@@ -428,31 +502,46 @@ export type MarkerEntry = TruthEnvelope & { type: 'MARKER'; body: MarkerBody };
 // Write-time validation schemas
 // ─────────────────────────────────────────────────────────────
 
-export const TbInputSchema = z.object({
-  claim: z.string().min(1),
-  evidence: z.array(EvidenceSchema).min(1, 'a TB requires at least one piece of evidence'),
-  signedBy: AuthorSchema,
-  literals: z.array(TombstonedLiteralSchema).optional(),
-});
+/** What a derived entry adds to its input: the premises it rests on, and the inference. */
+const DerivationInput = {
+  premises: PremisesSchema.optional(),
+  inference: InferenceSchema.optional(),
+};
+
+export const TbInputSchema = z
+  .object({
+    claim: z.string().min(1),
+    evidence: z.array(EvidenceSchema).min(1, 'a TB requires at least one piece of evidence'),
+    signedBy: AuthorSchema,
+    literals: z.array(TombstonedLiteralSchema).optional(),
+    ...DerivationInput,
+  })
+  .refine(derivationTogether, DERIVATION_TOGETHER);
 
 /** What an agent may draft: a TB body minus the signature it can't give itself. */
-export const TombstoneDraftInputSchema = z.object({
-  claim: z.string().min(1),
-  evidence: z.array(EvidenceSchema).min(1, 'a tombstone draft requires at least one piece of evidence'),
-  literals: z.array(TombstonedLiteralSchema).optional(),
-});
+export const TombstoneDraftInputSchema = z
+  .object({
+    claim: z.string().min(1),
+    evidence: z.array(EvidenceSchema).min(1, 'a tombstone draft requires at least one piece of evidence'),
+    literals: z.array(TombstonedLiteralSchema).optional(),
+    ...DerivationInput,
+  })
+  .refine(derivationTogether, DERIVATION_TOGETHER);
 
-export const UvInputSchema = z.object({
-  assertion: z.string().min(1),
-  basis: z.string().min(1),
-  verifyBy: VerifyBySchema,
-  // Wiki lines and intake drafts carry `contests: null` for "contests nothing"
-  contests: z
-    .string()
-    .min(1)
-    .nullish()
-    .transform((v) => v ?? undefined),
-});
+export const UvInputSchema = z
+  .object({
+    assertion: z.string().min(1),
+    basis: z.string().min(1),
+    verifyBy: VerifyBySchema,
+    // Wiki lines and intake drafts carry `contests: null` for "contests nothing"
+    contests: z
+      .string()
+      .min(1)
+      .nullish()
+      .transform((v) => v ?? undefined),
+    ...DerivationInput,
+  })
+  .refine(derivationTogether, DERIVATION_TOGETHER);
 
 /**
  * Corrections a notary may make to a draft when signing it: the draft's own
@@ -468,10 +557,15 @@ export const DraftEditsSchema = z
     basis: z.string().min(1),
     verifyBy: VerifyBySchema.strict(),
     contests: z.string().min(1).nullable(),
+    premises: z.array(PremiseSchema.strict()).min(1).max(MAX_PREMISES),
+    inference: InferenceSchema,
   })
   .partial()
   .strict()
-  .describe('Corrections to the draft, applied at signing time (TB: claim/evidence/literals; UV: assertion/basis/verifyBy/contests)');
+  .describe(
+    'Corrections to the draft, applied at signing time (TB: claim/evidence/literals; UV: assertion/basis/verifyBy/contests; ' +
+      'either: premises/inference)'
+  );
 
 // ─────────────────────────────────────────────────────────────
 // Downstream consumption rules (§7) — shipped verbatim inside

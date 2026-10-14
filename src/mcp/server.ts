@@ -35,6 +35,8 @@ import { ALLOW_AGENT_ASSERT_REMOVED, Stenographer } from '../core/stenographer.j
 import type { TombstoneQuorumProgress } from '../truth/attestations.js';
 import {
   CONSUMPTION_RULES,
+  PremiseSchema,
+  MAX_PREMISES,
   EvidenceSchema,
   VerifyBySchema,
   StrictTombstonedLiteralSchema,
@@ -45,7 +47,7 @@ import { createMcpChannelTransport, type ObjectionSinkConfig } from '../truth/de
 import { startupLedgerCheck } from '../truth/verify-cli.js';
 import type { StenographerConfig, StenographerMode } from '../types.js';
 
-const VERSION = '1.0.0';
+const VERSION = '1.1.0';
 
 export type ToolProfile = 'agent' | 'operator';
 const PROFILES: ToolProfile[] = ['agent', 'operator'];
@@ -152,6 +154,21 @@ const Literals = z
       'value needs its subject (e.g. {subject: "LOG_BUDGET", dead: "30", current: "100"}); a distinctive identifier ' +
       'may stand alone (e.g. {dead: "legacyRateLimiter"}).'
   );
+const Premises = z
+  .array(PremiseSchema.strict())
+  .min(1)
+  .max(MAX_PREMISES)
+  .describe(
+    'The entries this one is derived from, each pinned by the contentHash get_truth and search_truth return for it ' +
+      `(1–${MAX_PREMISES}). The ledger refuses a premise it does not hold, one whose content changed, or a dead one ` +
+      '(overridden, refuted, struck, or unsupported); an open UV or a TB under appeal is allowed, and the entry starts ' +
+      'clouded. Comes with inference.'
+  );
+const Inference = z
+  .string()
+  .min(1)
+  .describe('One sentence stating the inference from the premises to this claim. Required with premises, refused without.');
+const DerivationFields = { premises: Premises.optional(), inference: Inference.optional() };
 const TruthFilterArg = z
   .enum(['current', 'all', 'contested'])
   .describe('Which truth entries to include')
@@ -545,8 +562,10 @@ export class StenographerServer {
       tool({
         name: 'get_truth',
         description:
-          'Truth-ledger entries by filter (default "current": active/contested TBs and open UVs; struck and ' +
-          'overridden entries excluded). ' + CONSUMPTION_RULES,
+          'Truth-ledger entries by filter (default "current": active/contested TBs and open UVs; struck, ' +
+          'overridden and unsupported entries excluded). Every entry carries its standing (sound, clouded or ' +
+          'unsupported: what happened to the premises below it) with reasons naming the weak premise, and the ' +
+          'contentHash to pin it by as a premise. ' + CONSUMPTION_RULES,
         input: args({ truthFilter: TruthFilterArg }),
         annotations: READ_ONLY,
         run: ({ truthFilter }) => e.getTruth(truthFilter),
@@ -554,8 +573,8 @@ export class StenographerServer {
       tool({
         name: 'search_truth',
         description:
-          'Truth-ledger entries ranked by embedding relevance to a query. Ties break toward the TB. ' +
-          CONSUMPTION_RULES,
+          'Truth-ledger entries ranked by embedding relevance to a query. Ties break toward the TB. Each carries its ' +
+          'standing and the contentHash to pin it by as a premise. ' + CONSUMPTION_RULES,
         input: args({ query: Text('Search query'), k: limit('Number of results', 5, 50), truthFilter: TruthFilterArg }),
         annotations: READ_ONLY,
         run: ({ query, k, truthFilter }) => e.searchTruth(query, k, truthFilter),
@@ -634,6 +653,7 @@ export class StenographerServer {
           claim: Text('What is dead and what replaces it (if anything)'),
           evidence: Evidence,
           literals: Literals.optional(),
+          ...DerivationFields,
           rationale: z.string().min(1).describe('Why you believe it — shown to the person approving').optional(),
           targetRef: z
             .string()
@@ -673,7 +693,7 @@ export class StenographerServer {
           'Assert a UV — an unverified assertion ("there be dragons"): believed true, stated before verification exists. ' +
           'Written in full sentences with a machine-actionable verifyBy hint. ' +
           `Set contests to a TB id to dispute it: the TB becomes contested but remains active truth. ${bound}`,
-        input: args(UvFields),
+        input: args({ ...UvFields, ...DerivationFields }),
         annotations: APPEND,
         run: (a) => e.assertUv({ ...a, author: this.agentIdentity(), agentSessionId: this.agentSessionId() }),
       }),
@@ -734,6 +754,7 @@ export class StenographerServer {
           evidence: Evidence,
           signedBy: Signer('The person asserting it'),
           literals: Literals.optional(),
+          ...DerivationFields,
           author: Signer('Drafting author when distinct from signedBy (a person or an agent identity)').optional(),
         }),
         annotations: APPEND,
@@ -746,7 +767,7 @@ export class StenographerServer {
           'Assert a UV — an unverified assertion ("there be dragons"): believed true, stated before verification exists. ' +
           'Written in full sentences with a machine-actionable verifyBy hint. ' +
           'Set contests to a TB id to dispute it: the TB becomes contested but remains active truth.',
-        input: args({ ...UvFields, author: Signer('Who believes it') }),
+        input: args({ ...UvFields, ...DerivationFields, author: Signer('Who believes it') }),
         annotations: APPEND,
         run: (a) => e.assertUv(a),
       }),
