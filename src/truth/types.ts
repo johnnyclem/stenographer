@@ -313,6 +313,7 @@ export type StandingReasonKind =
   | 'premise-under-appeal'
   | 'premise-overridden'
   | 'premise-refuted'
+  | 'premise-superseded'
   | 'premise-struck';
 
 /** The nearest failing premise on one path below an entry, and the direct premise it was reached through. */
@@ -332,6 +333,8 @@ export type TruthEntryType = 'TB' | 'UV' | 'PROPOSAL' | 'ADDENDUM' | 'RULING' | 
 export type TbStatus = 'active' | 'contested' | 'overridden';
 export type UvStatus = 'open' | 'verified' | 'refuted';
 export type ProposalStatus = 'open' | 'signed' | 'dismissed';
+/** A precedent ruling's status (spec, Precedents): current until a later precedent supersedes it. Other rulings have none. */
+export type PrecedentStatus = 'current' | 'superseded';
 
 /**
  * Statuses are derived, never stored: each is a fold over the entry's
@@ -486,19 +489,31 @@ export interface AddendumBody {
   extra?: ExtraFields;
 }
 
-/** RULING — a signed judgment about an existing entry (§11). */
-export type RulingKind = 'strike' | 'promotion' | 'contempt' | 'objection' | 'dismissal';
+/** RULING — a signed judgment about an existing entry (§11), or a precedent: a policy decision that stands on its own. */
+export type RulingKind = 'strike' | 'promotion' | 'contempt' | 'objection' | 'dismissal' | 'precedent';
 
 /** Ruling kinds filed through fileRuling; objection rulings have their own path. */
-export const FILED_RULING_KINDS = ['strike', 'promotion', 'contempt'] as const;
+export const FILED_RULING_KINDS = ['strike', 'promotion', 'contempt', 'precedent'] as const;
 export type FiledRulingKind = (typeof FILED_RULING_KINDS)[number];
+
+/**
+ * A precedent's scope: a lowercase dotted slug such as `ci.merge-on-red`
+ * (spec, Precedents). Segments of letters, digits and inner hyphens, joined
+ * by dots.
+ */
+export const SCOPE_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*(?:\.[a-z0-9]+(?:-[a-z0-9]+)*)*$/;
+export const ScopeSchema = z.string().regex(SCOPE_PATTERN, 'a scope is a lowercase dotted slug, such as ci.merge-on-red');
 
 export interface RulingBody {
   kind: RulingKind;
   /** Required written reasoning — rulings are retrievable precedent. */
   opinion: string;
-  /** Entry id, or registered author identity for contempt. */
+  /** Entry id, or registered author identity for contempt. On a precedent: the precedent it supersedes, or its own id when it is the first on its scope. */
   target: string;
+  /** A precedent's scope (spec, Precedents). */
+  scope?: string;
+  /** Read-side, on a precedent: `current`, or `superseded` by a later precedent on its scope. Never stored, never on a wiki line. */
+  status?: PrecedentStatus;
   /** Objection rulings (§12): the objection ruled on, and the outcome. */
   objectionId?: string;
   outcome?: 'sustained' | 'overruled';
@@ -618,7 +633,8 @@ export const CONSUMPTION_RULES = `Consumption rules by confidence type and stand
 - Unsupported entry (standing unsupported): history. A premise below it is overridden, refuted or struck; never cite it as support, never deny on it.
 - Open UV: FLAG, DON'T BLOCK. A finding grounded only in a UV is phrased as a question or heads-up, never a demanded change. If your current task can check the UV, approve it with your evidence (approve): a UV becomes a TB only when a person approves it and one other approver agrees; three agent sessions agreeing nominate it for the person's review, and it stays a UV until then.
 - Corroborated UV (marker [UV · CORROBORATED]): three or more agent sessions found the same thing from different angles. Still a UV: flag, don't block. It is the cheapest context to hand another agent, with the receipts.
-- Refuted UV / overridden TB: retrievable for history, excluded from current-truth by default, never citable as support for a claim.`;
+- Refuted UV / overridden TB: retrievable for history, excluded from current-truth by default, never citable as support for a claim.
+- Precedents (RULING kind precedent, with a scope such as ci.merge-on-red): a person's standing policy decision. Before asking a person to decide, search precedents (get_precedents, search_truth); if one applies, follow it and cite its id. A superseded precedent is history.`;
 
 // ─────────────────────────────────────────────────────────────
 // ULID (Crockford base32, time-prefixed) — no new dependency

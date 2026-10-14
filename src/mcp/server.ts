@@ -557,6 +557,20 @@ export class StenographerServer {
         run: () => e.getDocket(),
       }),
       tool({
+        name: 'get_precedents',
+        description:
+          'Precedent rulings: a person\'s standing policy decisions, each on a scope such as ci.merge-on-red, with the ' +
+          'written opinion to follow. The current one per scope (every one, with all: true); scope narrows to a scope ' +
+          'and those under it. Before asking a person to decide, search these (and search_truth), and if one applies, ' +
+          'follow it and cite its id. A superseded precedent is history.',
+        input: args({
+          scope: z.string().min(1).describe('A scope, or a prefix of scopes (ci matches ci.merge-on-red)').optional(),
+          all: z.boolean().describe('Include superseded and struck precedents').default(false),
+        }),
+        annotations: READ_ONLY,
+        run: ({ scope, all }) => e.getPrecedents({ scope, all }),
+      }),
+      tool({
         name: 'get_contested',
         description:
           'All TB+UV disputes: contested TBs paired with their live contesting UVs. Contested is information, ' +
@@ -592,8 +606,8 @@ export class StenographerServer {
       tool({
         name: 'search_truth',
         description:
-          'Truth-ledger entries ranked by embedding relevance to a query. Ties break toward the TB. Each carries its ' +
-          'standing and the contentHash to pin it by as a premise. ' + CONSUMPTION_RULES,
+          'Truth-ledger entries (TBs, UVs and current precedent rulings) ranked by embedding relevance to a query. Ties ' +
+          'break toward the TB. Each TB and UV carries its standing and the contentHash to pin it by as a premise. ' + CONSUMPTION_RULES,
         input: args({ query: Text('Search query'), k: limit('Number of results', 5, 50), truthFilter: TruthFilterArg }),
         annotations: READ_ONLY,
         run: ({ query, k, truthFilter }) => e.searchTruth(query, k, truthFilter),
@@ -856,11 +870,16 @@ export class StenographerServer {
           'File a signed RULING with a required written opinion (rulings are retrievable precedent). ' +
           'strike: declares an entry inadmissible for retrieval (kept in history, excluded from current truth). ' +
           'promotion: records who ruled UV evidence sufficient and why. ' +
-          'contempt: judges an author\'s conduct and mints exactly one TB about it — no reputation system.',
+          'contempt: judges an author\'s conduct and mints exactly one TB about it — no reputation system. ' +
+          'precedent: a standing policy decision on a scope (a lowercase dotted slug, such as ci.merge-on-red), ' +
+          'which agents search before asking a person; it stays current until a later precedent on its scope ' +
+          'supersedes it (pass supersedes) or it is struck, and it can be a premise. A precedent takes scope, not target.',
         input: args({
           kind: z.enum(FILED_RULING_KINDS),
           opinion: Text('Written reasoning — rulings are precedent'),
-          target: Id('Entry id, or author identity for contempt'),
+          target: Id('Entry id, or author identity for contempt (not for a precedent)').optional(),
+          scope: z.string().min(1).describe('A precedent\'s scope: a lowercase dotted slug, such as ci.merge-on-red').optional(),
+          supersedes: Id('A precedent: the current precedent on its scope that this one supersedes').optional(),
           author: Signer('The person ruling'),
         }),
         annotations: DESTRUCTIVE,

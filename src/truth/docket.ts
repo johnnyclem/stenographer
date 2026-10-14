@@ -67,6 +67,8 @@ export interface DocketItem {
   attestations?: Array<Pick<Attestation, 'author' | 'agentSessionId' | 'resolution' | 'createdAt' | 'evidence' | 'note'>>;
   standing?: UvEntry['standing'];
   derivation: DerivationNode | null;
+  /** The nearest current precedents (R7), by the words they share with the item, so a person rules consistently. */
+  precedents: Array<{ id: string; scope: string; opinion: string; score: number }>;
   /** Passages of the indexed record, when the engine built the docket. */
   passages?: RecordPassage[];
 }
@@ -90,6 +92,16 @@ export function buildDocket(sources: DocketSources, now: number = Date.now()): D
   const { ledger, approvals, attestations } = sources;
   const items: DocketItem[] = [];
   const suspects = ledger.suspectUvs();
+  const precedents = ledger.getPrecedents().map((p) => ({ id: p.id, scope: p.body.scope ?? '', opinion: p.body.opinion }));
+  const nearest = (text: string) =>
+    lexicalPassages(
+      precedents.map((p) => ({ id: p.id, content: `${p.scope.replace(/[.-]/g, ' ')} ${p.opinion}` })),
+      text,
+      3
+    ).map((hit) => {
+      const p = precedents.find((x) => x.id === hit.id)!;
+      return { id: p.id, scope: p.scope, opinion: p.opinion, score: hit.score };
+    });
 
   for (const uv of ledger.getOpenUvs()) {
     const contested = uv.body.contests ? (ledger.getEntry(uv.body.contests) as TbEntry | null) : null;
@@ -116,6 +128,7 @@ export function buildDocket(sources: DocketSources, now: number = Date.now()): D
         .map(({ author, agentSessionId, resolution, createdAt, evidence, note }) => ({ author, agentSessionId, resolution, createdAt, evidence, note })),
       standing: uv.standing,
       derivation: buildDerivation(ledger, uv.id, 'down'),
+      precedents: nearest(uv.body.assertion),
     });
   }
 
@@ -138,6 +151,7 @@ export function buildDocket(sources: DocketSources, now: number = Date.now()): D
         evidence: [],
         review: { contests: draft.contests, detail: p.body.signal.detail ?? '' },
         derivation: buildDerivation(ledger, draft.contests, 'down'),
+        precedents: nearest(draft.assertion),
       });
     } else if (
       p.body.kind === 'tombstone' &&
@@ -171,6 +185,7 @@ export function buildDocket(sources: DocketSources, now: number = Date.now()): D
         evidence: draft.evidence ?? [],
         draft: { literals, proposalsOfSameLiterals: same },
         derivation: null,
+        precedents: nearest(draft.claim),
       });
     }
   }
@@ -216,6 +231,10 @@ export function formatDocketItem(item: DocketItem): string {
     lines.push(`  agents' verdicts: ${item.attestations.map((t) => `${t.author} ${t.resolution} (session ${t.agentSessionId})`).join(', ')}`);
   }
   if (item.standing && item.standing !== 'sound') lines.push(`  standing: ${item.standing}`);
+  if (item.precedents.length > 0) {
+    lines.push('  precedents:');
+    for (const p of item.precedents) lines.push(`    ${p.id} [${p.scope}] ${p.opinion.replace(/\s+/g, ' ').slice(0, 200)}`);
+  }
   if (item.passages && item.passages.length > 0) {
     lines.push('  from the record:');
     for (const p of item.passages) lines.push(`    ${p.id} [${p.role}] ${p.content.replace(/\s+/g, ' ').slice(0, 200)}`);

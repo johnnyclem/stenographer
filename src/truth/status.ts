@@ -8,6 +8,7 @@
  *   TB        active < contested < overridden
  *   UV        open < verified < refuted
  *   PROPOSAL  open < dismissed < signed
+ *   RULING    current < superseded   (precedents only: other rulings have no status)
  *
  * `overrides` makes a TB overridden and nothing takes that back: refuting a
  * contest only removes that contest's contribution (STENO-T-06). A TB is
@@ -29,13 +30,18 @@ const ORDER: Partial<Record<TruthEntryType, readonly string[]>> = {
   TB: ['active', 'contested', 'overridden'],
   UV: ['open', 'verified', 'refuted'],
   PROPOSAL: ['open', 'dismissed', 'signed'],
+  RULING: ['current', 'superseded'],
 };
 
 const TERMINAL: Partial<Record<TruthEntryType, readonly string[]>> = {
   TB: ['overridden'],
   UV: ['verified', 'refuted'],
   PROPOSAL: ['dismissed', 'signed'],
+  RULING: ['superseded'],
 };
+
+/** What `recordedStatus` answers for a precedent ruling without a recorded status: the lattice's floor, so it reads `current`. */
+export const PRECEDENT_FLOOR = 'current';
 
 export interface InboundLink {
   type: LinkType;
@@ -70,6 +76,10 @@ function contribution(type: TruthEntryType, link: InboundLink): string | null {
       if (link.type === 'signs') return 'signed';
       if (link.type === 'dismisses') return 'dismissed';
       return null;
+    case 'RULING':
+      // A precedent is superseded by a later precedent's supersedes link (spec, Precedents)
+      if (link.type === 'supersedes' && (link.from === null || link.from.type === 'RULING')) return 'superseded';
+      return null;
     default:
       return null;
   }
@@ -79,6 +89,8 @@ function contribution(type: TruthEntryType, link: InboundLink): string | null {
 export function deriveStatus(type: TruthEntryType, recorded: unknown, inbound: InboundLink[]): string | null {
   const order = ORDER[type];
   if (!order) return null;
+  // Only a precedent ruling has a status: recordedStatus answers for it, and nothing for any other ruling
+  if (type === 'RULING' && typeof recorded !== 'string') return null;
   let rank = 0;
   const join = (status: string | null) => {
     if (status !== null) rank = Math.max(rank, order.indexOf(status));
@@ -92,9 +104,16 @@ export function deriveStruck(inbound: InboundLink[]): boolean {
   return inbound.some((l) => l.type === 'strikes');
 }
 
-/** A body's recorded status, from its stored JSON. */
+/**
+ * A body's recorded status, from its stored JSON. A precedent ruling (kind
+ * `precedent`) answers `current` when it records none: it is the one ruling
+ * with a status, and it starts current.
+ */
 export function recordedStatus(body: unknown): unknown {
-  return body && typeof body === 'object' ? (body as { status?: unknown }).status : undefined;
+  if (!body || typeof body !== 'object') return undefined;
+  const b = body as { status?: unknown; kind?: unknown };
+  if (b.kind === 'precedent' && b.status === undefined) return PRECEDENT_FLOOR;
+  return b.status;
 }
 
 export interface DerivedState {
@@ -166,7 +185,7 @@ export interface DerivedStanding {
   reasons: StandingReason[];
 }
 
-const UNSUPPORTING: readonly StandingReasonKind[] = ['premise-overridden', 'premise-refuted', 'premise-struck'];
+const UNSUPPORTING: readonly StandingReasonKind[] = ['premise-overridden', 'premise-refuted', 'premise-superseded', 'premise-struck'];
 
 /** Why a premise fails on its own, if it does: dead (unsupporting), or weak (clouding). */
 export function premiseFailure(node: StandingNode): StandingReasonKind | null {
@@ -181,6 +200,8 @@ export function premiseFailure(node: StandingNode): StandingReasonKind | null {
     if (node.status === 'open') return 'premise-open';
     return null;
   }
+  // A precedent: evidence doesn't refute a fiat, but a later precedent supersedes it
+  if (node.type === 'RULING' && node.status === 'superseded') return 'premise-superseded';
   return null;
 }
 

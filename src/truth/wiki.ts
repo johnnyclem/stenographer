@@ -78,7 +78,7 @@ const STATUS_LINKS: readonly LinkType[] = ['contests', 'overrides', 'verifies', 
 const TRAVELING_LINKS: readonly LinkType[] = [...STATUS_LINKS, 'corroborates'];
 
 /** Ruling kinds the ledger knows (types.ts RulingKind). */
-const RULING_KINDS = ['strike', 'promotion', 'contempt', 'objection', 'dismissal'];
+const RULING_KINDS = ['strike', 'promotion', 'contempt', 'objection', 'dismissal', 'precedent'];
 
 /** Terminal statuses: the only recorded statuses the ledger's fold reads (status.ts). */
 const TERMINAL = new Set(['overridden', 'verified', 'refuted']);
@@ -201,12 +201,20 @@ function buildStream(ledger: TruthLedger): { lines: WikiLine[]; skipped: Array<{
       }
     } else if (
       (r.type === 'ADDENDUM' || r.type === 'RULING') &&
-      r.links.some((l) => TRAVELING_LINKS.includes(l.type) && (types.get(l.toId) === 'TB' || types.get(l.toId) === 'UV'))
+      (r.links.some((l) => TRAVELING_LINKS.includes(l.type) && (types.get(l.toId) === 'TB' || types.get(l.toId) === 'UV')) ||
+        // A precedent travels on its own: it is a policy decision, not a change to an entry (spec, Precedents)
+        (r.type === 'RULING' && b.kind === 'precedent'))
     ) {
       const body =
         r.type === 'ADDENDUM'
           ? { evidence: b.evidence, note: b.note ?? null, ...(b.quorum !== undefined ? { quorum: b.quorum } : {}) }
-          : { kind: b.kind, opinion: b.opinion, target: b.target, ...(b.answerableBy !== undefined ? { answerableBy: b.answerableBy } : {}) };
+          : {
+              kind: b.kind,
+              opinion: b.opinion,
+              target: b.target,
+              ...(b.scope !== undefined ? { scope: b.scope } : {}),
+              ...(b.answerableBy !== undefined ? { answerableBy: b.answerableBy } : {}),
+            };
       if (emit({ ...envelope, ...body, ...extra, 'x-steno': steno }, r.id)) written.add(r.id);
     }
 
@@ -615,8 +623,10 @@ function changeOf(d: DecodedWikiLine): { entry: NewEntry; links: TruthLink[] } |
   const unknown = unknownValue(line);
   if (unknown) return { unknown: `it has ${unknown}, which this stenographer doesn't know` };
   const x = (line['x-steno'] ?? {}) as { provenance?: NewEntry['provenance']; agentSessionId?: string | null; links?: TruthLink[] };
-  // No links, or an empty list: either way the line says nothing it changes
-  if (!x.links || x.links.length === 0) return { unknown: 'it lists no links (x-steno.links), so what it changes is unknown' };
+  // No links, or an empty list: either way the line says nothing it changes. The first precedent on a
+  // scope is the exception: it stands on its own, and changes nothing (spec, Precedents)
+  const precedent = d.type === 'RULING' && line.kind === 'precedent';
+  if (!precedent && (!x.links || x.links.length === 0)) return { unknown: 'it lists no links (x-steno.links), so what it changes is unknown' };
   const id = line.id as string;
   const type = d.type as 'ADDENDUM' | 'RULING';
   return {
@@ -635,11 +645,12 @@ function changeOf(d: DecodedWikiLine): { entry: NewEntry; links: TruthLink[] } |
               kind: line.kind,
               opinion: line.opinion,
               target: line.target,
+              ...(line.scope !== undefined ? { scope: line.scope } : {}),
               ...(line.answerableBy !== undefined ? { answerableBy: line.answerableBy } : {}),
               ...extraOf(line, type),
             },
     },
-    links: x.links.map((l) => ({ fromId: l.fromId, toId: l.toId, type: l.type })),
+    links: (x.links ?? []).map((l) => ({ fromId: l.fromId, toId: l.toId, type: l.type })),
   };
 }
 

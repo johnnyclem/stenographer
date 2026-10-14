@@ -25,7 +25,7 @@ export const LINE_BODY_FIELDS: Readonly<Record<'TB' | 'UV' | 'ADDENDUM' | 'RULIN
   TB: ['claim', 'evidence', 'signedBy', 'literals', 'quorum', 'inference', 'answerableBy', 'approvals', 'status'],
   UV: ['assertion', 'basis', 'verifyBy', 'contests', 'inference', 'status'],
   ADDENDUM: ['evidence', 'note', 'quorum'],
-  RULING: ['kind', 'opinion', 'target', 'answerableBy'],
+  RULING: ['kind', 'opinion', 'target', 'answerableBy', 'scope'],
 };
 
 /** The links each entry type writes from itself. */
@@ -33,7 +33,7 @@ export const OUTBOUND_LINKS: Record<TruthEntryType, readonly LinkType[]> = {
   TB: ['supersedes', 'signs', 'derives'],
   UV: ['contests', 'signs', 'derives'],
   ADDENDUM: ['verifies', 'refutes', 'overrides', 'corroborates'],
-  RULING: ['strikes', 'dismisses'],
+  RULING: ['strikes', 'dismisses', 'supersedes'],
   PROPOSAL: [],
   MARKER: ['supersedes', 'contests', 'verifies', 'refutes', 'signs', 'overrides', 'strikes', 'dismisses', 'derives', 'corroborates'],
 };
@@ -63,7 +63,8 @@ export const MARKERS = {
 
 /**
  * A status as a person reads it: `contested` is shown as "under appeal"
- * (the wire value stays `contested`), and a struck entry is "struck".
+ * (the wire value stays `contested`), and a struck entry is "struck". A
+ * precedent reads `current` or `superseded`.
  */
 export function displayStatus(status: string | null | undefined, struck = false): string {
   if (struck) return 'struck';

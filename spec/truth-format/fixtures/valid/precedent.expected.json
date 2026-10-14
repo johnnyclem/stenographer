@@ -1,0 +1,28 @@
+{
+  "01M1E6JK96VTM0RRK2ZK1S2MTB": {
+    "type": "TB",
+    "status": "active",
+    "current": false,
+    "standing": "unsupported",
+    "reasons": [
+      {
+        "premise": "01M1E6JK95EF3BGF6EDQ2BN40T",
+        "reason": "premise-superseded"
+      }
+    ]
+  },
+  "01M1E6JK95EF3BGF6EDQ2BN40T": {
+    "type": "RULING",
+    "status": "superseded",
+    "current": false,
+    "standing": "sound",
+    "reasons": []
+  },
+  "01M1E6JK97KH1T8H3KQE8SBKNX": {
+    "type": "RULING",
+    "status": "current",
+    "current": true,
+    "standing": "sound",
+    "reasons": []
+  }
+}
