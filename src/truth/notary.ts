@@ -187,3 +187,97 @@ export async function raiseUvForPerson(sinks: ObjectionSinkConfig[], raise: UvRa
     })
   );
 }
+
+/**
+ * Raises the suspicion detector's derivation reviews (R4) to a person
+ * through the receivers drafts use (meta.kind `derivation-review`). Best
+ * effort: the proposals stay on the docket until a person rules.
+ */
+export async function raiseDerivationReview(
+  sinks: ObjectionSinkConfig[],
+  proposals: ProposalEntry[],
+  falsified: string
+): Promise<Array<{ url: string; error?: string }>> {
+  if (proposals.length === 0) return [];
+  const content =
+    `🔎 ${displayText(falsified)} was refuted on new evidence; the suspicion detector filed ${proposals.length} derivation ` +
+    `review${proposals.length === 1 ? '' : 's'} against its premises (stenographer review): ` +
+    proposals.map((p) => `${displayText(p.id)} contests ${displayText(String((p.body.draft as { contests?: string }).contests ?? ''))}`).join('; ');
+  return Promise.all(
+    sinks.map(async (sink) => {
+      try {
+        if (sink.kind === 'channel') {
+          const base = sink.url.endsWith('/') ? sink.url : sink.url + '/';
+          await post(
+            new URL('event', base).href,
+            JSON.stringify({
+              channel: CHANNEL_NAME,
+              sender: SENDER,
+              content,
+              meta: { kind: 'derivation-review', proposal_ids: proposals.map((p) => p.id).join(','), refuted_id: falsified },
+            }),
+            sink.secret ? { 'X-Channel-Secret': sink.secret } : {}
+          );
+        } else {
+          const body = JSON.stringify({ type: 'stenographer.derivation-review', refuted: falsified, proposals });
+          const id = webhookId('stenographer.derivation-review', [falsified]);
+          const headers: Record<string, string> = {
+            'X-Stenographer-Event': 'derivation-review',
+            ...(sink.secret ? webhookHeaders(sink.secret, id, body) : { 'webhook-id': id }),
+          };
+          await post(sink.url, body, headers);
+        }
+        return { url: redactUrl(sink.url) };
+      } catch (err) {
+        return { url: redactUrl(sink.url), error: err instanceof Error ? err.message : String(err) };
+      }
+    })
+  );
+}
+
+/** A question a person sends the agent that authored a UV during review (R9), over the delivery channel (meta.kind `called-on`). */
+export interface CallOn {
+  uv: UvEntry;
+  question: string;
+  by: string;
+}
+
+export function formatCallOn(call: CallOn): string {
+  return (
+    `❓ ${displayText(call.by)} asks about UV ${displayText(call.uv.id)} ("${displayText(call.uv.body.assertion, MAX_NOTICE_CLAIM)}"): ` +
+    `${displayText(call.question, MAX_NOTICE_CLAIM)} — cite your sources or add context with assert_uv or approve.`
+  );
+}
+
+export async function callOnAgent(sinks: ObjectionSinkConfig[], call: CallOn): Promise<Array<{ url: string; error?: string }>> {
+  return Promise.all(
+    sinks.map(async (sink) => {
+      try {
+        if (sink.kind === 'channel') {
+          const base = sink.url.endsWith('/') ? sink.url : sink.url + '/';
+          await post(
+            new URL('event', base).href,
+            JSON.stringify({
+              channel: CHANNEL_NAME,
+              sender: SENDER,
+              content: formatCallOn(call),
+              meta: { kind: 'called-on', uv_id: call.uv.id, asked_by: call.by, ...(call.uv.agentSessionId ? { session_ids: call.uv.agentSessionId } : {}) },
+            }),
+            sink.secret ? { 'X-Channel-Secret': sink.secret } : {}
+          );
+        } else {
+          const body = JSON.stringify({ type: 'stenographer.called-on', uv: call.uv, question: call.question, by: call.by });
+          const id = webhookId('stenographer.called-on', [call.uv.id, call.by, call.question]);
+          const headers: Record<string, string> = {
+            'X-Stenographer-Event': 'called-on',
+            ...(sink.secret ? webhookHeaders(sink.secret, id, body) : { 'webhook-id': id }),
+          };
+          await post(sink.url, body, headers);
+        }
+        return { url: redactUrl(sink.url) };
+      } catch (err) {
+        return { url: redactUrl(sink.url), error: err instanceof Error ? err.message : String(err) };
+      }
+    })
+  );
+}

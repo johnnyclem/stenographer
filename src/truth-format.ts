@@ -39,11 +39,24 @@ export {
 } from './truth/derivation.js';
 export { LINE_ENVELOPE_FIELDS, LINE_BODY_FIELDS, OUTBOUND_LINKS, INBOUND_LINKS, MARKERS, displayStatus, markerFor } from './truth/format.js';
 export {
+  DERIVATION_DETECTOR,
+  INFERENCE_AT_FAULT,
+  detectSuspects,
+  triggersSuspicion,
+  suspicionTargetRef,
+  type SuspectPremise,
+  type SuspicionInput,
+  type SuspicionDraft,
+  type Suspicion,
+} from './truth/suspicion.js';
+export {
   QUORUM_WINDOW_MS,
   QUORUM_MIN_MEMBERS,
+  NOMINATION_MIN_MEMBERS,
   AGENT_PREFIX,
   checkQuorum,
   chooseQuorum,
+  chooseNomination,
   evidenceKey,
   evidenceRefKey,
   sameEvidence,

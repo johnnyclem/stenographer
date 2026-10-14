@@ -28,6 +28,13 @@
  *      the drafts.)
  *   6. The line shows its evidence: the members' items, and no others.
  *
+ * A nomination (spec, "Nomination") is the one other line that carries a
+ * quorum: an ADDENDUM with a `corroborates` link to an open UV, written when
+ * three or more agent sessions approved it from different angles. It
+ * settles nothing, so rule 4 (the window) doesn't bind it, rule 1 asks for
+ * three members, and rule 5 asks that every member's verdict is `verified`
+ * and that the line carries no resolution link.
+ *
  * Sessions and refs are trimmed of Unicode White_Space (trimWhiteSpace), so
  * every codec trims the same characters. checkQuorum is line-local, like
  * the link rules: the codec and the ledger's admission both apply it.
@@ -53,6 +60,8 @@ import {
 export const QUORUM_WINDOW_MS = 900_000;
 /** The fewest agent sessions that settle a claim together. */
 export const QUORUM_MIN_MEMBERS = 2;
+/** The fewest agent sessions whose agreement nominates a UV for a person's review (spec, "Nomination"). */
+export const NOMINATION_MIN_MEMBERS = 3;
 
 /** Without a signer registry, an agent is an identity whose key starts with this. */
 export const AGENT_PREFIX = 'agent:';
@@ -228,10 +237,13 @@ export function checkQuorum(subject: QuorumSubject): string[] {
   if (shape.length > 0) return shape;
   const members = raw as QuorumMember[];
   const issues: string[] = [];
+  // A nomination: an ADDENDUM whose links corroborate (it settles nothing, so the window doesn't bind it)
+  const nomination = subject.type === 'ADDENDUM' && linksOf(subject).some((l) => l.type === 'corroborates');
+  const needed = nomination ? NOMINATION_MIN_MEMBERS : QUORUM_MIN_MEMBERS;
 
-  // Rule 1: two or more, distinct sessions, accountable identities
-  if (members.length < QUORUM_MIN_MEMBERS) {
-    issues.push(`a quorum needs at least ${QUORUM_MIN_MEMBERS} members, and this one has ${members.length} (rule 1)`);
+  // Rule 1: two or more (three, for a nomination), distinct sessions, accountable identities
+  if (members.length < needed) {
+    issues.push(`a ${nomination ? 'nomination' : 'quorum'} needs at least ${needed} members, and this one has ${members.length} (rule 1)`);
   }
   const sessions = new Map<string, number>();
   members.forEach((m, i) => {
@@ -280,11 +292,12 @@ export function checkQuorum(subject: QuorumSubject): string[] {
     issues.push(`a quorum's settling evidence spans at least two settling kinds, and this one cites only ${[...settlingKinds][0]} (rule 3)`);
   }
 
-  // Rule 4: at the same time, to the millisecond
+  // Rule 4: at the same time, to the millisecond. A nomination settles
+  // nothing, so approvals hours apart may nominate together.
   const times = [...members.map((m) => m.ts), subject.ts].map((t) => (typeof t === 'string' ? quorumTime(t) : NaN));
   if (times.some((t) => !Number.isFinite(t))) {
     issues.push(`the line's ts is not a timestamp (rule 4)`);
-  } else {
+  } else if (!nomination) {
     const span = Math.max(...times) - Math.min(...times);
     if (span > QUORUM_WINDOW_MS) {
       issues.push(`the quorum's members and its line lie more than 15 minutes apart (${span} ms) (rule 4)`);
@@ -307,10 +320,19 @@ export function checkQuorum(subject: QuorumSubject): string[] {
     }
     for (const type of links.map((l) => l.type)) {
       if (typeof type !== 'string' || !Object.hasOwn(VERDICT_OF, type)) continue;
+      if (nomination) {
+        issues.push(`a nomination settles nothing: it carries no ${type} link beside its corroborates link (rule 5)`);
+        continue;
+      }
       members.forEach((m, i) => {
         if (m.verdict !== VERDICT_OF[type]) {
           issues.push(`quorum member ${i + 1}'s verdict ${m.verdict} is not the one its line's ${type} link applies (${VERDICT_OF[type]}) (rule 5)`);
         }
+      });
+    }
+    if (nomination) {
+      members.forEach((m, i) => {
+        if (m.verdict !== 'verified') issues.push(`nomination member ${i + 1}'s verdict is ${m.verdict}: a nomination's members verified the UV (rule 5)`);
       });
     }
   }
@@ -438,4 +460,31 @@ export function chooseQuorum<C extends QuorumCandidate>(
   if (partners.length === 0 || !inWindow(self)) missing.push('another session');
   else if (settling(self)) missing.push(partners.some((c) => disjoint(self, c)) ? 'a second evidence kind' : 'other evidence');
   return { members: null, progress: { ...base, missing } };
+}
+
+/**
+ * The members a nomination forms from `candidates` (spec, "Nomination"):
+ * agent sessions that approved a UV from different angles, no window. The
+ * first `needed` candidates, by time, from distinct sessions, each citing
+ * settling evidence, no item shared, and together spanning two settling
+ * kinds; later ones that keep the rules join too. Null when fewer than
+ * `needed` fit. Deterministic, like chooseQuorum: the earliest candidate
+ * leads, and each later one is taken when it fits what was taken so far.
+ */
+export function chooseNomination<C extends QuorumCandidate>(candidates: C[], needed: number = NOMINATION_MIN_MEMBERS): C[] | null {
+  const time = (c: C) => quorumTime(c.createdAt);
+  const session = (c: C) => (c.agentSessionId ? trimWhiteSpace(c.agentSessionId) : '');
+  const settling = (c: C) => c.evidence.some((e) => evidenceClass(e.kind) === 'settling');
+  const kinds = (cs: C[]) => new Set(cs.flatMap((c) => c.evidence.filter((e) => evidenceClass(e.kind) === 'settling').map((e) => e.kind)));
+  const disjoint = (a: C, b: C) => a.evidence.every((e) => !b.evidence.some((o) => sameEvidence(e, o)));
+  const byTime = (a: C, b: C) => time(a) - time(b) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+  const pool = candidates.filter((c) => session(c) && settling(c)).sort(byTime);
+  const fits = (members: C[], c: C) => members.every((m) => session(m) !== session(c) && disjoint(m, c));
+  // Each candidate in turn leads; the first lead that gathers enough wins
+  for (let i = 0; i < pool.length; i++) {
+    const members = [pool[i]];
+    for (let j = i + 1; j < pool.length; j++) if (fits(members, pool[j])) members.push(pool[j]);
+    if (members.length >= needed && kinds(members).size >= 2) return members;
+  }
+  return null;
 }

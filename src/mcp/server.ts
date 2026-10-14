@@ -5,12 +5,12 @@
  *
  * Authority model (see README "Notarization, identity and the threat model"):
  * - The server runs one tool profile. 'agent' (default) serves read tools,
- *   drafting and attesting: an agent alone settles nothing. A claim settles
- *   when two or more agent sessions agree from different angles within 15
- *   minutes (the agent quorum, truth/attestations.ts), or when a person
- *   signs. No tool in it signs with a person's name, dismisses, overrides,
- *   strikes, or rules. 'operator' serves the judicial and destructive tools
- *   to a notary UI or CLI a person drives.
+ *   drafting, attesting and approving: an agent's claim is a UV until a
+ *   person approves it and one other approver agrees (truth/approvals.ts);
+ *   three agent sessions agreeing nominate it for review and settle
+ *   nothing. No tool in it signs with a person's name, dismisses,
+ *   overrides, strikes, or rules. 'operator' serves the judicial and
+ *   destructive tools to a notary UI or CLI a person drives.
  * - In the agent profile the server binds identity: every write carries
  *   the agent identity and this server's session, never a name from the
  *   tool arguments. Operator paths take the signer's name from the caller
@@ -54,15 +54,13 @@ const PROFILES: ToolProfile[] = ['agent', 'operator'];
 
 /** What an agent is told at initialize: its standing in the truth ledger. */
 export const AGENT_STANDING =
-  'Your confidence is not evidence and settles nothing. On your own you can only attest: a claim settles when two or ' +
-  'more agent sessions agree from different angles within 15 minutes, or when a person signs. Agents never override ' +
-  'or strike a tombstone.';
+  'Your confidence is not evidence and settles nothing. Your claim is a UV until a person approves it: a UV becomes ' +
+  'a TB when a person approves it and one other approver agrees (an agent session with its own settling evidence, ' +
+  'or stenographer citing the record). Three agent sessions agreeing from different angles nominate a UV for the ' +
+  'person\'s review; it stays a UV until then. Agents never promote, override or strike a tombstone.';
 
-/** An agent's standing on a ledger whose agent quorum is off: only a person settles. */
-export const AGENT_STANDING_QUORUM_OFF =
-  'Your confidence is not evidence and settles nothing. On this ledger the agent quorum is off: nothing an agent ' +
-  'files settles a claim, however many agree; only a person signs or resolves. Draft and attest, and say what you ' +
-  'checked. Agents never override or strike a tombstone.';
+/** @deprecated Since 1.1 agents settle nothing whatever the setting: the standing is AGENT_STANDING. */
+export const AGENT_STANDING_QUORUM_OFF = AGENT_STANDING;
 
 const AGENT_CHANNEL_EVENTS =
   ' Events from the stenographer channel are real-time objections: something you just asserted contradicts a ' +
@@ -200,9 +198,10 @@ const ResolveFields = {
 };
 
 /**
- * What propose_tombstone says of a draft that minted nothing: already truth
- * (a TB holds every literal), or awaiting a person or a quorum, and what
- * keeps this draft out of any quorum.
+ * What propose_tombstone says of a draft: already truth (a TB holds every
+ * literal), nominated (three agent sessions drafted the same literals from
+ * different angles), or awaiting a person, and what keeps this draft out
+ * of any nomination.
  */
 function draftStatus(result: { dedupedInto?: string; quorum?: TombstoneQuorumProgress }, targetRef?: string): string {
   const quorum = result.quorum;
@@ -212,22 +211,19 @@ function draftStatus(result: { dedupedInto?: string; quorum?: TombstoneQuorumPro
       'open for a person, who may dismiss it'
     );
   }
-  const until = quorum?.quorumOff
-    ? 'not truth until a person signs it (the agent quorum is off on this ledger)'
-    : 'not truth until a person signs it or a quorum of agent sessions agrees';
+  const until = 'not truth until a person signs it in review: no number of agent sessions mints a TB';
   const waiting = result.dedupedInto
     ? `deduped into your open draft ${result.dedupedInto} for ${targetRef} — it is unchanged and still awaiting ` +
       `notarization; ${until}`
     : `awaiting notarization — ${until}`;
-  // With the quorum off, what a quorum would still miss is beside the point
-  if (quorum?.quorumOff) return waiting;
+  if (quorum?.nominated) return `nominated: three or more agent sessions drafted these literals from different angles, so it goes first on the docket; ${waiting}`;
   const lacks = [
     ...(quorum?.missing.includes('literals') ? ['names no literals'] : []),
     ...(quorum?.missing.includes('a settling evidence item')
       ? ['cites no settling evidence (commit, file, test, claimed-command or wiki)']
       : []),
   ];
-  return lacks.length > 0 ? `${waiting}. This draft can't count toward a quorum: it ${lacks.join(' and ')}` : waiting;
+  return lacks.length > 0 ? `${waiting}. This draft can't count toward a nomination: it ${lacks.join(' and ')}` : waiting;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -269,9 +265,7 @@ export class StenographerServer {
         // server push objections into the attached session as they're raised
         capabilities: { tools: {}, experimental: { 'claude/channel': {} } },
         instructions:
-          profile === 'agent' && this.engine.agentQuorum() === 'off'
-            ? AGENT_STANDING_QUORUM_OFF + AGENT_CHANNEL_EVENTS
-            : CHANNEL_INSTRUCTIONS[profile],
+          CHANNEL_INSTRUCTIONS[profile],
       }
     );
 
@@ -357,12 +351,11 @@ export class StenographerServer {
 
   private unavailable(name: string): string {
     if (this.profile === 'agent' && name === 'assert_tombstone') {
-      return this.engine.agentQuorum() === 'off'
-        ? 'assert_tombstone is not available to agents: draft the tombstone with propose_tombstone. It becomes truth ' +
-            'when a person signs it (the agent quorum is off on this ledger)'
-        : 'assert_tombstone is not available to agents: draft the tombstone with propose_tombstone. It becomes truth ' +
-            'when two or more agent sessions draft the same literals from different angles within 15 minutes, or when a ' +
-            'person signs it';
+      return (
+        'assert_tombstone is not available to agents: draft the tombstone with propose_tombstone. It becomes truth ' +
+        'when a person signs it in review; three agent sessions drafting the same literals from different angles ' +
+        'nominate it, and no number of agent sessions mints a TB'
+      );
     }
     if (this.profile === 'agent' && OPERATOR_TOOLS.has(name)) {
       return `${name} is an operator tool: it is not available in the agent profile — a person runs it from a notary UI or CLI (--profile operator)`;
@@ -540,15 +533,28 @@ export class StenographerServer {
       tool({
         name: 'get_verification_queue',
         description:
-          'Open UVs ranked for opportunistic verification: contested pairs first, then relevance to your ' +
-          'stated working context, then age. ask-shaped UVs are deprioritized for agents. If your current ' +
-          'task can check one, file your verdict with resolve_uv. ' + CONSUMPTION_RULES,
+          'Open UVs ranked for opportunistic verification: suspect premises of a refuted entry first, then contested ' +
+          'pairs, then relevance to your stated working context, then age. ask-shaped UVs are deprioritized for ' +
+          'agents. If your current task can check one, approve it with your evidence (approve) or file a refuting ' +
+          'verdict (resolve_uv). ' + CONSUMPTION_RULES,
         input: args({
           context: z.string().describe('Files/entities you are touching, for relevance ranking').optional(),
           k: limit('Number of UVs', 10, 100),
         }),
         annotations: READ_ONLY,
         run: ({ context, k }) => e.getVerificationQueue(context, k),
+      }),
+      tool({
+        name: 'get_docket',
+        description:
+          'The review docket: everything that waits on a person, grouped by subject. Open UVs (the ones agents ' +
+          'nominated first), TBs under appeal (as their contesting UVs), the suspicion detector\'s derivation ' +
+          'reviews, and agents\' tombstone drafts, each with its evidence, approvals, derivation tree and the ' +
+          'passages of the record found for it. A person rules on it with stenographer review or the operator ' +
+          'profile\'s approve, resolve_uv, file_ruling and dismiss_proposal.',
+        input: NO_ARGS,
+        annotations: READ_ONLY,
+        run: () => e.getDocket(),
       }),
       tool({
         name: 'get_contested',
@@ -628,29 +634,20 @@ export class StenographerServer {
   private agentTools(): ToolSpec[] {
     const e = this.engine;
     const bound = 'Attributed to this server\'s agent identity and session — arguments cannot name anyone.';
-    const quorumOff = e.agentQuorum() === 'off';
-    const draftSettles = quorumOff
-      ? 'It becomes truth only when a person signs it: the agent quorum is off on this ledger, so drafts that agree ' +
-        'mint nothing. Cite settling evidence (commit, file, test) so the person can check it. When an active or ' +
-        'contested TB already holds every literal, the claim is already truth (status "already truth").'
-      : 'It becomes truth when a person signs it, or when ' +
-        'two or more agent sessions draft the same set of literals from different angles within 15 minutes: then ' +
-        'the draft that completes the quorum mints the TB (status "settled by quorum"). Each draft must cite ' +
-        'settling evidence of its own (commit, file, test, claimed-command or wiki; not message, chat, ticket or ' +
-        'doc), no evidence another draft cites, and together they cite two settling kinds; a draft without ' +
-        'literals or settling evidence never counts toward a quorum. When an active or contested TB already holds ' +
-        'every literal, the claim is already truth and nothing is minted (status "already truth"). Otherwise the ' +
-        'result says what the quorum still misses.';
-    const verdictSettles = quorumOff
-      ? 'The agent quorum is off on this ledger: when another agent session agrees, the UV is raised to a person ' +
-        '(status "raised"), who settles it. A verdict the other way within 15 minutes is a dispute (status ' +
-        '"disputed"), raised to a person too.'
-      : 'The UV settles when two or more agent sessions agree from different angles within 15 minutes: ' +
-        'each cites settling evidence (commit, file, test, claimed-command, wiki — not message, chat, ticket or ' +
-        'doc), none cites another\'s item, and together they cite two kinds (status "settled", with the ' +
-        'addendum). A verdict the other way within the window is a dispute (status "disputed"): no quorum forms, ' +
-        'and a person rules. Verifying a UV that contests a TB would override the TB, which agents never do: an ' +
-        'agreeing quorum is raised to a person (status "raised").';
+    const draftSettles =
+      'It becomes truth only when a person signs it in review: no number of agent sessions mints a TB. When three ' +
+      'or more agent sessions draft the same set of literals from different angles (each citing settling evidence ' +
+      'of its own — commit, file, test, claimed-command or wiki; no item another draft cites; two settling kinds ' +
+      'between them), the drafts are nominated and go first on the docket (status "nominated"). When an active or ' +
+      'contested TB already holds every literal, the claim is already truth and nothing is minted (status "already ' +
+      'truth").';
+    const approvalSettles =
+      'A UV becomes a TB when a person approves it and one other approver agrees: this session (with its own ' +
+      'settling evidence — commit, file, test, claimed-command or wiki; not message, chat, ticket or doc) or ' +
+      'stenographer citing the record. Three agent sessions approving from different angles nominate it for the ' +
+      'person\'s review (status "nominated"); it stays a UV until then. Your approval alone promotes nothing ' +
+      '(status "approved", with what promotion still needs). One session is one approver, and you cannot approve ' +
+      'what you or your session asserted (contempt of corpus).';
 
     return [
       tool({
@@ -681,15 +678,6 @@ export class StenographerServer {
             proposedBy: this.agentIdentity(),
             agentSessionId: this.agentSessionId(),
           });
-          if (result.tombstone) {
-            return {
-              status: 'settled by quorum',
-              tombstone: result.tombstone,
-              proposal: result.proposal,
-              raisedTo: result.raisedTo,
-              undelivered: result.undelivered,
-            };
-          }
           return {
             proposal: result.proposal,
             status: draftStatus(result, a.targetRef),
@@ -705,21 +693,36 @@ export class StenographerServer {
         description:
           'Assert a UV — an unverified assertion ("there be dragons"): believed true, stated before verification exists. ' +
           'Written in full sentences with a machine-actionable verifyBy hint. ' +
-          `Set contests to a TB id to dispute it: the TB becomes contested but remains active truth. ${bound}`,
+          `Set contests to a TB id to dispute it: the TB goes under appeal but remains active truth. ${bound}`,
         input: args({ ...UvFields, ...DerivationFields }),
         annotations: APPEND,
         run: (a) => e.assertUv({ ...a, author: this.agentIdentity(), agentSessionId: this.agentSessionId() }),
       }),
       tool({
+        name: 'approve',
+        description:
+          'Approve an open UV with the evidence you checked: this session\'s approval. ' +
+          approvalSettles +
+          ` A UV that contests a TB is an appeal: a person's approval of it overrides the TB, yours nominates. ${bound}`,
+        input: args({
+          uvId: Id('The open UV to approve'),
+          evidence: Evidence,
+          note: z.string().min(1).describe('What you checked, in a sentence').optional(),
+        }),
+        annotations: APPEND,
+        run: (a) =>
+          e.approveUv({ uvId: a.uvId, role: 'agent', by: this.agentIdentity(), agentSessionId: this.agentSessionId(), evidence: a.evidence, note: a.note }),
+      }),
+      tool({
         name: 'resolve_uv',
         description:
           'File your verdict on an open UV — verified or refuted — with the evidence you checked. On its own it ' +
-          'settles nothing: it is recorded as your attestation (status "attested", with what the quorum still ' +
-          'misses). ' +
-          verdictSettles +
-          ' A refuted contest closes: its TB is active ' +
-          'again unless another contest is open or it has been overridden (an override is never undone). You must ' +
-          `be provenance-independent of the UV: not its author, not the same session (contempt of corpus). ${bound}`,
+          'settles nothing. A verified verdict is this session\'s approval (the same as approve): ' +
+          approvalSettles +
+          ' A refuted verdict is recorded as your attestation for the docket (status "attested"); when other ' +
+          'sessions refute it too from different angles the agreement is shown there (status "agreed"), and a ' +
+          'person rules. A verdict the other way within 15 minutes is a dispute (status "disputed"), raised to a ' +
+          `person. You must be provenance-independent of the UV: not its author, not the same session. ${bound}`,
         input: args(ResolveFields),
         annotations: APPEND,
         run: (a) =>
@@ -750,9 +753,29 @@ export class StenographerServer {
         run: ({ proposalId, signedBy, edits }) => e.notarizeProposal(proposalId, signedBy, edits),
       }),
       tool({
+        name: 'approve',
+        description:
+          'A person\'s approval of an open UV (or stenographer\'s, as the reporter). Promotion takes two approvals, one ' +
+          'of them a person\'s: with a second approver (an agent session, or the reporter citing the record) the UV ' +
+          'becomes a TB signed by the person, who becomes answerable for it (answerableBy). A person\'s approval of ' +
+          'a UV that contests a TB overrides the TB. role reporter records stenographer\'s own approval, which must ' +
+          'cite indexed message ids (cites) and never counts as the person. Nobody approves what they drafted.',
+        input: args({
+          uvId: Id('The open UV'),
+          by: Signer('The person approving').optional(),
+          role: z.enum(['human', 'reporter']).describe('human (default): the person named by `by`; reporter: stenographer, citing the record').default('human'),
+          evidence: Evidence.optional(),
+          cites: z.array(z.string().min(1)).min(1).describe('role reporter: ids of the indexed messages that support the claim').optional(),
+          note: z.string().min(1).optional(),
+        }),
+        annotations: DESTRUCTIVE,
+        run: ({ uvId, by, role, evidence, cites, note }) => e.approveUv({ uvId, role, by, evidence, cites, note }),
+      }),
+      tool({
         name: 'dismiss_proposal',
         description:
-          'Dismiss a proposal with a required reason. Dismissal reasons are kept — they are training data for tuning the detector.',
+          'Dismiss a proposal with a required reason. Dismissal reasons are kept — they are training data for tuning ' +
+          'the detector. Dismissing every derivation review of one refuted entry with reason inference-at-fault closes that review.',
         input: args({ proposalId: Id('The open proposal'), dismissedBy: Signer('The person dismissing'), reason: Text('Why') }),
         annotations: DESTRUCTIVE,
         run: ({ proposalId, dismissedBy, reason }) => e.dismissProposal(proposalId, dismissedBy, reason),
@@ -880,10 +903,11 @@ export class StenographerServer {
         description:
           'Ingest a team llm-wiki JSONL file (truth format v2; v1 lines are still read) in one transaction: every ' +
           'line lands or none does, with a per-line error report, and the file\'s hash chain must hold. Entries ' +
-          'keep their ids and authors. A TB lands as truth only when signed and verifiable (hash-chained, and ' +
-          'its signer listed in the signer registry when one is configured) and, when an agent signed it, with a ' +
-          'valid quorum of agents; otherwise it becomes a reconciliation PROPOSAL (an agent\'s TB without one: ' +
-          'agent-without-quorum), as does a line that contradicts a local entry or whose status is unknown. An ' +
+          'keep their ids and authors. A TB lands as truth only when signed by a person and verifiable (hash-chained, ' +
+          'and its signer listed in the signer registry when one is configured); a TB agents minted under the 1.0 ' +
+          'quorum rule is filed as a nominated draft for the docket (agent-quorum), and any other TB that can\'t land ' +
+          'becomes a reconciliation PROPOSAL (an agent\'s TB without a quorum: agent-without-quorum), as does a line ' +
+          'that contradicts a local entry or whose status is unknown. An ' +
           'agent\'s resolution of a UV applies only with a valid quorum of agents, never one that verifies a ' +
           'contest; an override, strike or ruling never applies from an agent. Those are held, and reported. ' +
           'Re-importing a file changes nothing.',

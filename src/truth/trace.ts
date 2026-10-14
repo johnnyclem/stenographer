@@ -123,10 +123,10 @@ export function formatDerivation(tree: DerivationNode, direction: TraceDirection
   const describe = (n: DerivationNode): string => {
     if (n.missing) return `${n.id} (not held here)`;
     const state = [displayStatus(n.status, n.struck), ...(n.standing && n.standing !== 'sound' ? [n.standing] : [])].join(' · ');
-    const who =
-      n.type === 'TB'
-        ? `signed by ${n.signedBy ?? 'nobody'}${n.answerableBy ? `, ${n.answerableBy} answers` : ''}`
-        : `by ${n.author}${n.answerableBy ? `, ${n.answerableBy} answers` : ''}`;
+    // Who stands behind it, and who answers for it: the signer, when they are one and the same
+    const answers = (who: string | null | undefined) =>
+      n.type === 'TB' || n.type === 'RULING' ? (n.answerableBy ? (n.answerableBy === who ? ', who answers' : `, ${n.answerableBy} answers`) : ', nobody answers') : '';
+    const who = n.type === 'TB' ? `signed by ${n.signedBy ?? 'nobody'}${answers(n.signedBy)}` : `by ${n.author}${answers(n.author)}`;
     const text = n.text !== undefined ? `: "${displayText(n.text, 120)}"` : '';
     return `${n.type} ${n.id} [${state}] ${who}${text}`;
   };

@@ -69,7 +69,7 @@
   {
     "line": 12,
     "outcome": "held",
-    "heldReason": "link type 'corroborates'",
+    "heldReason": "link type 'echoes'",
     "note": "a quorum ADDENDUM whose only link has a type this version does not know: it decodes, and the import fails closed"
   },
   {
@@ -98,9 +98,9 @@
   },
   {
     "line": 17,
-    "outcome": "inserted",
-    "status": "active",
-    "note": "a TB an agent quorum signed, one of whose members carries verdict 'bogus': only an ADDENDUM's members define verdict, so on a TB member it is an unknown field, whatever its value. It decodes, and the import takes the TB as truth and keeps the field, as for a TB member without it"
+    "outcome": "proposal",
+    "reason": "agent-quorum",
+    "note": "a TB an agent quorum signed, one of whose members carries verdict 'bogus': only an ADDENDUM's members define verdict, so on a TB member it is an unknown field, whatever its value. It decodes, and the import files it as it files every TB agents minted under the 1.0 rule: a nominated draft for the docket, never truth (agent-quorum), the field no reason to refuse or hold it"
   },
   {
     "line": 18,
@@ -118,34 +118,40 @@
     "line": 20,
     "outcome": "held",
     "heldReason": "is not held here",
-    "note": "a quorum ADDENDUM that verifies its UV, with a top-level links: \"corroborates\", a string: it decodes (rule 5 reads x-steno.links, whose link the members' verdicts match, and a field the format doesn't define never refuses a line), and is held only because its UV is not in this ledger: imported after it, it resolves the UV and keeps the field"
+    "note": "a quorum ADDENDUM that verifies its UV, with a top-level links: \"echoes\", a string: it decodes (rule 5 reads x-steno.links, whose link the members' verdicts match, and a field the format doesn't define never refuses a line), and is held only because its UV is not in this ledger: imported after it, it resolves the UV and keeps the field"
   },
   {
     "line": 21,
     "outcome": "proposal",
     "reason": "unknown-value",
-    "note": "a TB an agent quorum signed whose x-steno.links carries a link type this version does not know ('corroborates'): it decodes (the link rules and the quorum rules refuse no line over an unknown link type), and the import fails closed: filed for a person, never truth"
+    "note": "a TB an agent quorum signed whose x-steno.links carries a link type this version does not know ('echoes'): it decodes (the link rules and the quorum rules refuse no line over an unknown link type), and the import fails closed: filed for a person, never truth"
   },
   {
     "line": 22,
+    "outcome": "proposal",
+    "reason": "agent-quorum",
+    "note": "a TB two agent sessions minted under the 1.0 quorum rule: no number of agent sessions mints a TB, so it is filed as a nominated draft for the docket, never truth"
+  },
+  {
+    "line": 23,
     "outcome": "inserted",
     "status": "active",
     "standing": "clouded",
     "note": "a derived TB whose premises this ledger does not hold: clouded (premise-missing) until they arrive. Stenographer 1.0, which doesn't know derives, files it as unknown-value"
   },
   {
-    "line": 23,
+    "line": 24,
     "outcome": "inserted",
     "status": "active",
     "standing": "sound",
     "note": "the premise the next line pins, with other content than the pin names"
   },
   {
-    "line": 24,
+    "line": 25,
     "outcome": "proposal",
     "reason": "conflict",
     "after": [
-      23
+      24
     ],
     "note": "the same derived TB after that premise: its pin names content this ledger does not hold, so it is a conflict, never truth"
   }

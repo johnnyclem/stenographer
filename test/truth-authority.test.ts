@@ -190,8 +190,9 @@ describe('notarization cannot be bypassed from the agent profile (STENO-T-01)', 
       evidence: [{ kind: 'command', ref: 'grep LOG_BUDGET config.ts', detail: 'LOG_BUDGET = 30' }],
     });
     expect(verified.error).toBeUndefined();
-    expect(verified.status).toBe('attested');
+    expect(verified.status).toBe('approved');
     expect(verified.addendum).toBeUndefined();
+    expect(verified.tombstone).toBeUndefined();
     expect((ledger.getEntry(contest.id) as UvEntry).body.status).toBe('open');
     expect((ledger.getEntry(human.id) as TbEntry).body.status).toBe('contested');
 
@@ -394,7 +395,9 @@ describe('identity is bound by the server (STENO-T-18)', () => {
       author: 'sam',
     });
     const res = await call('resolve_uv', { uvId: contest.id, resolution: 'verified', evidence: [{ kind: 'command', ref: 'grep -rn fetchV1 src/' }] });
-    expect(res.status).toBe('attested');
+    // A verified verdict is the session's approval; it promotes nothing without a person
+    expect(res.status).toBe('approved');
+    expect(res.approvals.missing).toEqual(['a human approval', 'a second approver']);
     expect(res.attestation.evidence).toEqual([{ kind: 'claimed-command', ref: 'grep -rn fetchV1 src/' }]);
     expect((engine.store.truth.getEntry(tb.id) as TbEntry).body.status).toBe('contested');
   });

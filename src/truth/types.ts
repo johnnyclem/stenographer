@@ -252,6 +252,7 @@ export const LINK_TYPES = [
   'strikes',
   'dismisses',
   'derives',
+  'corroborates',
 ] as const;
 export type LinkType = (typeof LINK_TYPES)[number];
 
@@ -339,6 +340,27 @@ export type ProposalStatus = 'open' | 'signed' | 'dismissed';
  */
 
 /** Shared envelope for every ledger entry. */
+/**
+ * Who approved a UV before it was promoted to a TB (spec/truth-format,
+ * "Approvals"): a person, an agent session, or stenographer as the reporter,
+ * which cites the passages of the indexed record that support the claim.
+ */
+export type ApprovalRole = 'human' | 'agent' | 'reporter';
+
+/** The identity stenographer's own (reporter) approvals carry. */
+export const REPORTER_IDENTITY = 'stenographer';
+
+export interface Approval {
+  by: string;
+  role: ApprovalRole;
+  /** RFC 3339: when the approval was recorded. */
+  ts: string;
+  /** An agent's approval: the session that gave it. */
+  agentSessionId?: string;
+  /** A reporter's approval: the ids of the indexed messages it cites. */
+  cites?: string[];
+}
+
 export interface TruthEnvelope {
   /** ULID — sortable, unique. */
   id: string;
@@ -360,6 +382,12 @@ export interface TruthEnvelope {
   standing?: Standing;
   reasons?: StandingReason[];
   contentHash?: string;
+  /**
+   * Read-side, on an open UV: three or more agent sessions nominated it (an
+   * ADDENDUM with a `corroborates` link, spec "Nomination"). It is still a
+   * UV: flag, don't block.
+   */
+  corroborated?: true;
 }
 
 /**
@@ -385,6 +413,14 @@ export interface TbBody {
   quorum?: QuorumMember[];
   /** The inference from its premises (the `derives` links) to the claim, when it is derived. */
   inference?: string;
+  /**
+   * The person who answers for it (spec, "Answerability"): the signer of a TB
+   * a person asserted, or the human approver of a promoted UV. Absent on a
+   * backfilled TB, and on a TB agents minted under the 1.0 quorum rule.
+   */
+  answerableBy?: string;
+  /** On a promoted TB: who approved the UV it was promoted from. */
+  approvals?: Approval[];
   extra?: ExtraFields;
 }
 
@@ -417,7 +453,8 @@ export interface ProposalBody {
       | 'manual-flag'
       | 'wiki-reconciliation'
       | 'compaction-candidate'
-      | 'agent-draft';
+      | 'agent-draft'
+      | 'detector:derivation';
     score?: number;
     threshold?: number;
     detail?: string;
@@ -465,6 +502,8 @@ export interface RulingBody {
   /** Objection rulings (§12): the objection ruled on, and the outcome. */
   objectionId?: string;
   outcome?: 'sustained' | 'overruled';
+  /** The person who answers for the ruling: its author (spec, "Answerability"). */
+  answerableBy?: string;
   extra?: ExtraFields;
 }
 
@@ -577,7 +616,8 @@ export const CONSUMPTION_RULES = `Consumption rules by confidence type and stand
 - TB under appeal (status contested): less than a TB and more than a UV. Trust it, verify it, and cite the appeal (the contesting UV) with it; never grounds for a denial while the appeal is open.
 - Clouded TB (standing clouded): ground truth with an asterisk. Cite the weak premise its reasons name (an open UV, a TB under appeal, or a premise not held here).
 - Unsupported entry (standing unsupported): history. A premise below it is overridden, refuted or struck; never cite it as support, never deny on it.
-- Open UV: FLAG, DON'T BLOCK. A finding grounded only in a UV is phrased as a question or heads-up, never a demanded change. If your current task can check the UV, file your verdict and evidence with resolve_uv: it settles only when another agent session agrees from a different angle (other evidence, another kind) within 15 minutes, or when a person rules.
+- Open UV: FLAG, DON'T BLOCK. A finding grounded only in a UV is phrased as a question or heads-up, never a demanded change. If your current task can check the UV, approve it with your evidence (approve): a UV becomes a TB only when a person approves it and one other approver agrees; three agent sessions agreeing nominate it for the person's review, and it stays a UV until then.
+- Corroborated UV (marker [UV · CORROBORATED]): three or more agent sessions found the same thing from different angles. Still a UV: flag, don't block. It is the cheapest context to hand another agent, with the receipts.
 - Refuted UV / overridden TB: retrievable for history, excluded from current-truth by default, never citable as support for a claim.`;
 
 // ─────────────────────────────────────────────────────────────

@@ -31,6 +31,10 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
     const { runTraceCLI } = await import('../dist/truth/trace.js');
     process.exitCode = await runTraceCLI(args);
   },
+  review: async (args) => {
+    const { runReviewCLI } = await import('../dist/truth/review-cli.js');
+    process.exitCode = await runReviewCLI(args);
+  },
 };
 
 async function main() {
@@ -53,6 +57,15 @@ Usage:
                                                         and every status re-derived from links
                                                         (exit 0 intact, 1 integrity failure,
                                                         2 could not run)
+  stenographer review [--state <path>] [--as <name>] [--signer-registry <path>] [--json]
+                                                        The review session: everything waiting
+                                                        on a person (open UVs, nominated first;
+                                                        TBs under appeal; derivation reviews;
+                                                        agent drafts), grouped by subject. With
+                                                        --as, rule on each item: approve, refute,
+                                                        defer, strike, cite the record, ask —
+                                                        interactive terminal only. Without it,
+                                                        or with --json, print the docket
   stenographer trace <id> [--up|--down] [--json] [--state <path>]
                                                         What an entry rests on (--down, the
                                                         default) or what rests on it (--up):
@@ -120,23 +133,24 @@ Options (start):
                            as Claude Code channel events
       --profile <name>     agent | operator  (default: agent)
                            agent:    read tools + propose_tombstone, assert_uv,
-                                     resolve_uv; one agent only drafts and
-                                     attests, a claim settles when 2+ agent
-                                     sessions agree from different angles
-                                     within 15 minutes, or a person signs;
-                                     writes carry the agent identity, never a
+                                     resolve_uv, approve; an agent's claim is
+                                     a UV until a person approves it (plus one
+                                     more approver); three agent sessions
+                                     agreeing nominate it for review; writes
+                                     carry the agent identity, never a
                                      caller-named one
                            operator: sign/dismiss/override/rule/strike, direct
                                      TBs, wiki import/export, backfill — for a
                                      notary UI or CLI a person drives, never
                                      an agent
       --agent-quorum <on|off>
-                           whether agent quorums settle claims on this
-                           ledger; kept in the state file, so every process
-                           on it obeys. off: agreeing drafts stay open and
-                           agreeing verdicts are raised to a person. Any
-                           process may turn it off; turning it back on takes
-                           --profile operator (default: leave it as it is)
+                           whether the library's 1.0 quorum writes
+                           (resolveUvByQuorum, mintTombstoneByQuorum) are
+                           allowed on this ledger; kept in the state file.
+                           Since 1.1 no live path settles on agents' word
+                           either way: agents nominate, a person approves.
+                           Any process may turn it off; turning it back on
+                           takes --profile operator (default: as it is)
       --agent-identity <id>
                            who agent-profile writes are attributed to
                            (default: agent:<MCP client name>); people

@@ -14,6 +14,7 @@ import { migrate } from './migrations.js';
 import { cosineSimilarity, EMBEDDING_DIMENSIONS } from '../indexer/embeddings.js';
 import { TruthLedger } from '../truth/ledger.js';
 import { UvAttestations } from '../truth/attestations.js';
+import { UvApprovals } from '../truth/approvals.js';
 import type { AgentClassifier } from '../truth/quorum.js';
 import { ObjectionLog } from '../truth/objections.js';
 import { ObjectionDispatcher } from '../truth/delivery.js';
@@ -88,6 +89,7 @@ export class StateStore {
   private truthLedger: TruthLedger | null = null;
   private isAgent: AgentClassifier | undefined;
   private uvAttestations: UvAttestations | null = null;
+  private uvApprovals: UvApprovals | null = null;
   private objectionLog: ObjectionLog | null = null;
   private dispatcher: ObjectionDispatcher | null = null;
   private statements: Map<string, Database.Statement> = new Map();
@@ -127,6 +129,14 @@ export class StateStore {
       this.uvAttestations = new UvAttestations(this.db, this.truth);
     }
     return this.uvAttestations;
+  }
+
+  /** Approvals of open UVs, until a promotion writes them into a TB (PRD R5): operational state beside the ledger. */
+  get approvals(): UvApprovals {
+    if (!this.uvApprovals) {
+      this.uvApprovals = new UvApprovals(this.db, this.truth);
+    }
+    return this.uvApprovals;
   }
 
   /** Real-time objections (§12): operational log beside the ledger. */

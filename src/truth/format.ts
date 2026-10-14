@@ -22,26 +22,26 @@ export const LINE_ENVELOPE_FIELDS: readonly string[] = ['schemaVersion', 'seq', 
  * kept in the body's `extra` and exported again as written.
  */
 export const LINE_BODY_FIELDS: Readonly<Record<'TB' | 'UV' | 'ADDENDUM' | 'RULING', readonly string[]>> = {
-  TB: ['claim', 'evidence', 'signedBy', 'literals', 'quorum', 'inference', 'status'],
+  TB: ['claim', 'evidence', 'signedBy', 'literals', 'quorum', 'inference', 'answerableBy', 'approvals', 'status'],
   UV: ['assertion', 'basis', 'verifyBy', 'contests', 'inference', 'status'],
   ADDENDUM: ['evidence', 'note', 'quorum'],
-  RULING: ['kind', 'opinion', 'target'],
+  RULING: ['kind', 'opinion', 'target', 'answerableBy'],
 };
 
 /** The links each entry type writes from itself. */
 export const OUTBOUND_LINKS: Record<TruthEntryType, readonly LinkType[]> = {
   TB: ['supersedes', 'signs', 'derives'],
   UV: ['contests', 'signs', 'derives'],
-  ADDENDUM: ['verifies', 'refutes', 'overrides'],
+  ADDENDUM: ['verifies', 'refutes', 'overrides', 'corroborates'],
   RULING: ['strikes', 'dismisses'],
   PROPOSAL: [],
-  MARKER: ['supersedes', 'contests', 'verifies', 'refutes', 'signs', 'overrides', 'strikes', 'dismisses', 'derives'],
+  MARKER: ['supersedes', 'contests', 'verifies', 'refutes', 'signs', 'overrides', 'strikes', 'dismisses', 'derives', 'corroborates'],
 };
 
 /** Links into itself an imported entry may carry: its own history, written in a ledger we don't hold. */
 export const INBOUND_LINKS: Partial<Record<TruthEntryType, readonly LinkType[]>> = {
   TB: ['overrides', 'contests', 'supersedes', 'strikes'],
-  UV: ['verifies', 'refutes', 'supersedes', 'strikes'],
+  UV: ['verifies', 'refutes', 'supersedes', 'strikes', 'corroborates'],
 };
 
 /**
@@ -49,14 +49,16 @@ export const INBOUND_LINKS: Partial<Record<TruthEntryType, readonly LinkType[]>>
  * and HyperVault print the same strings). A TB may be relied on; a TB
  * under appeal (status `contested`) carries its appeal and is never grounds
  * for a denial; a clouded TB (standing `clouded`) carries its weak premise;
- * an open UV is the dragon marker: flag, don't block. An unsupported entry
- * is history and gets no marker.
+ * an open UV is the dragon marker: flag, don't block, and a corroborated
+ * one (nominated by three agent sessions) says so, with the same rule. An
+ * unsupported entry is history and gets no marker.
  */
 export const MARKERS = {
   TB: '[TB]',
   TB_UNDER_APPEAL: '[TB ⚠ UNDER APPEAL]',
   TB_CLOUDED: '[TB ⚠ CLOUDED]',
   UV: '[UV — UNVERIFIED]',
+  UV_CORROBORATED: '[UV · CORROBORATED]',
 } as const;
 
 /**
@@ -69,10 +71,10 @@ export function displayStatus(status: string | null | undefined, struck = false)
   return status ?? 'unknown';
 }
 
-/** The marker for a current TB or UV, by status and standing; null for one consumers don't cite. */
-export function markerFor(type: TruthEntryType, status: string | null | undefined, standing?: string | null): string | null {
+/** The marker for a current TB or UV, by status, standing and (a UV) nomination; null for one consumers don't cite. */
+export function markerFor(type: TruthEntryType, status: string | null | undefined, standing?: string | null, corroborated?: boolean): string | null {
   if (standing === 'unsupported') return null;
-  if (type === 'UV') return status === 'open' ? MARKERS.UV : null;
+  if (type === 'UV') return status === 'open' ? (corroborated ? MARKERS.UV_CORROBORATED : MARKERS.UV) : null;
   if (type !== 'TB') return null;
   if (status === 'contested') return MARKERS.TB_UNDER_APPEAL;
   if (status === 'active') return standing === 'clouded' ? MARKERS.TB_CLOUDED : MARKERS.TB;

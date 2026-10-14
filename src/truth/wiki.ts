@@ -74,6 +74,8 @@ export const WIKI_SYNC_DETECTOR = 'detector:wiki-sync';
 
 /** Links whose arrival changes the status of a TB or UV. */
 const STATUS_LINKS: readonly LinkType[] = ['contests', 'overrides', 'verifies', 'refutes', 'strikes'];
+/** Links an ADDENDUM or RULING line travels for: the status links, and a nomination (which changes no status). */
+const TRAVELING_LINKS: readonly LinkType[] = [...STATUS_LINKS, 'corroborates'];
 
 /** Ruling kinds the ledger knows (types.ts RulingKind). */
 const RULING_KINDS = ['strike', 'promotion', 'contempt', 'objection', 'dismissal'];
@@ -183,6 +185,8 @@ function buildStream(ledger: TruthLedger): { lines: WikiLine[]; skipped: Array<{
               ...(b.literals !== undefined ? { literals: b.literals } : {}),
               ...(b.quorum !== undefined ? { quorum: b.quorum } : {}),
               ...(b.inference !== undefined ? { inference: b.inference } : {}),
+              ...(b.answerableBy !== undefined ? { answerableBy: b.answerableBy } : {}),
+              ...(b.approvals !== undefined ? { approvals: b.approvals } : {}),
             }
           : {
               assertion: b.assertion,
@@ -197,12 +201,12 @@ function buildStream(ledger: TruthLedger): { lines: WikiLine[]; skipped: Array<{
       }
     } else if (
       (r.type === 'ADDENDUM' || r.type === 'RULING') &&
-      r.links.some((l) => STATUS_LINKS.includes(l.type) && (types.get(l.toId) === 'TB' || types.get(l.toId) === 'UV'))
+      r.links.some((l) => TRAVELING_LINKS.includes(l.type) && (types.get(l.toId) === 'TB' || types.get(l.toId) === 'UV'))
     ) {
       const body =
         r.type === 'ADDENDUM'
           ? { evidence: b.evidence, note: b.note ?? null, ...(b.quorum !== undefined ? { quorum: b.quorum } : {}) }
-          : { kind: b.kind, opinion: b.opinion, target: b.target };
+          : { kind: b.kind, opinion: b.opinion, target: b.target, ...(b.answerableBy !== undefined ? { answerableBy: b.answerableBy } : {}) };
       if (emit({ ...envelope, ...body, ...extra, 'x-steno': steno }, r.id)) written.add(r.id);
     }
 
@@ -278,7 +282,7 @@ export interface ImportOptions {
   embeddings?: ReadonlyMap<string, number[]>;
 }
 
-export type ReconciliationReason = 'unsigned' | 'unverifiable' | 'agent-without-quorum' | 'unknown-status' | 'unknown-value' | 'conflict';
+export type ReconciliationReason = 'unsigned' | 'unverifiable' | 'agent-without-quorum' | 'agent-quorum' | 'unknown-status' | 'unknown-value' | 'conflict';
 
 export interface ImportResult {
   /** False when any line failed: the file was rolled back, nothing was written, and `errors` says why. */
@@ -295,6 +299,8 @@ export interface ImportResult {
   conflicts: Array<{ id: string; proposalId: string }>;
   /** Lines not applied: from someone the registry doesn't list, at an entry not held here, or with values this ledger can't apply. */
   held: Array<{ line: number; id: string; reason: string }>;
+  /** Derivation reviews the suspicion detector filed here when an imported refutation or override applied (R4). */
+  suspicions: Array<{ line: number; id: string; proposalId: string; premise: string }>;
   errors: Array<{ line: number; id?: string; error: string }>;
 }
 
@@ -312,7 +318,7 @@ export function importWikiEntries(
   input: { lines: string[] },
   options: ImportOptions = {}
 ): ImportResult {
-  const result: ImportResult = { committed: false, inserted: 0, unchanged: 0, derived: 0, proposals: [], conflicts: [], held: [], errors: [] };
+  const result: ImportResult = { committed: false, inserted: 0, unchanged: 0, derived: 0, proposals: [], conflicts: [], held: [], suspicions: [], errors: [] };
   const items: Array<{ line: number; text: string; d: DecodedWikiLine | null }> = [];
   input.lines.forEach((text, i) => {
     if (text.trim().length === 0) return;
@@ -345,7 +351,7 @@ export function importWikiEntries(
   } catch (err) {
     if (!(err instanceof Rollback)) throw err;
     const errors = result.errors.sort((a, b) => a.line - b.line);
-    return { committed: false, inserted: 0, unchanged: 0, derived: 0, proposals: [], conflicts: [], held: [], errors };
+    return { committed: false, inserted: 0, unchanged: 0, derived: 0, proposals: [], conflicts: [], held: [], suspicions: [], errors };
   }
   result.committed = true;
   return result;
@@ -399,8 +405,10 @@ function applyLine(
       }
       const outcome = ledger.importChange(change.entry, change.links);
       if (outcome.outcome === 'held') result.held.push({ line: lineNo, id, reason: outcome.reason });
-      else if (outcome.outcome === 'inserted') result.inserted++;
-      else result.unchanged++;
+      else if (outcome.outcome === 'inserted') {
+        result.inserted++;
+        for (const p of outcome.suspects) result.suspicions.push({ line: lineNo, id, proposalId: p.id, premise: String((p.body.draft as { contests?: string }).contests ?? '') });
+      } else result.unchanged++;
       return;
     }
 
@@ -511,6 +519,8 @@ function entryOf(d: DecodedWikiLine): EntryOf {
           ...(line.literals !== undefined ? { literals: line.literals } : {}),
           ...(line.quorum !== undefined ? { quorum: line.quorum } : {}),
           ...(line.inference !== undefined ? { inference: line.inference } : {}),
+          ...(line.answerableBy !== undefined ? { answerableBy: line.answerableBy } : {}),
+          ...(line.approvals !== undefined ? { approvals: line.approvals } : {}),
           ...floor,
           ...extraOf(line, type),
         }
@@ -621,7 +631,13 @@ function changeOf(d: DecodedWikiLine): { entry: NewEntry; links: TruthLink[] } |
       body:
         type === 'ADDENDUM'
           ? { evidence: line.evidence, note: line.note, ...(line.quorum !== undefined ? { quorum: line.quorum } : {}), ...extraOf(line, type) }
-          : { kind: line.kind, opinion: line.opinion, target: line.target, ...extraOf(line, type) },
+          : {
+              kind: line.kind,
+              opinion: line.opinion,
+              target: line.target,
+              ...(line.answerableBy !== undefined ? { answerableBy: line.answerableBy } : {}),
+              ...extraOf(line, type),
+            },
     },
     links: x.links.map((l) => ({ fromId: l.fromId, toId: l.toId, type: l.type })),
   };
@@ -643,7 +659,8 @@ function entryRoute(d: DecodedWikiLine, entry: NewEntry, signers: SignerRegistry
   } catch (err) {
     return { reason: 'unverifiable', detail: `wiki ${entry.type} ${entry.id}: ${messageOf(err)}` };
   }
-  // Agents settle only together: an agent's TB is truth only with a quorum of agents (the codec checked its rules)
+  // Agents settle nothing (R5): a TB agents minted under 1.0's quorum rule is not admitted as truth. With a valid
+  // quorum of agents it is filed as a nominated UV-class draft that waits on the docket; without one, as before.
   if (entry.type === 'TB' && isAgent(body.signedBy!)) {
     const why = !body.quorum ? 'no quorum' : nonAgentMember(body.quorum, signers, isAgent);
     if (why) {
@@ -651,9 +668,15 @@ function entryRoute(d: DecodedWikiLine, entry: NewEntry, signers: SignerRegistry
         reason: 'agent-without-quorum',
         detail:
           `wiki TB ${entry.id} is signed by agent ${body.signedBy} with ${why === 'no quorum' ? 'no quorum' : `a quorum that isn't all agents (${why})`}: ` +
-          'agents settle a claim only as two or more agent sessions agreeing from different angles within 15 minutes, or a person signs it',
+          'an agent\'s claim is a UV until a person approves it',
       };
     }
+    return {
+      reason: 'agent-quorum',
+      detail:
+        `wiki TB ${entry.id} was minted by ${body.quorum!.length} agent sessions under the 1.0 quorum rule: no number of agent sessions ` +
+        'mints a TB, so it is filed as a nominated draft for a person to sign in review',
+    };
   }
   return null;
 }
@@ -708,6 +731,13 @@ function changeDistrust(
   if (isAgent(entry.author)) {
     if (judicial) {
       return `${entry.type === 'RULING' ? 'a ruling' : 'an override'} is a person's act, and ${entry.author} is an agent`;
+    }
+    if (links.some((l) => l.type === 'corroborates')) {
+      // A nomination: three or more agent sessions (the codec checked the rules), all agents
+      const quorum = (entry.body as { quorum?: QuorumMember[] }).quorum;
+      if (!quorum) return `${entry.author}'s nomination applies only with the quorum of agent sessions that nominated`;
+      const person = nonAgentMember(quorum, signers, isAgent);
+      if (person) return `${entry.author}'s nomination has a quorum that isn't all agents: ${person}`;
     }
     if (links.some((l) => l.type === 'verifies' || l.type === 'refutes')) {
       const quorum = (entry.body as { quorum?: QuorumMember[] }).quorum;
@@ -820,6 +850,7 @@ function reconcile(
       targetRef: id,
       requiresNotary: true,
       meta: {
+        ...(reason === 'agent-quorum' ? { nominated: true } : {}),
         wiki: {
           id,
           reason,

@@ -1,0 +1,27 @@
+# approve from a fresh trajectory, which starts trusted and public. Replay
+# only proposes calls: nothing runs.
+
+# An approval of a UV is a truth write: with a person's approval it
+# promotes the UV to a TB, and three agent sessions' approvals nominate it.
+# It needs trusted data, as every truth write does. The result reports
+# other sessions' approvals and the UV, so it is restricted to self.
+mcp/stenographer/approve {
+  uvId: "01M1E6JK8T990YNBMTS1KP26ZW"
+  evidence: [{"kind": "test", "ref": "test/retry.test.ts", "detail": "the per-tenant cap is 5"}]
+  note: "The test pins the cap."
+}
+expect allow
+
+# So the next truth write still runs from the same trajectory.
+mcp/stenographer/assert_uv {
+  assertion: "The per-tenant cap is read once, at start-up."
+  basis: "config.ts loads it before the loop."
+  verifyBy: {"kind": "command", "value": "grep -n tenantCap src/config.ts"}
+}
+expect allow
+
+# The result is restricted to self.
+mcp/mail/send {
+  to: "public"
+}
+expect deny

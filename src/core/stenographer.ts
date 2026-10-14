@@ -36,12 +36,23 @@ import type { TruthFilter } from '../truth/ledger.js';
 import { buildDerivation, type DerivationNode, type TraceDirection } from '../truth/trace.js';
 import type { Objection, ObjectionMode, ObjectionStatus, ObjectionStats } from '../truth/objections.js';
 import { createSinkTransport, type ObjectionTransport } from '../truth/delivery.js';
-import { formatProposalNotice, formatUvNotice, raiseForNotarization, raiseUvForPerson, type UvRaise } from '../truth/notary.js';
+import {
+  callOnAgent,
+  formatCallOn,
+  formatProposalNotice,
+  formatUvNotice,
+  raiseDerivationReview,
+  raiseForNotarization,
+  raiseUvForPerson,
+  type UvRaise,
+} from '../truth/notary.js';
 import { submitProposalEnvelope } from '../truth/intake.js';
 import { ContemptError } from '../truth/ledger.js';
 import { SignerRegistry, agentClassifier, resolveIdentity, type SignerRole } from '../truth/identity.js';
-import { settleTombstoneQuorum, type Attestation, type TombstoneQuorumProgress } from '../truth/attestations.js';
+import { draftAgreement, type Attestation, type TombstoneQuorumProgress } from '../truth/attestations.js';
 import { trimWhiteSpace, type QuorumProgress } from '../truth/quorum.js';
+import { type ApprovalSummary, type UvApproval } from '../truth/approvals.js';
+import { buildDocket, type Docket, type RecordPassage } from '../truth/docket.js';
 import type {
   Evidence,
   VerifyBy,
@@ -54,7 +65,9 @@ import type {
   TombstonedLiteral,
   FiledRulingKind,
   Premise,
+  ApprovalRole,
 } from '../truth/types.js';
+import { REPORTER_IDENTITY } from '../truth/types.js';
 import type {
   StenographerAPI,
   StenographerConfig,
@@ -1249,10 +1262,8 @@ export class Stenographer implements StenographerAPI {
     dedupedInto?: string;
     raisedTo: string[];
     undelivered: Array<{ url: string; error?: string }>;
-    /** An agent's draft: where the quorum that would mint it stands (absent once it minted). */
+    /** An agent's draft: where it stands among other sessions' drafts of the same literals (`nominated` at three). Nothing mints. */
     quorum?: TombstoneQuorumProgress;
-    /** The TB this draft minted together with other agent sessions' drafts (spec, Agent quorum). */
-    tombstone?: TbEntry;
   }> {
     const proposedBy = this.resolveIdentity(input.proposedBy, ['agent', 'human'], 'drafter');
     const prior = input.targetRef
@@ -1284,18 +1295,10 @@ export class Stenographer implements StenographerAPI {
       raisedTo: raised.filter((r) => !r.error).map((r) => r.url),
       undelivered: raised.filter((r) => r.error),
     };
-    // An agent's draft may complete a quorum of agent sessions' drafts, which mints the TB
+    // An agent's draft: where it stands among other sessions' drafts (three nominate it; nothing mints)
     if (!input.agentSessionId || !this.store.truth.isAgent(proposedBy)) return result;
-    // The clock is read under the write lock: drafts committed while this one waited for it count
-    const settled = settleTombstoneQuorum(this.store.truth, proposal, {
-      author: proposedBy,
-      agentSessionId: input.agentSessionId,
-      now: () => this.now(),
-    });
-    if ('progress' in settled) return { ...result, quorum: settled.progress };
-    // Embedded after the fact: the minting transaction can't await the embedder
-    this.store.truth.cacheEmbedding(settled.tombstone.id, await (await this.ensureEmbedder()).embed(settled.tombstone.body.claim));
-    return { ...result, proposal: this.store.truth.getEntry(proposal.id) as ProposalEntry, tombstone: settled.tombstone };
+    const { progress } = draftAgreement(this.store.truth, proposal, { author: proposedBy, agentSessionId: input.agentSessionId, now: () => this.now() });
+    return { ...result, quorum: progress };
   }
 
   /**
@@ -1445,7 +1448,7 @@ export class Stenographer implements StenographerAPI {
     const embedding = uv
       ? await (await this.ensureEmbedder()).embed(uv.body.assertion)
       : undefined;
-    return this.store.truth.resolveUv(uvId, resolution, evidence, {
+    const result = this.store.truth.resolveUv(uvId, resolution, evidence, {
       author,
       signedBy,
       opinion: opts.opinion,
@@ -1453,20 +1456,149 @@ export class Stenographer implements StenographerAPI {
       agentSessionId: opts.agentSessionId ?? null,
       embedding,
     });
+    await this.raiseSuspects(uvId, result.suspects);
+    return result;
+  }
+
+  /** The suspicion detector's proposals go to a person the way drafts do (meta.kind `derivation-review`), best effort. */
+  private async raiseSuspects(falsified: string, suspects: ProposalEntry[]): Promise<void> {
+    if (suspects.length === 0) return;
+    console.error(`🔎 ${falsified} fell to new evidence: ${suspects.length} derivation review${suspects.length === 1 ? '' : 's'} filed against its premises`);
+    await raiseDerivationReview(this.config.objectionSinks ?? [], suspects, falsified);
+  }
+
+  /**
+   * An approval of an open UV (PRD R5): a person's (`human`), an agent
+   * session's (`agent`, with settling evidence of its own) or stenographer's
+   * as the reporter (`reporter`, citing indexed messages). A person's
+   * approval plus one more promotes the UV to a TB answered for by that
+   * person; three agent sessions nominate it. Identities are checked
+   * against the signer registry for their role.
+   */
+  async approveUv(input: {
+    uvId: string;
+    role: ApprovalRole;
+    by?: string;
+    agentSessionId?: string;
+    evidence?: Evidence[];
+    cites?: string[];
+    note?: string;
+  }): Promise<
+    | { status: 'approved'; uv: UvEntry; approval: UvApproval; approvals: ApprovalSummary; detail: string }
+    | { status: 'nominated'; uv: UvEntry; approval: UvApproval; approvals: ApprovalSummary; addendum: AddendumEntry; detail: string }
+    | { status: 'promoted'; uv: UvEntry; approval: UvApproval; tombstone: TbEntry; addendum: AddendumEntry; ruling: RulingEntry | null; detail: string }
+  > {
+    const by =
+      input.role === 'reporter'
+        ? this.reporterIdentity()
+        : this.resolveIdentity(input.by ?? '', [input.role], input.role === 'human' ? 'the approving person' : 'the approving agent');
+    const uv = this.store.truth.getEntry(input.uvId) as UvEntry | null;
+    const embedding = uv?.type === 'UV' ? await (await this.ensureEmbedder()).embed(uv.body.assertion) : undefined;
+    const outcome = this.store.approvals.approve(
+      { uvId: input.uvId, by, role: input.role, agentSessionId: input.agentSessionId ?? null, evidence: input.evidence, cites: input.cites, note: input.note ?? null },
+      () => this.now()
+    );
+    switch (outcome.status) {
+      case 'promoted':
+        if (embedding) this.store.truth.cacheEmbedding(outcome.tombstone.id, embedding);
+        return {
+          status: 'promoted',
+          uv: outcome.uv,
+          approval: outcome.approval,
+          tombstone: outcome.tombstone,
+          addendum: outcome.addendum,
+          ruling: outcome.ruling,
+          detail: `Promoted: TB ${outcome.tombstone.id}, signed by ${outcome.tombstone.body.signedBy}, who answers for it.`,
+        };
+      case 'nominated':
+        return {
+          status: 'nominated',
+          uv: outcome.uv,
+          approval: outcome.approval,
+          approvals: outcome.approvals,
+          addendum: outcome.addendum,
+          detail:
+            `${outcome.members.length} agent sessions approved this UV from different angles: it is nominated and goes first on the docket. ` +
+            'It stays a UV (flag, don\'t block) until a person approves it in review.',
+        };
+      case 'approved':
+        return {
+          status: 'approved',
+          uv: outcome.uv,
+          approval: outcome.approval,
+          approvals: outcome.approvals,
+          detail:
+            `Your approval is recorded; it promotes nothing on its own. Promotion needs ${outcome.approvals.missing.join(' and ')}` +
+            (input.role === 'agent' ? '; three agent sessions agreeing from different angles nominate it for a person\'s review.' : '.'),
+        };
+    }
+  }
+
+  /** Stenographer's own identity as the reporter: listed with role `reporter` when a signer registry is configured. */
+  private reporterIdentity(): string {
+    return this.resolveIdentity(REPORTER_IDENTITY, ['reporter'], 'the reporter');
+  }
+
+  /**
+   * The review docket (R9): everything that waits on a person, grouped by
+   * subject, nominated UVs first, each item with the passages of the record
+   * found for it.
+   */
+  async getDocket(): Promise<Docket> {
+    const docket = buildDocket({ ledger: this.store.truth, approvals: this.store.approvals, attestations: this.store.attestations }, this.now());
+    for (const group of docket.groups) {
+      for (const item of group.items) item.passages = await this.passagesFor(item.text);
+    }
+    return docket;
+  }
+
+  private async passagesFor(text: string, k: number = 3): Promise<RecordPassage[]> {
+    if (!this.store.hasEmbeddings()) return [];
+    const found = await this.searchSimilar(text, k);
+    return found.map((m, i) => ({ id: m.id, role: m.role, timestamp: m.timestamp, content: m.content, score: Number(((k - i) / k).toFixed(2)) }));
+  }
+
+  /**
+   * A person calls on the agent that authored a UV during review (R9): the
+   * question goes to that session over the delivery channel (meta.kind
+   * `called-on`) when this engine carries it; otherwise stenographer answers
+   * from the record, and says so.
+   */
+  async callOnAuthor(
+    uvId: string,
+    question: string,
+    opts: { by: string }
+  ): Promise<{ asked: true; session: string; raisedTo: string[]; undelivered: Array<{ url: string; error?: string }> } | { asked: false; reason: string; passages: RecordPassage[] }> {
+    const by = this.resolveIdentity(opts.by, ['human'], 'the reviewer');
+    const uv = this.store.truth.getEntry(uvId) as UvEntry | null;
+    if (!uv || uv.type !== 'UV') throw new Error(`no such UV: ${uvId}`);
+    const session = uv.agentSessionId?.trim();
+    if (session && this.carriesSession(session)) {
+      const call = { uv, question, by };
+      console.error(formatCallOn(call));
+      const results = await callOnAgent(this.config.objectionSinks ?? [], call);
+      return { asked: true, session, raisedTo: results.filter((r) => !r.error).map((r) => r.url), undelivered: results.filter((r) => r.error) };
+    }
+    return {
+      asked: false,
+      reason: session ? `session ${session} has ended; stenographer answers from the record` : `${uv.author} has no session to call on; stenographer answers from the record`,
+      passages: await this.passagesFor(uv.body.assertion, 5),
+    };
   }
 
   /**
    * An agent's verdict on an open UV (resolve_uv in the agent profile). On
-   * its own it settles nothing: it is recorded as an attestation, and the UV
-   * settles when two or more agent sessions agree from different angles
-   * within 15 minutes (spec/truth-format, "Agent quorum"). Results:
-   * - `attested`: recorded; `quorum` says what is still missing;
+   * its own it settles nothing (PRD R5): it is recorded as an attestation,
+   * and a verified verdict is also this session's approval (approveUv):
+   * a person's approval plus one more promotes the UV, and three agent
+   * sessions agreeing from different angles nominate it. Results:
+   * - `approved`, `nominated`, `promoted`: the approval's outcome, for a
+   *   verified verdict;
+   * - `attested`: a refuted verdict, recorded for the docket;
+   * - `agreed`: other sessions refute it too, from different angles; the
+   *   docket shows the agreement, and a person rules;
    * - `disputed`: an opposite verdict stands within the window (from any
-   *   session, this one included), so no quorum forms; the first dispute is
-   *   raised to a person;
-   * - `raised`: a quorum verified a contest, which would override its TB:
-   *   that is raised to a person, and nothing is written to the ledger;
-   * - `settled`: the quorum's ADDENDUM resolved the UV.
+   *   session, this one included); the first dispute is raised to a person.
    */
   async attestUv(
     uvId: string,
@@ -1475,6 +1607,7 @@ export class Stenographer implements StenographerAPI {
     opts: { author: string; agentSessionId: string; opinion?: string }
   ): Promise<
     | { status: 'attested'; uv: UvEntry; attestation: Attestation; quorum: QuorumProgress; detail: string }
+    | { status: 'agreed'; uv: UvEntry; attestation: Attestation; members: Array<Pick<Attestation, 'author' | 'agentSessionId' | 'resolution' | 'createdAt'>>; detail: string }
     | {
         status: 'disputed';
         uv: UvEntry;
@@ -1484,8 +1617,9 @@ export class Stenographer implements StenographerAPI {
         undelivered: Array<{ url: string; error?: string }>;
         detail: string;
       }
-    | { status: 'raised'; uv: UvEntry; attestation: Attestation; raisedTo: string[]; undelivered: Array<{ url: string; error?: string }>; detail: string }
-    | { status: 'settled'; uv: UvEntry; addendum: AddendumEntry }
+    | { status: 'approved'; uv: UvEntry; attestation: Attestation; approval: UvApproval; approvals: ApprovalSummary; detail: string }
+    | { status: 'nominated'; uv: UvEntry; attestation: Attestation; approval: UvApproval; approvals: ApprovalSummary; addendum: AddendumEntry; detail: string }
+    | { status: 'promoted'; uv: UvEntry; attestation: Attestation; approval: UvApproval; tombstone: TbEntry; addendum: AddendumEntry; ruling: RulingEntry | null; detail: string }
   > {
     const author = this.resolveIdentity(opts.author, ['agent'], 'the attesting agent');
     // The clock is read under the write lock: a verdict committed while this one waited for it counts
@@ -1493,67 +1627,48 @@ export class Stenographer implements StenographerAPI {
       { uvId, resolution, evidence, author, agentSessionId: opts.agentSessionId, note: opts.opinion ?? null },
       () => this.now()
     );
-    const raise = async (r: Omit<UvRaise, 'cause'>) => {
-      const notice = { ...r, cause: outcome.attestation.id };
-      console.error(formatUvNotice(notice));
-      const results = await raiseUvForPerson(this.config.objectionSinks ?? [], notice);
-      return { raisedTo: results.filter((x) => !x.error).map((x) => x.url), undelivered: results.filter((x) => x.error) };
-    };
-    switch (outcome.status) {
-      case 'settled':
-        return { status: 'settled', uv: outcome.uv, addendum: outcome.addendum };
-      case 'attested':
-        return {
-          status: 'attested',
-          uv: outcome.uv,
-          attestation: outcome.attestation,
-          quorum: outcome.quorum,
-          detail: outcome.quorum.missing.includes('a settling evidence item')
-            ? 'Your verdict is recorded, but it can\'t count toward a quorum: it cites no settling evidence. Check the ' +
-              `claim against ${SETTLING_KINDS_TEXT} evidence and file your verdict again with it, or leave the UV to a person.`
-            : 'Your verdict is recorded; it settles nothing on its own. The UV settles when another agent session agrees ' +
-              `from a different angle (other evidence, another kind) before ${outcome.quorum.windowEndsAt}, or when a person rules.`,
-        };
-      case 'disputed': {
-        const own = outcome.dissent.some((d) => trimWhiteSpace(d.agentSessionId) === trimWhiteSpace(opts.agentSessionId));
-        const detail =
-          `opposite verdicts stand on UV ${uvId} within 15 minutes` +
-          (own ? ', this session\'s own earlier one among them' : '') +
-          ': no quorum forms while both stand; a person rules';
-        return {
-          status: 'disputed',
-          uv: outcome.uv,
-          attestation: outcome.attestation,
-          dissent: outcome.dissent.map(({ author, agentSessionId, resolution, createdAt }) => ({ author, agentSessionId, resolution, createdAt })),
-          ...(outcome.raise ? await raise({ reason: 'dispute', uv: outcome.uv, detail }) : { raisedTo: [], undelivered: [] }),
-          detail,
-        };
+    const brief = ({ author, agentSessionId, resolution, createdAt }: Attestation) => ({ author, agentSessionId, resolution, createdAt });
+    if (outcome.status === 'disputed') {
+      const own = outcome.dissent.some((d) => trimWhiteSpace(d.agentSessionId) === trimWhiteSpace(opts.agentSessionId));
+      const detail =
+        `opposite verdicts stand on UV ${uvId} within 15 minutes` +
+        (own ? ', this session\'s own earlier one among them' : '') +
+        ': a person rules in review';
+      let raisedTo: string[] = [];
+      let undelivered: Array<{ url: string; error?: string }> = [];
+      if (outcome.raise) {
+        const notice: UvRaise = { reason: 'dispute', uv: outcome.uv, detail, cause: outcome.attestation.id };
+        console.error(formatUvNotice(notice));
+        const results = await raiseUvForPerson(this.config.objectionSinks ?? [], notice);
+        raisedTo = results.filter((x) => !x.error).map((x) => x.url);
+        undelivered = results.filter((x) => x.error);
       }
-      case 'raised': {
-        if (outcome.reason === 'quorum-off') {
-          const detail =
-            `${outcome.members.length} agent sessions ${outcome.attestation.resolution === 'verified' ? 'verified' : 'refuted'} this UV ` +
-            'from different angles; the agent quorum is off on this ledger, so a person settles it';
-          return {
-            status: 'raised',
-            uv: outcome.uv,
-            attestation: outcome.attestation,
-            ...(await raise({ reason: 'quorum-off', uv: outcome.uv, detail })),
-            detail,
-          };
-        }
-        const detail =
-          `${outcome.members.length} agent sessions verified this contest from different angles; ` +
-          `overriding TB ${outcome.tbId} needs a person`;
-        return {
-          status: 'raised',
-          uv: outcome.uv,
-          attestation: outcome.attestation,
-          ...(await raise({ reason: 'contest-verified', uv: outcome.uv, detail, tbId: outcome.tbId })),
-          detail,
-        };
-      }
+      return { status: 'disputed', uv: outcome.uv, attestation: outcome.attestation, dissent: outcome.dissent.map(brief), raisedTo, undelivered, detail };
     }
+    if (resolution === 'verified') {
+      // A verified verdict is this session's approval: the attestation keeps the dispute check, the approval counts toward promotion
+      const approved = await this.approveUv({ uvId, role: 'agent', by: author, agentSessionId: opts.agentSessionId, evidence, note: opts.opinion });
+      return { ...approved, attestation: outcome.attestation };
+    }
+    if (outcome.status === 'agreed') {
+      return {
+        status: 'agreed',
+        uv: outcome.uv,
+        attestation: outcome.attestation,
+        members: outcome.members.map(brief),
+        detail: `${outcome.members.length} agent sessions refute this UV from different angles. Nothing settles on agents' word: the docket shows the agreement, and a person rules in review.`,
+      };
+    }
+    return {
+      status: 'attested',
+      uv: outcome.uv,
+      attestation: outcome.attestation,
+      quorum: outcome.quorum,
+      detail: outcome.quorum.missing.includes('a settling evidence item')
+        ? 'Your verdict is recorded, but it cites no settling evidence. Check the ' +
+          `claim against ${SETTLING_KINDS_TEXT} evidence and file your verdict again with it, or leave the UV to a person.`
+        : 'Your verdict is recorded; it settles nothing on its own. It waits on the docket, where a person rules in review.',
+    };
   }
 
   /** The force path — fails without evidence. A person's act. */
@@ -1561,11 +1676,13 @@ export class Stenographer implements StenographerAPI {
     tbId: string,
     addendum: { evidence: Evidence[]; note?: string },
     opts: { author: string; agentSessionId?: string }
-  ): Promise<{ tombstone: TbEntry; addendum: AddendumEntry }> {
-    return this.store.truth.overrideTombstone(tbId, addendum, {
+  ): Promise<{ tombstone: TbEntry; addendum: AddendumEntry; suspects: ProposalEntry[] }> {
+    const result = this.store.truth.overrideTombstone(tbId, addendum, {
       author: this.resolveIdentity(opts.author, ['human'], 'author'),
       agentSessionId: opts.agentSessionId ?? null,
     });
+    await this.raiseSuspects(tbId, result.suspects);
+    return result;
   }
 
   /** Rulings are judgments: a person's act. */
@@ -1595,29 +1712,33 @@ export class Stenographer implements StenographerAPI {
   async getVerificationQueue(
     context?: string,
     k: number = 10
-  ): Promise<Array<UvEntry & { queueRank: { contesting: boolean; relevance: number; deprioritized: boolean } }>> {
+  ): Promise<Array<UvEntry & { queueRank: { suspect: boolean; contesting: boolean; relevance: number; deprioritized: boolean } }>> {
     const ctxEmbedding = context ? await (await this.ensureEmbedder()).embed(context) : null;
     const uvs = ctxEmbedding ? await this.withEmbeddings(this.store.truth.getOpenUvs()) : this.store.truth.getOpenUvs();
+    const suspects = this.store.truth.suspectUvs();
 
     const scored = uvs.map((uv) => {
+      // A premise of a refuted or overridden entry goes first (R4): the detector filed nothing against it
+      const suspect = suspects.has(uv.id);
       const contesting = Boolean(uv.body.contests);
       const relevance =
         ctxEmbedding && uv.embedding ? cosineSimilarity(ctxEmbedding, uv.embedding) : 0;
       const deprioritized = uv.body.verifyBy.kind === 'ask';
-      return { uv, contesting, relevance, deprioritized };
+      return { uv, suspect, contesting, relevance, deprioritized };
     });
 
     scored.sort(
       (a, b) =>
+        Number(b.suspect) - Number(a.suspect) ||
         Number(b.contesting) - Number(a.contesting) ||
         Number(a.deprioritized) - Number(b.deprioritized) ||
         b.relevance - a.relevance ||
         a.uv.createdAt.localeCompare(b.uv.createdAt)
     );
 
-    return scored.slice(0, k).map(({ uv, contesting, relevance, deprioritized }) => {
+    return scored.slice(0, k).map(({ uv, suspect, contesting, relevance, deprioritized }) => {
       const { embedding: _drop, ...entry } = uv;
-      return { ...entry, queueRank: { contesting, relevance, deprioritized } };
+      return { ...entry, queueRank: { suspect, contesting, relevance, deprioritized } };
     });
   }
 
@@ -1700,8 +1821,15 @@ export class Stenographer implements StenographerAPI {
     openProposals: number;
     contested: number;
     rulings: number;
+    standing: { sound: number; clouded: number; unsupported: number };
+    /** The review docket's size and the age of its oldest item (R9): a neglected docket is visible without being loud. */
+    docket: { size: number; nominated: number; oldest: { id: string; createdAt: string; ageMs: number } | null };
   }> {
-    return this.store.truth.getStats();
+    const docket = buildDocket({ ledger: this.store.truth, approvals: this.store.approvals, attestations: this.store.attestations }, this.now());
+    return {
+      ...this.store.truth.getStats(),
+      docket: { size: docket.size, nominated: docket.nominated, oldest: docket.oldest ? { id: docket.oldest.id, createdAt: docket.oldest.createdAt, ageMs: docket.oldest.ageMs } : null },
+    };
   }
 
   // ─────────────────────────────────────────────────────────

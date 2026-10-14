@@ -1,0 +1,17 @@
+{
+  "01M1E6JK90ZQ233YQH6CQNEE31": {
+    "type": "UV",
+    "status": "verified",
+    "current": false,
+    "standing": "sound",
+    "reasons": [],
+    "corroborated": true
+  },
+  "01M1E6JK93QC38KX0BC1DMTT8E": {
+    "type": "TB",
+    "status": "active",
+    "current": true,
+    "standing": "sound",
+    "reasons": []
+  }
+}
