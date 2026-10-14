@@ -88,6 +88,7 @@ const QUERIES = {
     kind: z.enum(['tombstone', 'uv']).optional(),
   }),
   contextFrame: z.object({ budget: count(2000, MAX_BUDGET) }),
+  precedents: z.object({ scope: z.string().min(1).max(200).optional(), all: z.literal('true').optional() }),
   derivation: z.object({ direction: z.enum(['down', 'up']).default('down') }),
 };
 
@@ -324,6 +325,12 @@ export class RestServer {
       case '/proposals': {
         const { status, kind } = parseQuery(QUERIES.proposals, url);
         sendJson(res, 200, await this.engine.listProposals(status, kind));
+        return;
+      }
+
+      case '/precedents': {
+        const { scope, all } = parseQuery(QUERIES.precedents, url);
+        sendJson(res, 200, await this.engine.getPrecedents({ scope, all: all === 'true' }));
         return;
       }
 

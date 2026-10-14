@@ -554,7 +554,7 @@
           "const": "RULING"
         },
         "kind": {
-          "description": "An open string. Known: strike, promotion, contempt, objection, dismissal.",
+          "description": "An open string. Known: strike, promotion, contempt, objection, dismissal, precedent.",
           "type": "string",
           "minLength": 1
         },
@@ -568,6 +568,11 @@
         "answerableBy": {
           "description": "The person who answers for the ruling: its author (README, Answerability).",
           "$ref": "#/$defs/identity"
+        },
+        "scope": {
+          "description": "On a precedent (kind precedent): its scope, a lowercase dotted slug such as ci.merge-on-red (README, Precedents). The codec requires it on a precedent.",
+          "type": "string",
+          "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*(?:\\.[a-z0-9]+(?:-[a-z0-9]+)*)*$"
         }
       },
       "required": [

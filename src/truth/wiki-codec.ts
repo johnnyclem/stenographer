@@ -41,6 +41,7 @@ import {
   LINK_TYPES,
   MAX_PREMISES,
   MIGRATION_AUTHOR,
+  SCOPE_PATTERN,
   EvidenceSchema,
   ProvenanceSchema,
   TombstonedLiteralSchema,
@@ -221,7 +222,17 @@ const AddendumLine = z
   })
   .passthrough();
 const RulingLine = z
-  .object({ ...Envelope, type: z.literal('RULING'), author: Identity, kind: Text, opinion: Blankless, target: ID, answerableBy: Identity.optional() })
+  .object({
+    ...Envelope,
+    type: z.literal('RULING'),
+    author: Identity,
+    kind: Text,
+    opinion: Blankless,
+    target: ID,
+    answerableBy: Identity.optional(),
+    /** A precedent's scope (spec, Precedents): a lowercase dotted slug. */
+    scope: z.string().regex(SCOPE_PATTERN, 'a scope is a lowercase dotted slug, such as ci.merge-on-red').optional(),
+  })
   .passthrough();
 const ProposalLine = z
   .object({
@@ -301,6 +312,21 @@ const LineV2 = z
         if (l.fromId !== line.id) {
           issue(`${line.type === 'ADDENDUM' ? 'an' : 'a'} ${line.type} line lists only the links it writes`, ['x-steno', 'links', String(i)]);
         }
+      }
+    }
+    if (line.type === 'RULING') {
+      // A precedent (spec, Precedents): a scope, and a target that is itself or the one precedent it supersedes
+      const precedent = line.kind === 'precedent';
+      const supersedes = links.filter((l) => l.type === 'supersedes' && l.fromId === line.id);
+      // (A scope on another kind is kept as written: a newer writer's kind may carry one too)
+      if (precedent && line.scope === undefined) issue('a precedent names its scope', ['scope']);
+      if (!precedent && supersedes.length > 0) issue('only a precedent supersedes another', ['x-steno', 'links']);
+      if (precedent && supersedes.length > 1) issue('a precedent supersedes one precedent', ['x-steno', 'links']);
+      if (precedent && supersedes.length === 1 && line.target !== supersedes[0].toId) {
+        issue("a precedent's target is the precedent it supersedes", ['target']);
+      }
+      if (precedent && supersedes.length === 0 && line.target !== line.id) {
+        issue('the first precedent on a scope targets itself', ['target']);
       }
     }
     // Agents settle only together: a quorum keeps rules 1–6, and appears only on a TB or an ADDENDUM

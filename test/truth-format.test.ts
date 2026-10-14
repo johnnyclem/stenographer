@@ -128,7 +128,18 @@ function fold(stream: string[]): Record<string, { type: string; status: string |
 function foldWithStanding(stream: string[]): Record<string, { type: string; status: string | null; current: boolean; standing: string; reasons: unknown[] }> {
   const statuses = fold(stream);
   const nodes = new Map<string, StandingNode>();
-  for (const line of stream.map(parse)) {
+  const lines = stream.map(parse);
+  // A precedent ruling folds too (spec, Precedents): current until a later precedent's supersedes link, or a strike
+  const struckIds = new Set(lines.filter((l) => l.type === 'RULING' && l.kind === 'strike').map((l) => l.target));
+  const superseded = new Set(lines.filter((l) => l.type === 'RULING').flatMap((l) => (l['x-steno']?.links ?? []).filter((k: { type: string }) => k.type === 'supersedes').map((k: { toId: string }) => k.toId)));
+  for (const line of lines) {
+    if (line.type === 'RULING' && line.kind === 'precedent') {
+      const struck = struckIds.has(line.id);
+      const status = superseded.has(line.id) ? 'superseded' : 'current';
+      nodes.set(line.id, { type: 'RULING', status, struck, premises: [] });
+      statuses[line.id] = { type: 'RULING', status: struck ? 'struck' : status, current: !struck && status === 'current' };
+      continue;
+    }
     if (line.type !== 'TB' && line.type !== 'UV') continue;
     const state = statuses[line.id];
     nodes.set(line.id, {
@@ -650,6 +661,33 @@ function buildFixtures(): Map<string, string> {
   expect(reviewStream.skipped).toEqual([]);
   files.set('valid/review.jsonl', jsonl(reviewStream.lines));
   files.set('valid/review.expected.json', json(foldReview(reviewStream.lines)));
+
+  // valid/precedent.jsonl: a precedent, a TB derived from it, and a superseding precedent that undermines the TB
+  const precedents = new TruthLedger(new Database(':memory:'));
+  const first = precedents.fileRuling(
+    { kind: 'precedent', scope: 'ci.merge-on-red', opinion: 'A red main is never merged into. Fix forward on a branch, or revert; a merge waits for green.' },
+    { author: 'johnnyclem', timestamp: H(10) }
+  ).ruling;
+  const derivedFromPrecedent = precedents.assertTombstone(
+    {
+      claim: 'The merge-on-red exception for hotfixes is gone.',
+      evidence: [{ kind: 'commit', ref: 'd00d1e5', detail: 'removed the hotfix bypass from the merge queue' }],
+      signedBy: 'kim',
+      literals: [{ dead: 'allowHotfixOnRed' }],
+      premises: [{ id: first.id, contentHash: precedents.contentHashOf(first.id)! }],
+      inference: 'The precedent admits no exception, so the bypass that made one is dead.',
+    },
+    { author: 'kim', timestamp: H(11) }
+  );
+  precedents.fileRuling(
+    { kind: 'precedent', scope: 'ci.merge-on-red', opinion: 'A red main may be merged into for a revert that makes it green, and for nothing else.', supersedes: first.id },
+    { author: 'johnnyclem', timestamp: H(12) }
+  );
+  const precedentStream = exportWikiEntries(precedents);
+  expect(precedentStream.skipped).toEqual([]);
+  files.set('valid/precedent.jsonl', jsonl(precedentStream.lines));
+  files.set('valid/precedent.expected.json', json(foldWithStanding(precedentStream.lines)));
+  void derivedFromPrecedent;
   return files;
 }
 
@@ -1272,6 +1310,60 @@ describe('valid/unknown.jsonl: what a newer writer may send', () => {
       const back = exportWikiEntries(ledger).lines.map(parse).find((l) => l.type === type)!;
       for (const [key, value] of Object.entries(added)) expect(canonicalize(back[key]), what).toBe(canonicalize(value));
     }
+  });
+});
+
+describe('valid/precedent.jsonl: a precedent, a TB derived from it, and a superseding precedent', () => {
+  const fixture = () => lines('fixtures/valid/precedent.jsonl');
+
+  it('every line passes the schema and the codec, and the lines chain; precedent lines carry scope and self- or predecessor-targets', () => {
+    const all = fixture();
+    for (const [i, line] of all.entries()) {
+      expect(schemaValid(line), `line ${i + 1}: ${ajv.errorsText(validate.errors)}`).toBe(true);
+      expect(decodeWikiLine(line)).toMatchObject({ version: 2, seq: i + 1 });
+      expect(parse(line).prevHash).toBe(i === 0 ? null : parse(all[i - 1]).hash);
+    }
+    const [first, tb, second] = all.map(parse);
+    expect(first).toMatchObject({ type: 'RULING', kind: 'precedent', scope: 'ci.merge-on-red', target: first.id, answerableBy: 'johnnyclem' });
+    expect(first['x-steno'].links).toEqual([]);
+    expect(tb).toMatchObject({ type: 'TB', inference: expect.any(String) });
+    expect(tb['x-steno'].links).toContainEqual({ fromId: tb.id, toId: first.id, type: 'derives', contentHash: lineContentHash(first) });
+    expect(second).toMatchObject({ type: 'RULING', kind: 'precedent', scope: 'ci.merge-on-red', target: first.id });
+    expect(second['x-steno'].links).toEqual([{ fromId: second.id, toId: first.id, type: 'supersedes' }]);
+    // No TRANSITION: a precedent's status is read off the supersedes link, and the TB's status didn't change
+    expect(all.map(parse).some((l) => l.type === 'TRANSITION')).toBe(false);
+  });
+
+  it("folds, by the readers' rule, to the expected statuses and standing: the superseded precedent undermines the TB", () => {
+    const want = expected<Record<string, { type: string; status: string; standing: string; reasons: Array<{ reason: string }> }>>('fixtures/valid/precedent.expected.json');
+    expect(foldWithStanding(fixture())).toEqual(want);
+    const [first, tb, second] = fixture().map(parse);
+    expect(want[first.id]).toMatchObject({ type: 'RULING', status: 'superseded', current: false });
+    expect(want[second.id]).toMatchObject({ type: 'RULING', status: 'current', current: true });
+    expect(want[tb.id]).toMatchObject({ status: 'active', standing: 'unsupported', current: false, reasons: [{ premise: first.id, reason: 'premise-superseded' }] });
+  });
+
+  it('imports into a fresh ledger with the same standing, and holds a precedent whose predecessor is not held', () => {
+    const ledger = fresh();
+    const all = fixture();
+    const result = importWikiEntries(ledger, { lines: all }, { signers: signers() });
+    expect(result).toMatchObject({ committed: true, inserted: 3, proposals: [], held: [], errors: [] });
+    for (const [id, want] of Object.entries(expected<Record<string, { type: string; status: string; standing: string; reasons: unknown[] }>>('fixtures/valid/precedent.expected.json'))) {
+      if (want.type === 'RULING') expect((ledger.getEntry(id)!.body as { status: string }).status, id).toBe(want.status);
+      else expect(ledger.getEntry(id), id).toMatchObject({ standing: want.standing, reasons: want.reasons });
+    }
+    const [first, , second] = all.map(parse);
+    expect((ledger.getEntry(first.id)!.body as { status: string }).status).toBe('superseded');
+    expect(ledger.getPrecedents().map((p) => p.id)).toEqual([second.id]);
+    expect(ledger.verify().ok).toBe(true);
+    // The superseding precedent on its own: its predecessor is not held, so it waits
+    const alone = fresh();
+    const held = importWikiEntries(alone, { lines: [all[2]] }, { signers: signers() });
+    expect(held.held).toMatchObject([{ id: second.id, reason: expect.stringMatching(/is not held here/) }]);
+    // A reader that doesn't know the kind holds the line and changes nothing else (import rule 6)
+    const unknownKind = fresh();
+    const [renamed] = stream([{ ...(({ schemaVersion: _v, seq: _s, prevHash: _p, hash: _h, ...rest }) => rest)(first), kind: 'edict' }]);
+    expect(importWikiEntries(unknownKind, { lines: [renamed] }, { signers: signers() }).held).toMatchObject([{ reason: expect.stringMatching(/ruling kind 'edict'/) }]);
   });
 });
 

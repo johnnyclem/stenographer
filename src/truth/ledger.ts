@@ -65,7 +65,9 @@ import {
   type Premise,
   type Standing,
   type Approval,
+  type PrecedentStatus,
   InferenceSchema,
+  ScopeSchema,
   MAX_PREMISES,
 } from './types.js';
 import { ContemptError, NotarizationRequiredError } from './errors.js';
@@ -228,15 +230,19 @@ const STORED_BODY: Partial<Record<TruthEntryType, z.ZodTypeAny>> = {
     .strict(),
   RULING: z
     .object({
-      kind: z.enum(['strike', 'promotion', 'contempt', 'objection', 'dismissal']),
+      kind: z.enum(['strike', 'promotion', 'contempt', 'objection', 'dismissal', 'precedent']),
       opinion: z.string().refine((o) => o.trim().length > 0, 'a ruling requires a written opinion'),
       target: z.string().min(1),
       objectionId: z.string().min(1).optional(),
       outcome: z.enum(['sustained', 'overruled']).optional(),
       answerableBy: z.string().min(1).optional(),
+      scope: ScopeSchema.optional(),
+      // Recorded by a wiki line's reader: a precedent's status is derived (status.ts), never stored
+      status: z.enum(['current', 'superseded']).optional(),
       extra: extraFields('RULING'),
     })
-    .strict(),
+    .strict()
+    .refine((r) => r.kind !== 'precedent' || r.scope !== undefined, { message: 'a precedent names its scope', path: ['scope'] }),
   PROPOSAL: z
     .object({
       kind: z.enum(['tombstone', 'uv']),
@@ -255,8 +261,8 @@ const LINK_TARGET: Partial<Record<LinkType, readonly TruthEntryType[]>> = {
   refutes: ['UV'],
   signs: ['PROPOSAL'],
   dismisses: ['PROPOSAL'],
-  // A premise is a TB or a UV the ledger holds (a precedent ruling, when those exist)
-  derives: ['TB', 'UV'],
+  // A premise is a TB, a UV or a precedent ruling the ledger holds (admitDerivation checks the ruling's kind)
+  derives: ['TB', 'UV', 'RULING'],
   // A nomination corroborates a UV (spec, Nomination)
   corroborates: ['UV'],
 };
@@ -267,7 +273,11 @@ const HEX64 = /^[0-9a-f]{64}$/;
 function isDead(entry: { type: TruthEntryType; body: { status?: unknown }; struck: boolean }): boolean {
   if (entry.struck) return true;
   const status = entry.body.status;
-  return (entry.type === 'TB' && status === 'overridden') || (entry.type === 'UV' && status === 'refuted');
+  return (
+    (entry.type === 'TB' && status === 'overridden') ||
+    (entry.type === 'UV' && status === 'refuted') ||
+    (entry.type === 'RULING' && status === 'superseded')
+  );
 }
 
 function formatIssues(error: z.ZodError): string {
@@ -846,7 +856,42 @@ export class TruthLedger {
         fail(`link ${link.fromId} -${link.type}-> ${link.toId} is not this entry's to write`);
       }
     }
+    this.admitPrecedent(entry, links, fail);
     this.admitDerivation(entry, links, opts, fail);
+  }
+
+  /**
+   * A precedent (spec, Precedents): a RULING of kind `precedent` with a
+   * scope, whose `target` is the precedent it supersedes (its one
+   * `supersedes` link, at a current precedent on the same scope) or its own
+   * id when it is the first on its scope. Only a precedent writes
+   * `supersedes`.
+   */
+  private admitPrecedent(entry: NewEntry, links: TruthLink[], fail: (message: string) => never): void {
+    if (entry.type !== 'RULING') return;
+    const body = entry.body as { kind?: unknown; target?: unknown; scope?: unknown };
+    const supersedes = links.filter((l) => l.fromId === entry.id && l.type === 'supersedes');
+    if (body.kind !== 'precedent') {
+      if (supersedes.length > 0) fail('only a precedent ruling supersedes another');
+      return;
+    }
+    if (supersedes.length > 1) fail('a precedent supersedes one precedent');
+    const [link] = supersedes;
+    if (link) {
+      if (body.target !== link.toId) fail(`a precedent's target is the precedent it supersedes (${link.toId}), not ${String(body.target)}`);
+      const prior = this.storedRecord(link.toId);
+      if (prior) {
+        const priorBody = prior.body as { kind?: unknown; scope?: unknown };
+        if (prior.type !== 'RULING' || priorBody.kind !== 'precedent') fail(`a precedent supersedes a precedent, and ${link.toId} is not one`);
+        if (priorBody.scope !== body.scope) fail(`precedent ${link.toId} is on scope ${String(priorBody.scope)}, not ${String(body.scope)}: a precedent supersedes one on its own scope`);
+        // One supersession per precedent: a scope has one current precedent
+        const state = this.db.prepare('SELECT status, struck FROM truth_entries WHERE id = ?').get(link.toId) as { status: string | null; struck: number };
+        if (state.status === 'superseded') fail(`precedent ${link.toId} is already superseded`);
+        if (state.struck) fail(`precedent ${link.toId} is struck`);
+      }
+    } else if (body.target !== entry.id) {
+      fail(`the first precedent on a scope targets itself (${entry.id}), not ${String(body.target)}: a later one names the precedent it supersedes`);
+    }
   }
 
   /**
@@ -877,6 +922,9 @@ export class TruthLedger {
     for (const link of derives) {
       const held = this.storedRecord(link.toId);
       if (!held) continue; // a live write already failed on `no such entry`; an import lands clouded
+      if (held.type === 'RULING' && (held.body as { kind?: unknown }).kind !== 'precedent') {
+        fail(`premise ${link.toId} is a ${String((held.body as { kind?: unknown }).kind)} ruling: only a precedent ruling is a premise`);
+      }
       const hash = contentHash(held.type, held.author, held.body);
       if (hash !== link.contentHash) {
         fail(`premise ${link.toId} hashes to ${hash}, not the ${link.contentHash} this entry pins it by: it is not the premise the signer attested to`);
@@ -1855,7 +1903,16 @@ export class TruthLedger {
   // ─────────────────────────────────────────────────────────
 
   fileRuling(
-    input: { kind: FiledRulingKind; opinion: string; target: string },
+    input: {
+      kind: FiledRulingKind;
+      opinion: string;
+      /** Entry id, or author identity for contempt. A precedent takes `scope` and `supersedes` instead; its target is derived. */
+      target?: string;
+      /** A precedent's scope: a lowercase dotted slug such as `ci.merge-on-red`. */
+      scope?: string;
+      /** A precedent: the current precedent on its scope it supersedes. Absent for the first on a scope. */
+      supersedes?: string;
+    },
     ctx: WriteContext
   ): { ruling: RulingEntry; conductTombstone: TbEntry | null } {
     ctx = { ...ctx, author: this.accountable(ctx.author, 'ruling author') };
@@ -1869,24 +1926,49 @@ export class TruthLedger {
       throw new TruthWriteError('a ruling requires a written opinion — rulings are precedent');
     }
 
+    if (input.kind === 'precedent') {
+      if (input.scope === undefined) throw new TruthWriteError('a precedent names its scope (a lowercase dotted slug, such as ci.merge-on-red)');
+      const parsedScope = ScopeSchema.safeParse(input.scope);
+      if (!parsedScope.success) throw new TruthWriteError(`scope '${String(input.scope)}': ${formatIssues(parsedScope.error)}`);
+      const scope = parsedScope.data;
+      if (input.target !== undefined && input.target !== input.supersedes) {
+        throw new TruthWriteError("a precedent's target is derived: the precedent it supersedes, or its own id when it is the first on its scope");
+      }
+      const rulingId = this.tx(() => {
+        const id = ulid();
+        if (input.supersedes === undefined) {
+          return this.insertRuling({ kind: 'precedent', opinion: input.opinion, target: id, scope }, ctx, [], id);
+        }
+        const prior = this.mustGetTyped<RulingEntry>(input.supersedes, 'RULING');
+        if (prior.body.kind !== 'precedent') throw new TruthWriteError(`${prior.id} is a ${prior.body.kind} ruling, not a precedent`);
+        if (prior.body.scope !== scope) throw new TruthWriteError(`precedent ${prior.id} is on scope ${prior.body.scope}, not ${scope}`);
+        if (this.isStruck(prior.id)) throw new TruthWriteError(`precedent ${prior.id} is struck`);
+        if (prior.body.status === 'superseded') throw new TruthWriteError(`precedent ${prior.id} is already superseded`);
+        return this.insertRuling({ kind: 'precedent', opinion: input.opinion, target: prior.id, scope }, ctx, [{ toId: prior.id, type: 'supersedes' }], id);
+      });
+      return { ruling: this.getEntry(rulingId) as RulingEntry, conductTombstone: null };
+    }
+    if (typeof input.target !== 'string' || input.target.length === 0) throw new TruthWriteError(`a ${input.kind} ruling names its target`);
+    const target = input.target;
+
     const { rulingId, tbId } = this.tx((): { rulingId: string; tbId: string | null } => {
       let rulingId: string;
       let tbId: string | null = null;
 
       if (input.kind === 'strike') {
         // Inadmissible for retrieval; nothing is deleted — append-only holds
-        const target = this.mustGet(input.target);
-        rulingId = this.insertRuling(input, ctx, [{ toId: target.id, type: 'strikes' }]);
+        const struck = this.mustGet(target);
+        rulingId = this.insertRuling({ kind: 'strike', opinion: input.opinion, target: struck.id }, ctx, [{ toId: struck.id, type: 'strikes' }]);
       } else if (input.kind === 'promotion') {
-        this.mustGet(input.target);
-        rulingId = this.insertRuling(input, ctx);
+        this.mustGet(target);
+        rulingId = this.insertRuling({ kind: 'promotion', opinion: input.opinion, target }, ctx);
       } else {
-        rulingId = this.insertRuling(input, ctx);
+        rulingId = this.insertRuling({ kind: 'contempt', opinion: input.opinion, target }, ctx);
         // Contempt mints exactly one artifact: a TB about the conduct,
         // surfaced when that author's output is next reviewed. No karma.
         const tb = this.insertTb(
           {
-            claim: `Contempt of corpus: ${input.target} — ${input.opinion}`,
+            claim: `Contempt of corpus: ${target} — ${input.opinion}`,
             evidence: [{ kind: 'wiki', ref: rulingId, detail: 'contempt ruling' }],
             signedBy: ctx.author,
             answerableBy: ctx.author,
@@ -1971,11 +2053,12 @@ export class TruthLedger {
   }
 
   private insertRuling(
-    input: { kind: FiledRulingKind | 'dismissal'; opinion: string; target: string },
+    input: { kind: FiledRulingKind | 'dismissal'; opinion: string; target: string; scope?: string },
     ctx: WriteContext,
-    links: Array<{ toId: string; type: LinkType }> = []
+    links: Array<{ toId: string; type: LinkType }> = [],
+    /** A precedent's id is chosen first: the first on a scope targets itself. */
+    id: string = ulid()
   ): string {
-    const id = ulid();
     this.append(
       {
         id,
@@ -1986,7 +2069,7 @@ export class TruthLedger {
         agentSessionId: ctx.agentSessionId ?? null,
         origin: 'local',
         // A ruling is answered for by the person who filed it (spec, Answerability)
-        body: { kind: input.kind, opinion: input.opinion, target: input.target, answerableBy: ctx.author },
+        body: { kind: input.kind, opinion: input.opinion, target: input.target, ...(input.scope !== undefined ? { scope: input.scope } : {}), answerableBy: ctx.author },
       },
       TruthLedger.outbound(id, links),
       { embedding: ctx.embedding }
@@ -2357,6 +2440,33 @@ export class TruthLedger {
           )
         : null,
     }));
+  }
+
+  /**
+   * Precedent rulings (spec, Precedents): the current one on each scope by
+   * default, every one with `all`. `scope` narrows to that scope and the
+   * scopes under it (`ci` matches `ci.merge-on-red`). Oldest first.
+   */
+  getPrecedents(opts: { scope?: string; all?: boolean } = {}): Array<RulingEntry & { embedding: number[] | null }> {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM truth_entries WHERE type = 'RULING' AND json_extract(body, '$.kind') = 'precedent'
+           ${opts.all ? '' : "AND struck = 0 AND COALESCE(status, 'current') = 'current'"}
+         ORDER BY created_at ASC, seq ASC`
+      )
+      .all() as any[];
+    const under = (scope: string) => opts.scope === undefined || scope === opts.scope || scope.startsWith(`${opts.scope}.`);
+    return rows
+      .map((r) => ({
+        ...(this.rowToEntry(r) as RulingEntry),
+        embedding: r.embedding ? Array.from(new Float32Array(r.embedding.buffer, r.embedding.byteOffset, r.embedding.byteLength / 4)) : null,
+      }))
+      .filter((p) => under(p.body.scope ?? ''));
+  }
+
+  /** The current precedent on a scope, if any. */
+  currentPrecedent(scope: string): (RulingEntry & { status?: PrecedentStatus }) | null {
+    return this.getPrecedents({ scope }).find((p) => p.body.scope === scope) ?? null;
   }
 
   /** All TB+UV disputes: contested TBs paired with their live contesting UVs. */

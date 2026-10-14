@@ -1143,19 +1143,27 @@ export class Stenographer implements StenographerAPI {
     const entities = this.store
       .getEntities(this.scope)
       .sort((a, b) => b.references - a.references || b.lastSeen.localeCompare(a.lastSeen));
+    const precedents = this.store.truth.getPrecedents(); // the current one per scope, oldest first
 
     const sections: FrameSection[] = [
+      {
+        // Standing policy decisions (R7): follow one that applies, and cite its id
+        header: '## Precedents',
+        items: precedents.map((p) => `- ${p.body.scope}: ${clip(p.body.opinion, FRAME_ITEM_CHARS)} (${p.id})`),
+        priority: precedents.map((_, i) => precedents.length - 1 - i),
+        share: 0.1,
+      },
       {
         header: '## Entities',
         items: entities.map((e) => `- ${clip(e.value, FRAME_ENTITY_CHARS)} (${e.type})`),
         priority: entities.map((_, i) => i),
-        share: 0.15,
+        share: 0.1,
       },
       {
         header: '## Decisions',
         items: decisions.map((d) => `- ${clip(d.description, FRAME_ITEM_CHARS)}`),
         priority: decisions.map((_, i) => decisions.length - 1 - i),
-        share: 0.35,
+        share: 0.3,
       },
       {
         header: '## Recent Messages',
@@ -1169,8 +1177,8 @@ export class Stenographer implements StenographerAPI {
       },
     ];
 
-    // Fill order: messages, decisions, entities — by share, then leftovers
-    const fillOrder = [sections[2], sections[1], sections[0]];
+    // Fill order: messages, decisions, precedents, entities — by share, then leftovers
+    const fillOrder = [sections[3], sections[2], sections[0], sections[1]];
     let remaining = limit;
     for (const section of fillOrder) remaining -= fillSection(section, Math.min(remaining, Math.floor(limit * section.share)));
     for (const section of fillOrder) remaining -= fillSection(section, remaining);
@@ -1689,17 +1697,33 @@ export class Stenographer implements StenographerAPI {
   async fileRuling(input: {
     kind: FiledRulingKind;
     opinion: string;
-    target: string;
+    target?: string;
+    /** A precedent's scope (R7), such as `ci.merge-on-red`. */
+    scope?: string;
+    /** A precedent: the current precedent on its scope that it supersedes. */
+    supersedes?: string;
     author: string;
     agentSessionId?: string;
   }): Promise<{ ruling: RulingEntry; conductTombstone: TbEntry | null }> {
+    // A precedent is searched like truth: its opinion is embedded
+    const embedding = input.kind === 'precedent' ? await (await this.ensureEmbedder()).embed(input.opinion) : undefined;
     return this.store.truth.fileRuling(
-      { kind: input.kind, opinion: input.opinion, target: input.target },
+      { kind: input.kind, opinion: input.opinion, target: input.target, scope: input.scope, supersedes: input.supersedes },
       {
         author: this.resolveIdentity(input.author, ['human'], 'ruling author'),
         agentSessionId: input.agentSessionId ?? null,
+        embedding,
       }
     );
+  }
+
+  /**
+   * Precedent rulings (R7): the current one on each scope, or every one with
+   * `all`; `scope` narrows to a scope and those under it. Before asking a
+   * person to decide, an agent searches these and follows one that applies.
+   */
+  async getPrecedents(opts: { scope?: string; all?: boolean } = {}): Promise<RulingEntry[]> {
+    return this.store.truth.getPrecedents(opts).map(({ embedding: _drop, ...entry }) => entry);
   }
 
   /**
@@ -1772,11 +1796,22 @@ export class Stenographer implements StenographerAPI {
     query: string,
     k: number = 5,
     filter: TruthFilter = 'current'
-  ): Promise<Array<(TbEntry | UvEntry) & { relevance: number }>> {
+  ): Promise<Array<(TbEntry | UvEntry | RulingEntry) & { relevance: number }>> {
+    // Precedents are searched with truth (R7): the current ones, or every one with `all`
+    const precedents = this.store.truth.getPrecedents({ all: filter === 'all' });
     const found = this.store.truth.getTruth(filter);
-    if (found.length === 0) return [];
-    const queryEmbedding = await (await this.ensureEmbedder()).embed(query);
-    const entries = await this.withEmbeddings(found);
+    if (found.length === 0 && precedents.length === 0) return [];
+    const embedder = await this.ensureEmbedder();
+    const queryEmbedding = await embedder.embed(query);
+    const entries: Array<(TbEntry | UvEntry | RulingEntry) & { embedding: number[] | null }> = await this.withEmbeddings(found);
+    for (const p of precedents) {
+      let embedding = p.embedding;
+      if (!embedding) {
+        embedding = await embedder.embed(p.body.opinion);
+        this.store.truth.cacheEmbedding(p.id, embedding);
+      }
+      entries.push({ ...p, embedding });
+    }
 
     return entries
       .map((entry) => {

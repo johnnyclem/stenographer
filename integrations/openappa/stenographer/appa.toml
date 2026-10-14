@@ -121,6 +121,12 @@ delta = { audience = ["self"], trust = "suspicious" }
 name = "mcp/stenographer/get_docket"
 delta = { audience = ["self"], trust = "suspicious" }
 
+# Precedent rulings: a person's policy decisions, with opinions written
+# outside this trajectory.
+[[policy.tool]]
+name = "mcp/stenographer/get_precedents"
+delta = { audience = ["self"], trust = "suspicious" }
+
 [[policy.tool]]
 name = "mcp/stenographer/get_contested"
 delta = { audience = ["self"], trust = "suspicious" }
