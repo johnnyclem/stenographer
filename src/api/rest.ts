@@ -248,6 +248,11 @@ export class RestServer {
       return;
     }
 
+    if (path === '/docket') {
+      sendJson(res, 200, await this.engine.getDocket());
+      return;
+    }
+
     const chainMatch = path.match(/^\/decisions\/([^/]+)\/chain$/);
     if (chainMatch) {
       sendJson(res, 200, await this.engine.getDecisionChain(decodeSegment(chainMatch[1])));

@@ -32,8 +32,8 @@ describe('trace (R6)', () => {
     expect(formatDerivation(tree, 'down')).toMatchInlineSnapshot(`
       [
         "UV 01M1E6JK8T990YNBMTS1KP26ZW [open · unsupported] by sam: "The per-tenant cap is 5 too."",
-        "└─ derives TB 01M1E6JK8SQAJ8K0JBRHTD10YG [active · unsupported] signed by johnnyclem: "Retries are capped at 5; the old cap of 3 is dead."",
-        "   ├─ derives TB 01M1E6JK8QHST8RZF45PNRBMXG [struck] signed by johnnyclem: "The retry budget is 100." ✗ premise-struck",
+        "└─ derives TB 01M1E6JK8SQAJ8K0JBRHTD10YG [active · unsupported] signed by johnnyclem, who answers: "Retries are capped at 5; the old cap of 3 is dead."",
+        "   ├─ derives TB 01M1E6JK8QHST8RZF45PNRBMXG [struck] signed by johnnyclem, who answers: "The retry budget is 100." ✗ premise-struck",
         "   └─ derives UV 01M1E6JK8RY2RTGX9TRXJABTWR [verified] by sam: "Each retry costs 20."",
       ]
     `);
@@ -50,10 +50,10 @@ describe('trace (R6)', () => {
     const root = '01M1E6JK8QHST8RZF45PNRBMXG';
     expect(formatDerivation(buildDerivation(ledger, root, 'up')!, 'up')).toMatchInlineSnapshot(`
       [
-        "TB 01M1E6JK8QHST8RZF45PNRBMXG [struck] signed by johnnyclem: "The retry budget is 100."",
-        "├─ derives TB 01M1E6JK8SQAJ8K0JBRHTD10YG [active · unsupported] signed by johnnyclem: "Retries are capped at 5; the old cap of 3 is dead."",
+        "TB 01M1E6JK8QHST8RZF45PNRBMXG [struck] signed by johnnyclem, who answers: "The retry budget is 100."",
+        "├─ derives TB 01M1E6JK8SQAJ8K0JBRHTD10YG [active · unsupported] signed by johnnyclem, who answers: "Retries are capped at 5; the old cap of 3 is dead."",
         "│  └─ derives UV 01M1E6JK8T990YNBMTS1KP26ZW [open · unsupported] by sam: "The per-tenant cap is 5 too."",
-        "└─ wiki TB 01M1E6JK8VNTSQ9WD7KZ8AG3GA [active · unsupported] signed by kim: "The retry budget flag is gone."",
+        "└─ wiki TB 01M1E6JK8VNTSQ9WD7KZ8AG3GA [active · unsupported] signed by kim, who answers: "The retry budget flag is gone."",
       ]
     `);
   });
@@ -70,7 +70,7 @@ describe('trace (R6)', () => {
       '└─ derives 01M1E6JK8RY2RTGX9TRXJABTWR (not held here) ✗ premise-missing',
     ]);
     const root = ledger.assertTombstone({ claim: 'A root.', evidence: [{ kind: 'commit', ref: 'abc1234' }], signedBy: 'kim' }, { author: 'kim' });
-    expect(formatDerivation(buildDerivation(ledger, root.id)!)).toEqual([`TB ${root.id} [active] signed by kim: "A root."`, '(a root: it rests on no entry)']);
+    expect(formatDerivation(buildDerivation(ledger, root.id)!)).toEqual([`TB ${root.id} [active] signed by kim, who answers: "A root."`, '(a root: it rests on no entry)']);
     ledger.assertUv({ assertion: 'Not so.', basis: 'a hunch', verifyBy: { kind: 'ask', value: 'ops' }, contests: root.id }, { author: 'sam' });
     expect(formatDerivation(buildDerivation(ledger, root.id)!)[0]).toContain('[under appeal]');
     expect(buildDerivation(ledger, root.id)!.status).toBe('contested');

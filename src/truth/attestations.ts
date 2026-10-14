@@ -1,38 +1,41 @@
 /**
- * Stenographer — Agent attestations and the quorum that settles them
+ * Stenographer — Agent attestations
  *
- * Agents settle claims only together (spec/truth-format, "Agent quorum"):
- * two or more agent sessions agreeing from different angles at the same
- * time. On its own an agent can only attest.
+ * Agents settle nothing (PRD R5, decision D2): an agent's claim is a UV
+ * until a person approves it. On its own an agent can only attest.
  *
  * - resolve_uv in the agent profile records an attestation: this session's
  *   verdict on an open UV, with its evidence. Attestations are operational
  *   state, like objections: a table in the state database, shared by every
  *   stenographer process on that file, never a ledger entry, never
- *   exported. When attestations from distinct sessions agree within 15
- *   minutes from different angles, the one that completes the quorum writes
- *   a single ADDENDUM carrying every member (TruthLedger.resolveUvByQuorum).
- *   A verdict the other way within the window is a dispute: no quorum forms,
- *   and a person hears of it. A quorum that verifies a contest would
- *   override the TB, which no agent does: it is raised to a person instead.
+ *   exported. A verified verdict is also an approval (approvals.ts): a
+ *   person's approval plus one more promotes the UV, and three agent
+ *   sessions agreeing from different angles nominate it for review. A
+ *   refuted verdict waits on the docket, where a person rules. When
+ *   attestations from distinct sessions agree within 15 minutes from
+ *   different angles, the ledger writes nothing: the agreement is reported
+ *   (`agreed`), and the docket shows it. A verdict the other way within the
+ *   window is a dispute, and a person hears of it.
  * - propose_tombstone files a draft for a person, as ever. Drafts from
- *   distinct sessions naming the same set of literals, within 15 minutes and
- *   from different angles, mint a TB together
- *   (TruthLedger.mintTombstoneByQuorum), unless an active or contested TB
- *   already holds every literal.
+ *   distinct sessions naming the same set of literals, from different
+ *   angles, mint nothing: three of them nominate the draft, which the docket
+ *   lists first (draftAgreement).
  *
- * Every decision here runs in one write transaction, so two processes
- * attesting at once can't both complete the same quorum. Time is the
- * caller's clock (`now`, epoch ms, or a clock to read), so the window is
+ * The 1.0 quorum that settled a UV or minted a TB (resolveUvByQuorum,
+ * mintTombstoneByQuorum) is still in the library for ledgers that hold such
+ * lines, and no live path writes one.
+ *
+ * Every decision here runs in one write transaction. Time is the caller's
+ * clock (`now`, epoch ms, or a clock to read), so the window is
  * deterministic in tests. A clock is read once the write lock is held: a
  * process that waited for the lock behind another's opposite verdict reads
  * a time after it, and sees it.
  */
 
 import type Database from 'better-sqlite3';
-import { chooseQuorum, literalSetKey, QUORUM_WINDOW_MS, type QuorumMember, type QuorumProgress } from './quorum.js';
+import { chooseNomination, chooseQuorum, literalSetKey, NOMINATION_MIN_MEMBERS, QUORUM_WINDOW_MS, type QuorumProgress } from './quorum.js';
 import type { TruthLedger } from './ledger.js';
-import { ulid, type AddendumEntry, type Evidence, type ProposalEntry, type TbEntry, type TombstonedLiteral, type UvEntry } from './types.js';
+import { ulid, type Evidence, type ProposalEntry, type TombstonedLiteral, type UvEntry } from './types.js';
 
 /** Epoch ms, or a clock that attest and settleTombstoneQuorum read once they hold the write lock. */
 export type QuorumClock = number | (() => number);
@@ -50,26 +53,20 @@ export interface Attestation {
   note: string | null;
   createdAt: string;
   /**
-   * The addendum that settled it, 'raised' when its quorum went to a person,
-   * or null while it may still join a quorum. A raised verdict still stands
-   * as dissent within the window: a person has it, and it is no one's to undo.
+   * The addendum that settled it under the 1.0 quorum rule, 'raised' when
+   * its quorum went to a person, or null: since 1.1 nothing consumes a
+   * verdict, and every one stands on the docket until a person rules.
    */
   consumedBy: string | null;
 }
 
 export type AttestOutcome =
-  /** Recorded; no quorum yet. */
+  /** Recorded; no other session agrees yet. */
   | { status: 'attested'; attestation: Attestation; uv: UvEntry; quorum: QuorumProgress }
-  /** An opposite verdict stands within the window (from any session, this one included): no quorum forms. `raise` is set for the first attestation of a dispute. */
+  /** An opposite verdict stands within the window (from any session, this one included). `raise` is set for the first attestation of a dispute. */
   | { status: 'disputed'; attestation: Attestation; uv: UvEntry; dissent: Attestation[]; raise: boolean }
-  /**
-   * A quorum formed that agents may not act on, so it is raised to a person and nothing is written to the
-   * ledger: it verified a contest (overriding the TB needs a person), or the ledger's agent quorum is off.
-   */
-  | { status: 'raised'; reason: 'contest-verified'; attestation: Attestation; uv: UvEntry; members: Attestation[]; tbId: string }
-  | { status: 'raised'; reason: 'quorum-off'; attestation: Attestation; uv: UvEntry; members: Attestation[] }
-  /** The quorum settled the UV with one ADDENDUM. */
-  | { status: 'settled'; attestation: Attestation; uv: UvEntry; addendum: AddendumEntry; members: Attestation[] };
+  /** Two or more sessions agree from different angles. Nothing settles: the docket shows the agreement, and a person rules. */
+  | { status: 'agreed'; attestation: Attestation; uv: UvEntry; members: Attestation[] };
 
 /** The attestation table, beside the ledger in the state database. Idempotent. */
 export function ensureAttestationSchema(db: Database.Database): void {
@@ -134,8 +131,9 @@ export class UvAttestations {
   }
 
   /**
-   * Records an agent session's verdict on an open UV and settles the UV when
-   * it completes a quorum. The checks a resolution meets come first (the UV
+   * Records an agent session's verdict on an open UV. Nothing settles: the
+   * UV stays open for a person, and the outcome says whether other sessions
+   * agree or dispute it. The checks a resolution meets come first (the UV
    * is open, there is evidence, the agent is independent of the UV and,
    * refuting a contest, of its TB): an attestation that fails them is not
    * recorded.
@@ -198,73 +196,40 @@ export class UvAttestations {
         return { status: 'disputed', attestation, uv, dissent, raise };
       }
 
+      void contestedTb; // a person rules on a contest either way: agents settle nothing
       const chosen = chooseQuorum(attestation, others, now);
       if (!chosen.members) return { status: 'attested', attestation, uv, quorum: chosen.progress };
-
-      const members = chosen.members;
-      if (contestedTb && input.resolution === 'verified') {
-        this.consume(members, 'raised');
-        return { status: 'raised', reason: 'contest-verified', attestation: { ...attestation, consumedBy: 'raised' }, uv, members, tbId: contestedTb.id };
-      }
-      if (this.ledger.agentQuorum() === 'off') {
-        this.consume(members, 'raised');
-        return { status: 'raised', reason: 'quorum-off', attestation: { ...attestation, consumedBy: 'raised' }, uv, members };
-      }
-      const quorum: QuorumMember[] = members.map((m) => ({
-        author: m.author,
-        agentSessionId: m.agentSessionId,
-        ts: m.createdAt,
-        evidence: m.evidence,
-        verdict: m.resolution,
-      }));
-      const settled = this.ledger.resolveUvByQuorum(uv.id, input.resolution, quorum, {
-        author: input.author,
-        agentSessionId: input.agentSessionId,
-        opinion: input.note ?? undefined,
-        timestamp: attestation.createdAt,
-      });
-      this.consume(members, settled.addendum.id);
-      return {
-        status: 'settled',
-        attestation: { ...attestation, consumedBy: settled.addendum.id },
-        uv: settled.uv,
-        addendum: settled.addendum,
-        members,
-      };
+      // Agreement is reported, never written: the UV stays open, and the docket shows who agrees
+      return { status: 'agreed', attestation, uv, members: chosen.members };
     });
-  }
-
-  private consume(members: Attestation[], by: string): void {
-    const mark = this.db.prepare('UPDATE uv_attestations SET consumed_by = ? WHERE id = ? AND consumed_by IS NULL');
-    for (const m of members) mark.run(by, m.id);
   }
 }
 
 /**
- * Where a draft's tombstone quorum stands; `heldBy` names an active or
- * contested TB that already holds every literal. `quorumOff` is set when the
- * ledger's agent quorum is off: nothing an agent drafts mints, however many
- * agree, and the drafts wait for a person.
+ * Where a draft stands among the other agents' drafts of the same literals;
+ * `heldBy` names an active or contested TB that already holds every
+ * literal; `nominated` is set when three or more agent sessions drafted the
+ * same set from different angles, which puts the drafts first on the
+ * docket. Nothing mints: a person signs one of the drafts.
  */
-export type TombstoneQuorumProgress = QuorumProgress & { heldBy?: string; quorumOff?: true };
+export type TombstoneQuorumProgress = QuorumProgress & { heldBy?: string; nominated?: true };
 
 /**
- * After an agent files `draft`: mints a TB when open agent drafts from
- * other sessions name the same set of literals, within 15 minutes of each
- * other and of `now`, from different angles — unless an active or contested
- * TB already holds every literal. Otherwise says where the quorum stands.
- * Only agents' drafts settle together (the ledger's classifier says who is
- * one). Runs in one write transaction, which reads `now` once it holds the
- * write lock.
+ * After an agent files `draft`: where it stands among open agent drafts
+ * from other sessions naming the same set of literals, from different
+ * angles (`agreeing` counts those within 15 minutes, as a quorum did), and
+ * whether three or more sessions, any time apart, nominate it. Nothing
+ * mints (PRD R5: no number of agent sessions mints a TB). Only agents'
+ * drafts count (the ledger's classifier says who is one). Runs in one
+ * transaction, which reads `now` once it holds the lock.
  */
-export function settleTombstoneQuorum(
+export function draftAgreement(
   ledger: TruthLedger,
   draft: ProposalEntry,
   ctx: { author: string; agentSessionId: string; now: QuorumClock }
-): { tombstone: TbEntry } | { progress: TombstoneQuorumProgress } {
+): { progress: TombstoneQuorumProgress } {
   return ledger.atomically(() => {
     const now = readClock(ctx.now);
-    const off = ledger.agentQuorum() === 'off';
     const literalsOf = (p: ProposalEntry) => (p.body.draft.literals ?? []) as TombstonedLiteral[];
     const candidate = (p: ProposalEntry) => ({
       id: p.id,
@@ -275,9 +240,9 @@ export function settleTombstoneQuorum(
     });
     const literals = literalsOf(draft);
     if (literals.length === 0) {
-      // A quorum TB carries the literals its members agree on
+      // Drafts agree on literals: one without any agrees with nothing
       const { progress } = chooseQuorum(candidate(draft), [], now);
-      return { progress: { ...progress, missing: ['literals', ...progress.missing], ...(off ? { quorumOff: true as const } : {}) } };
+      return { progress: { ...progress, missing: ['literals', ...progress.missing] } };
     }
 
     const set = literalSetKey(literals);
@@ -293,7 +258,7 @@ export function settleTombstoneQuorum(
           literalSetKey(literalsOf(p)) === set
       )
       .map(candidate);
-    const { members, progress } = chooseQuorum(candidate(draft), agreeing, now);
+    const { progress } = chooseQuorum(candidate(draft), agreeing, now);
 
     // Already truth: an active or contested TB holds every literal of the set
     const wanted = JSON.parse(set) as string[];
@@ -302,14 +267,28 @@ export function settleTombstoneQuorum(
       return wanted.every((l) => held.has(l));
     })?.id;
     if (heldBy) return { progress: { ...progress, heldBy } };
-    // On a ledger whose quorum is off, agreeing drafts mint nothing: a person signs one of them
-    if (off) return { progress: { ...progress, quorumOff: true } };
-    if (!members) return { progress };
-
-    const tombstone = ledger.mintTombstoneByQuorum(
-      members.map((m) => m.id),
-      { author: ctx.author, agentSessionId: ctx.agentSessionId, timestamp: new Date(now).toISOString() }
-    );
-    return { tombstone };
+    // Three sessions from different angles nominate the drafts: first on the docket, still a person's to sign
+    const nominated = chooseNomination([candidate(draft), ...agreeing], NOMINATION_MIN_MEMBERS) !== null;
+    return { progress: { ...progress, ...(nominated ? { nominated: true as const } : {}) } };
   });
+}
+
+/** @deprecated Since 1.1 agent drafts mint nothing: use draftAgreement, which says where the drafts stand. */
+export const settleTombstoneQuorum = draftAgreement;
+
+/**
+ * Whether open agent drafts of the same literal set as `draft`, from three
+ * or more sessions and different angles, nominate it (the docket reads
+ * this; nothing is written).
+ */
+export function draftNominated(ledger: TruthLedger, draft: ProposalEntry): boolean {
+  const literalsOf = (p: ProposalEntry) => (p.body.draft.literals ?? []) as TombstonedLiteral[];
+  const literals = literalsOf(draft);
+  if (literals.length === 0 || !ledger.isAgent(draft.author)) return false;
+  const set = literalSetKey(literals);
+  const candidates = ledger
+    .listProposals('open', 'tombstone')
+    .filter((p) => p.body.requiresNotary === true && p.body.signal?.source === 'agent-draft' && ledger.isAgent(p.author) && literalsOf(p).length > 0 && literalSetKey(literalsOf(p)) === set)
+    .map((p) => ({ id: p.id, author: p.author, agentSessionId: p.agentSessionId ?? null, createdAt: p.createdAt, evidence: (p.body.draft.evidence ?? []) as Evidence[] }));
+  return chooseNomination(candidates, NOMINATION_MIN_MEMBERS) !== null;
 }

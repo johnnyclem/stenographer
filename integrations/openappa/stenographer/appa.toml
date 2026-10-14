@@ -17,13 +17,13 @@
 #
 # Writes into the ledger need trusted data: suspicious text cannot become
 # truth, contest a TB or settle a UV unless an authority approves the
-# call. Agents settle claims only together: an agent's draft
-# (`propose_tombstone`) or verdict (`resolve_uv`) settles nothing alone,
-# but the one that completes a quorum — two or more agent sessions
-# agreeing from different angles within 15 minutes — mints the TB or
-# settles the UV without a person. So a draft is a truth write too: it
-# needs trusted data and records `stenographer.proposed` and
-# `stenographer.changed`. Every act a person performs under their own
+# call. Agents settle nothing: an agent's draft (`propose_tombstone`),
+# verdict (`resolve_uv`) or approval (`approve`) is a UV-class claim until
+# a person approves it, but three agent sessions agreeing from different
+# angles nominate it (an ADDENDUM in the ledger), and an approval counts
+# toward a person's promotion. So a draft and an approval are truth
+# writes too: they need trusted data, and a draft records
+# `stenographer.proposed` and `stenographer.changed`. Every act a person performs under their own
 # name in the operator profile — notarizing, dismissing, overriding,
 # ruling, and minting a TB with `signedBy` — also needs the `hitl` mark:
 # the server takes that name from the caller there, so the person
@@ -115,6 +115,12 @@ delta = { audience = ["self"], trust = "suspicious" }
 name = "mcp/stenographer/get_derivation"
 delta = { audience = ["self"], trust = "suspicious" }
 
+# The review docket: agents' UVs and drafts, the detector's reviews, and
+# the record's passages, all written outside this trajectory.
+[[policy.tool]]
+name = "mcp/stenographer/get_docket"
+delta = { audience = ["self"], trust = "suspicious" }
+
 [[policy.tool]]
 name = "mcp/stenographer/get_contested"
 delta = { audience = ["self"], trust = "suspicious" }
@@ -160,14 +166,30 @@ delta = { audience = ["self"] }
 requires = { trust = "trusted", attention = ["hitl"] }
 effects = ["stenographer.changed", "stenographer.ruled"]
 
-# Agent profile: files the agent's verdict as an attestation; the one
-# that completes a quorum of agent sessions settles the UV with one
-# addendum. Operator profile, without signedBy: a person resolves it.
-# Returns the UV, which its own author wrote, and the addendum, whose
-# evidence other agent sessions may have brought (see the README's
-# limits).
+# Agent profile: files the agent's verdict as an attestation; a verified
+# one is the session's approval, which three sessions turn into a
+# nomination. Operator profile, without signedBy: a person resolves it.
+# Returns the UV, which its own author wrote, and what other sessions
+# approved or attested (see the README's limits).
 [[policy.tool]]
 name = "mcp/stenographer/resolve_uv"
+delta = { audience = ["self"] }
+requires = { trust = "trusted" }
+effects = ["stenographer.changed"]
+
+# Agent profile: this session's approval of a UV, which counts toward a
+# person's promotion and, with two other sessions', nominates it. Operator
+# profile: a person's approval, which promotes with one more; the person
+# is named by the caller, so it is reviewed under hitl like every act in
+# a person's name. Returns the UV and the other approvals.
+[[policy.tool]]
+name = "mcp/stenographer/approve(by:*)"
+delta = { audience = ["self"] }
+requires = { trust = "trusted", attention = ["hitl"] }
+effects = ["stenographer.changed", "stenographer.ruled"]
+
+[[policy.tool]]
+name = "mcp/stenographer/approve"
 delta = { audience = ["self"] }
 requires = { trust = "trusted" }
 effects = ["stenographer.changed"]

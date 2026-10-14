@@ -32,7 +32,7 @@ import {
   DETECTOR_PREFIX,
 } from './types.js';
 
-export type SignerRole = 'human' | 'agent' | 'detector';
+export type SignerRole = 'human' | 'agent' | 'detector' | 'reporter';
 
 /** An identity failed validation: anonymous, reserved, unregistered, or the wrong role. */
 export class IdentityError extends TruthWriteError {}
@@ -59,7 +59,7 @@ export const SignerRegistryFileSchema = z
         .object({
           /** The canonical handle. A trailing `*` (e.g. `agent:*`) matches any identity with that prefix. */
           id: z.string().min(1),
-          role: z.enum(['human', 'agent', 'detector']),
+          role: z.enum(['human', 'agent', 'detector', 'reporter']),
           /** Other spellings that resolve to `id` (e.g. a short handle). */
           aliases: z.array(z.string().min(1)).optional(),
           /** Public keys for 1.x key signing: accepted and ignored in 1.0. */

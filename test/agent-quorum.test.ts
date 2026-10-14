@@ -22,7 +22,10 @@ import { StenographerServer, runCLI } from '../src/mcp/server.js';
 import { SignerRegistry } from '../src/truth/identity.js';
 import { StateStore } from '../src/store/index.js';
 import { Stenographer } from '../src/core/stenographer.js';
-import { settleTombstoneQuorum } from '../src/truth/attestations.js';
+import { draftAgreement, UvAttestations } from '../src/truth/attestations.js';
+import { UvApprovals } from '../src/truth/approvals.js';
+import { buildDocket } from '../src/truth/docket.js';
+import { markerFor } from '../src/truth/format.js';
 import { decodeWikiLine, exportWikiEntries, importWikiEntries, wikiLineHash } from '../src/truth/wiki.js';
 import { QUORUM_MIN_MEMBERS, QUORUM_WINDOW_MS, checkQuorum, type QuorumMember } from '../src/truth/quorum.js';
 import { CONSUMPTION_RULES, type AddendumEntry, type ProposalEntry, type TbEntry, type UvEntry } from '../src/truth/types.js';
@@ -193,11 +196,28 @@ describe('checkQuorum: the rules a line with a quorum must keep', () => {
     expect(checkQuorum(addendum(linked('verifies', 'overrides'))).join()).toMatch(/never overrides.*rule 5/);
     // A line that lists no resolution link (no x-steno.links, an empty list, or only types the reader doesn't
     // know) is checked for agreeing verdicts only
-    for (const xSteno of [undefined, {}, { links: [] }, linked('corroborates')['x-steno']]) {
+    for (const xSteno of [undefined, {}, { links: [] }, linked('echoes')['x-steno']]) {
       const subject = { ...addendum(), 'x-steno': xSteno };
       expect(checkQuorum(subject), JSON.stringify(xSteno)).toEqual([]);
       expect(checkQuorum({ ...subject, quorum: [member(), second({ verdict: 'refuted' })] }).join(), JSON.stringify(xSteno)).toMatch(/disagree.*rule 5/);
     }
+  });
+
+  it('a nomination (an ADDENDUM with a corroborates link) takes three members, any time apart, each verified, and no resolution link', () => {
+    const third = { ...second(), agentSessionId: 'sess-c', ts: at(3 * 24 * 60 * MIN), evidence: [{ kind: 'test', ref: 'test/budget.test.ts' }] };
+    const nomination = (over: Record<string, unknown> = {}) => ({
+      ...addendum({ quorum: [member(), second(), third], evidence: [...member().evidence, ...second().evidence, ...third.evidence] }),
+      'x-steno': { links: [{ fromId: 'ADD1', toId: 'UV1', type: 'corroborates' }] },
+      ...over,
+    });
+    expect(checkQuorum(nomination())).toEqual([]);
+    expect(checkQuorum(nomination({ quorum: [member(), second()], evidence: [...member().evidence, ...second().evidence] })).join()).toMatch(/nomination needs at least 3 members.*rule 1/);
+    expect(checkQuorum(nomination({ quorum: [member(), second(), { ...third, verdict: 'refuted' }] })).join()).toMatch(/nomination member 3's verdict is refuted.*rule 5/);
+    expect(
+      checkQuorum(nomination({ 'x-steno': { links: [{ fromId: 'ADD1', toId: 'UV1', type: 'corroborates' }, { fromId: 'ADD1', toId: 'UV1', type: 'verifies' }] } })).join()
+    ).toMatch(/nomination settles nothing.*rule 5/);
+    // The window (rule 4) binds a settlement, not a nomination: the third member is days later
+    expect(checkQuorum({ ...nomination(), 'x-steno': { links: [{ fromId: 'ADD1', toId: 'UV1', type: 'verifies' }] } }).join()).toMatch(/rule 4/);
   });
 
   it("rule 5 reads an ADDENDUM's links from x-steno.links: those it writes", () => {
@@ -398,7 +418,7 @@ describe('the ledger: an agent settles only with a quorum, and never overrides, 
     expect((l.getEntry(tb.id) as TbEntry).body.status).toBe('contested');
     // ...while refuting the contest by quorum is settling a UV, which agents may do
     const refuting = { ...verifying, body: { ...verifying.body, quorum: quorum('refuted') } };
-    expect(l.importChange(refuting, [{ fromId: id, toId: contest.id, type: 'refutes' }])).toEqual({ outcome: 'inserted' });
+    expect(l.importChange(refuting, [{ fromId: id, toId: contest.id, type: 'refutes' }])).toEqual({ outcome: 'inserted', suspects: [] });
     expect((l.getEntry(tb.id) as TbEntry).body.status).toBe('active');
   });
 
@@ -513,48 +533,73 @@ const resolve = (uvId: string, resolution: 'verified' | 'refuted', evidence: unk
   ...(opinion ? { opinion } : {}),
 });
 
-describe('resolve_uv: an agent attests; two sessions agreeing from different angles within 15 minutes settle', () => {
-  it('two sessions with disjoint evidence of two kinds, within the window, settle the UV', async () => {
-    const { s, clock, ledger, uv } = await sessions(['sess-a', 'sess-b']);
+describe('resolve_uv: an agent attests; agents settle nothing, a person approves and three sessions nominate', () => {
+  it('a verified verdict is the session\'s approval: two sessions promote nothing, three nominate, a person promotes', async () => {
+    const { s, clock, ledger, engine, uv, addenda } = await sessions(['sess-a', 'sess-b', 'sess-c']);
     const target = await uv();
 
     const first = await s['sess-a'].call('resolve_uv', resolve(target.id, 'verified', [COMMIT]));
-    expect(first.status).toBe('attested');
-    expect(first.quorum).toEqual({ agreeing: 1, needed: 2, windowEndsAt: at(15 * MIN), missing: ['another session'] });
+    expect(first.status).toBe('approved');
+    expect(first.approvals).toMatchObject({ approvers: 1, human: false, agentSessions: 1, nominated: false, missing: ['a human approval', 'a second approver'] });
+    expect(first.detail).toMatch(/promotes nothing on its own/);
     expect((ledger.getEntry(target.id) as UvEntry).body.status).toBe('open');
 
     clock.now = T0 + 5 * MIN;
     const second = await s['sess-b'].call('resolve_uv', resolve(target.id, 'verified', [FILE], 'config.ts:3 says 100'));
-    expect(second.status).toBe('settled');
-    expect(second.uv.body.status).toBe('verified');
-    const addendum = second.addendum as AddendumEntry;
-    expect(addendum).toMatchObject({ author: AGENT, agentSessionId: 'sess-b', createdAt: at(5 * MIN) });
-    expect(addendum.body).toEqual({
-      evidence: [{ kind: 'commit', ref: 'a1b2c3', detail: COMMIT.detail }, FILE],
-      note: 'config.ts:3 says 100',
-      quorum: [
-        { author: AGENT, agentSessionId: 'sess-a', ts: at(0), evidence: [{ kind: 'commit', ref: 'a1b2c3', detail: COMMIT.detail }], verdict: 'verified' },
-        { author: AGENT, agentSessionId: 'sess-b', ts: at(5 * MIN), evidence: [FILE], verdict: 'verified' },
-      ],
-    });
-    expect(addendum.links).toContainEqual({ fromId: addendum.id, toId: target.id, type: 'verifies' });
+    expect(second.status).toBe('approved');
+    expect(second.approvals).toMatchObject({ approvers: 2, human: false, missing: ['a human approval'] });
+    expect((ledger.getEntry(target.id) as UvEntry).body.status).toBe('open');
+    expect(addenda()).toEqual([]);
+
+    // The third session, from a third angle, nominates: one ADDENDUM with a corroborates link, the UV still open
+    clock.now = T0 + 3 * 24 * 60 * MIN;
+    const third = await s['sess-c'].call('resolve_uv', resolve(target.id, 'verified', [TEST]));
+    expect(third.status).toBe('nominated');
+    const nomination = third.addendum as AddendumEntry;
+    expect(nomination).toMatchObject({ author: AGENT, agentSessionId: 'sess-c' });
+    expect(nomination.links).toEqual([{ fromId: nomination.id, toId: target.id, type: 'corroborates' }]);
+    expect(nomination.body.quorum!.map((m) => [m.agentSessionId, m.verdict])).toEqual([['sess-a', 'verified'], ['sess-b', 'verified'], ['sess-c', 'verified']]);
+    expect(nomination.body.evidence).toEqual([{ kind: 'commit', ref: 'a1b2c3', detail: COMMIT.detail }, FILE, TEST]);
+    const nominated = ledger.getEntry(target.id) as UvEntry;
+    expect(nominated.body.status).toBe('open');
+    expect(nominated.corroborated).toBe(true);
+    expect(markerFor('UV', 'open', 'sound', true)).toBe('[UV · CORROBORATED]');
+    expect((await engine.getDocket()).groups[0].items[0]).toMatchObject({ id: target.id, nominated: true });
     expect(ledger.verify().ok).toBe(true);
 
-    // The settlement travels: its line decodes, and a teammate's ledger applies it
+    // A person's approval promotes: the TB is signed by them, answered for by them, and carries every approval
+    const promoted = await engine.approveUv({ uvId: target.id, role: 'human', by: 'johnnyclem', note: 'the config change is in' });
+    expect(promoted.status).toBe('promoted');
+    const tb = (promoted as { tombstone: TbEntry }).tombstone;
+    expect(tb.body).toMatchObject({ claim: target.body.assertion, signedBy: 'johnnyclem', answerableBy: 'johnnyclem', status: 'active' });
+    expect(tb.body.approvals!.map((a) => [a.by, a.role])).toEqual([[AGENT, 'agent'], [AGENT, 'agent'], [AGENT, 'agent'], ['johnnyclem', 'human']]);
+    expect(tb.body.evidence).toEqual([{ kind: 'commit', ref: 'a1b2c3', detail: COMMIT.detail }, FILE, TEST]);
+    expect(tb.links).toContainEqual({ fromId: tb.id, toId: target.id, type: 'supersedes' });
+    expect((ledger.getEntry(target.id) as UvEntry).body.status).toBe('verified');
+    expect(engine.store.approvals.list(target.id).every((a) => a.consumedBy === tb.id)).toBe(true);
+
+    // It all travels: the nomination, the TB a person signed; a teammate holds the same
     const { lines } = exportWikiEntries(ledger);
     for (const line of lines) expect(() => decodeWikiLine(line)).not.toThrow();
     const teammate = new TruthLedger(new Database(':memory:'));
     expect(importWikiEntries(teammate, { lines })).toMatchObject({ committed: true, held: [], proposals: [] });
     expect((teammate.getEntry(target.id) as UvEntry).body.status).toBe('verified');
+    expect((teammate.getEntry(tb.id) as TbEntry).body).toMatchObject({ answerableBy: 'johnnyclem', approvals: tb.body.approvals });
+    expect(teammate.getEntry(nomination.id)).not.toBeNull();
   });
 
-  it('one agent alone never settles, however much evidence it brings', async () => {
+  it('one agent alone never settles, however much evidence it brings, and one session approves once', async () => {
     const { s, ledger, uv, addenda } = await sessions(['sess-a']);
     const target = await uv();
+    const res = await s['sess-a'].call('resolve_uv', resolve(target.id, 'verified', [COMMIT, FILE, TEST]));
+    expect(res.status).toBe('approved');
+    expect(res.approvals.missing).toEqual(['a human approval', 'a second approver']);
+    await expect(s['sess-a'].call('resolve_uv', resolve(target.id, 'verified', [CLAIMED]))).rejects.toThrow(/already approved.*one session is one approver/);
+    const refuted = await uv();
     for (const evidence of [[COMMIT, FILE, TEST], [CLAIMED]]) {
-      const res = await s['sess-a'].call('resolve_uv', resolve(target.id, 'verified', evidence));
-      expect(res.status).toBe('attested');
-      expect(res.quorum.missing).toEqual(['another session']);
+      const r = await s['sess-a'].call('resolve_uv', resolve(refuted.id, 'refuted', evidence));
+      expect(r.status).toBe('attested');
+      expect(r.quorum.missing).toEqual(['another session']);
     }
     expect((ledger.getEntry(target.id) as UvEntry).body.status).toBe('open');
     expect(addenda()).toEqual([]);
@@ -564,9 +609,9 @@ describe('resolve_uv: an agent attests; two sessions agreeing from different ang
     const { s, clock, ledger, uv, addenda } = await sessions(['sess-a']);
     const twin = await sessions(['sess-a']);
     const target = await uv();
-    await s['sess-a'].call('resolve_uv', resolve(target.id, 'verified', [COMMIT]));
+    await s['sess-a'].call('resolve_uv', resolve(target.id, 'refuted', [COMMIT]));
     clock.now = twin.clock.now = T0 + MIN;
-    const again = await twin.s['sess-a'].call('resolve_uv', resolve(target.id, 'verified', [FILE]));
+    const again = await twin.s['sess-a'].call('resolve_uv', resolve(target.id, 'refuted', [FILE]));
     expect(again.status).toBe('attested');
     expect(again.quorum).toMatchObject({ agreeing: 1, missing: ['another session'] });
     expect((ledger.getEntry(target.id) as UvEntry).body.status).toBe('open');
@@ -610,7 +655,7 @@ describe('resolve_uv: an agent attests; two sessions agreeing from different ang
     const call = (tool: string, a: Record<string, unknown>) =>
       (server as unknown as { callTool: (n: string, a: Record<string, unknown>) => Promise<any> }).callTool(tool, a);
     const target = await engine.assertUv({ assertion: 'LOG_BUDGET is 100 everywhere.', basis: 'the config change', verifyBy: { kind: 'inspect', value: 'config.ts' }, author: 'sam' });
-    const first = await call('resolve_uv', resolve(target.id, 'verified', [COMMIT]));
+    const first = await call('resolve_uv', resolve(target.id, 'refuted', [COMMIT]));
     expect(first.attestation.agentSessionId).toBe('conv-1');
 
     // The log the server follows names another session (a resumed transcript, a log that aggregates sessions)
@@ -618,7 +663,7 @@ describe('resolve_uv: an agent attests; two sessions agreeing from different ang
     await until(() => engine.getSessionId() === 'conv-2');
     expect(engine.getSessionId()).toBe('conv-2');
     clock.now = T0 + MIN;
-    const again = await call('resolve_uv', resolve(target.id, 'verified', [FILE]));
+    const again = await call('resolve_uv', resolve(target.id, 'refuted', [FILE]));
     expect(again.status).toBe('attested');
     expect(again.attestation.agentSessionId).toBe('conv-1');
     expect((engine.store.truth.getEntry(target.id) as UvEntry).body.status).toBe('open');
@@ -627,8 +672,8 @@ describe('resolve_uv: an agent attests; two sessions agreeing from different ang
   it('shared evidence is one angle: the items compare by kind and trimmed ref', async () => {
     const { s, ledger, uv } = await sessions(['sess-a', 'sess-b']);
     const target = await uv();
-    await s['sess-a'].call('resolve_uv', resolve(target.id, 'verified', [COMMIT]));
-    const res = await s['sess-b'].call('resolve_uv', resolve(target.id, 'verified', [{ kind: 'commit', ref: ' a1b2c3 ' }, FILE]));
+    await s['sess-a'].call('resolve_uv', resolve(target.id, 'refuted', [COMMIT]));
+    const res = await s['sess-b'].call('resolve_uv', resolve(target.id, 'refuted', [{ kind: 'commit', ref: ' a1b2c3 ' }, FILE]));
     expect(res.status).toBe('attested');
     expect(res.quorum).toMatchObject({ agreeing: 2, missing: ['other evidence'] });
     expect((ledger.getEntry(target.id) as UvEntry).body.status).toBe('open');
@@ -637,8 +682,8 @@ describe('resolve_uv: an agent attests; two sessions agreeing from different ang
   it('one settling kind is one angle', async () => {
     const { s, ledger, uv } = await sessions(['sess-a', 'sess-b']);
     const target = await uv();
-    await s['sess-a'].call('resolve_uv', resolve(target.id, 'verified', [COMMIT]));
-    const res = await s['sess-b'].call('resolve_uv', resolve(target.id, 'verified', [{ kind: 'commit', ref: 'd4e5f6' }]));
+    await s['sess-a'].call('resolve_uv', resolve(target.id, 'refuted', [COMMIT]));
+    const res = await s['sess-b'].call('resolve_uv', resolve(target.id, 'refuted', [{ kind: 'commit', ref: 'd4e5f6' }]));
     expect(res.status).toBe('attested');
     expect(res.quorum).toMatchObject({ agreeing: 2, missing: ['a second evidence kind'] });
     expect((ledger.getEntry(target.id) as UvEntry).body.status).toBe('open');
@@ -647,9 +692,9 @@ describe('resolve_uv: an agent attests; two sessions agreeing from different ang
   it('the same evidence spelled another way is one angle: a commit in upper case, a path with ./', async () => {
     const { s, clock, ledger, uv } = await sessions(['sess-a', 'sess-b']);
     const target = await uv();
-    await s['sess-a'].call('resolve_uv', resolve(target.id, 'verified', [{ kind: 'commit', ref: 'a1b2c3d' }, { kind: 'file', ref: 'src/retry.ts:10' }]));
+    await s['sess-a'].call('resolve_uv', resolve(target.id, 'refuted', [{ kind: 'commit', ref: 'a1b2c3d' }, { kind: 'file', ref: 'src/retry.ts:10' }]));
     clock.now = T0 + MIN;
-    const res = await s['sess-b'].call('resolve_uv', resolve(target.id, 'verified', [{ kind: 'commit', ref: 'A1B2C3D' }, { kind: 'file', ref: './src/retry.ts:10' }]));
+    const res = await s['sess-b'].call('resolve_uv', resolve(target.id, 'refuted', [{ kind: 'commit', ref: 'A1B2C3D' }, { kind: 'file', ref: './src/retry.ts:10' }]));
     expect(res.status).toBe('attested');
     expect(res.quorum).toMatchObject({ agreeing: 2, missing: ['other evidence'] });
     expect((ledger.getEntry(target.id) as UvEntry).body.status).toBe('open');
@@ -658,18 +703,20 @@ describe('resolve_uv: an agent attests; two sessions agreeing from different ang
   it('progress counts only the sessions that could join a quorum, and tells a verdict without settling evidence what to do', async () => {
     const { s, clock, uv } = await sessions(['sess-a', 'sess-b']);
     const target = await uv();
-    const said = await s['sess-a'].call('resolve_uv', resolve(target.id, 'verified', [{ kind: 'message', ref: 'msg_0042' }]));
+    const said = await s['sess-a'].call('resolve_uv', resolve(target.id, 'refuted', [{ kind: 'message', ref: 'msg_0042' }]));
     expect(said.status).toBe('attested');
     expect(said.quorum).toMatchObject({ agreeing: 0, missing: ['a settling evidence item', 'another session'] });
-    expect(said.detail).toMatch(/can't count toward a quorum/);
+    expect(said.detail).toMatch(/cites no settling evidence/);
     expect(said.detail).toMatch(/commit, file, test, claimed-command or wiki/);
-    expect(said.detail).not.toMatch(/settles when another agent session agrees/);
+    expect(said.detail).not.toMatch(/waits on the docket/);
     clock.now = T0 + MIN;
-    const checked = await s['sess-b'].call('resolve_uv', resolve(target.id, 'verified', [COMMIT, FILE]));
+    const checked = await s['sess-b'].call('resolve_uv', resolve(target.id, 'refuted', [COMMIT, FILE]));
     expect(checked.status).toBe('attested');
-    // sess-a's message-only verdict is no partner: one session could join a quorum, and it needs another
+    // sess-a's message-only verdict is no partner: one session could agree, and it needs another
     expect(checked.quorum).toMatchObject({ agreeing: 1, needed: 2, missing: ['another session'] });
-    expect(checked.detail).toMatch(/settles when another agent session agrees/);
+    expect(checked.detail).toMatch(/waits on the docket, where a person rules/);
+    // ...and an approval on message evidence is refused outright: an agent's approval cites a check
+    await expect(s['sess-a'].call('resolve_uv', resolve((await uv()).id, 'verified', [{ kind: 'message', ref: 'msg_0042' }]))).rejects.toThrow(/settling evidence of its own/);
   });
 
   it('question-class evidence settles nothing: what someone said or wrote down is not a check', async () => {
@@ -681,9 +728,9 @@ describe('resolve_uv: an agent attests; two sessions agreeing from different ang
       { kind: 'ticket', ref: 'LIN-123' },
       { kind: 'doc', ref: 'https://wiki.example/budget' },
     ];
-    const a = await s['sess-a'].call('resolve_uv', resolve(target.id, 'verified', said.slice(0, 2)));
+    const a = await s['sess-a'].call('resolve_uv', resolve(target.id, 'refuted', said.slice(0, 2)));
     expect(a.quorum.missing).toEqual(['a settling evidence item', 'another session']);
-    const b = await s['sess-b'].call('resolve_uv', resolve(target.id, 'verified', said.slice(2)));
+    const b = await s['sess-b'].call('resolve_uv', resolve(target.id, 'refuted', said.slice(2)));
     expect(b.status).toBe('attested');
     // Neither can join a quorum, so neither counts as agreeing
     expect(b.quorum).toMatchObject({ agreeing: 0, missing: ['a settling evidence item', 'another session'] });
@@ -691,26 +738,31 @@ describe('resolve_uv: an agent attests; two sessions agreeing from different ang
 
     // ...and doesn't count toward a quorum: the next settling attestation still needs a partner
     clock.now = T0 + MIN;
-    const c = await s['sess-c'].call('resolve_uv', resolve(target.id, 'verified', [COMMIT]));
+    const c = await s['sess-c'].call('resolve_uv', resolve(target.id, 'refuted', [COMMIT]));
     expect(c.status).toBe('attested');
     expect(c.quorum).toMatchObject({ agreeing: 1, missing: ['another session'] });
   });
 
-  it('outside the 15-minute window, no quorum forms; at its edge, one does', async () => {
-    const { s, clock, ledger, uv } = await sessions(['sess-a', 'sess-b']);
+  it('outside the 15-minute window, no agreement forms; at its edge, one does, and settles nothing', async () => {
+    const { s, clock, ledger, uv, addenda } = await sessions(['sess-a', 'sess-b']);
     const late = await uv();
-    await s['sess-a'].call('resolve_uv', resolve(late.id, 'verified', [COMMIT]));
+    await s['sess-a'].call('resolve_uv', resolve(late.id, 'refuted', [COMMIT]));
     clock.now = T0 + QUORUM_WINDOW_MS + 1;
-    const res = await s['sess-b'].call('resolve_uv', resolve(late.id, 'verified', [FILE]));
+    const res = await s['sess-b'].call('resolve_uv', resolve(late.id, 'refuted', [FILE]));
     expect(res.status).toBe('attested');
     expect(res.quorum).toMatchObject({ agreeing: 1, missing: ['another session'] });
     expect((ledger.getEntry(late.id) as UvEntry).body.status).toBe('open');
 
     const edge = await uv();
     clock.now = T0;
-    await s['sess-a'].call('resolve_uv', resolve(edge.id, 'verified', [COMMIT]));
+    await s['sess-a'].call('resolve_uv', resolve(edge.id, 'refuted', [COMMIT]));
     clock.now = T0 + QUORUM_WINDOW_MS;
-    expect((await s['sess-b'].call('resolve_uv', resolve(edge.id, 'verified', [FILE]))).status).toBe('settled');
+    const agreed = await s['sess-b'].call('resolve_uv', resolve(edge.id, 'refuted', [FILE]));
+    expect(agreed.status).toBe('agreed');
+    expect(agreed.members.map((m: { agentSessionId: string }) => m.agentSessionId)).toEqual(['sess-a', 'sess-b']);
+    expect(agreed.detail).toMatch(/Nothing settles on agents' word/);
+    expect((ledger.getEntry(edge.id) as UvEntry).body.status).toBe('open');
+    expect(addenda()).toEqual([]);
   });
 
   it('dissent: no quorum forms while the other verdict stands, and a person hears of it once', async () => {
@@ -737,21 +789,23 @@ describe('resolve_uv: an agent attests; two sessions agreeing from different ang
     expect(events).toHaveLength(1);
     expect((ledger.getEntry(target.id) as UvEntry).body.status).toBe('open');
 
-    // Once it has left the window, agreeing sessions within it settle
+    // Once it has left the window, agreeing sessions within it agree: nothing settles, the docket shows it
     clock.now = T0 + 17 * MIN;
     const d = await s['sess-d'].call('resolve_uv', resolve(target.id, 'refuted', [CLAIMED]));
-    expect(d.status).toBe('settled');
-    expect(d.uv.body.status).toBe('refuted');
-    expect((d.addendum as AddendumEntry).body.quorum!.map((m) => m.agentSessionId)).toEqual(['sess-c', 'sess-d']);
+    expect(d.status).toBe('agreed');
+    expect(d.members.map((m: { agentSessionId: string }) => m.agentSessionId)).toEqual(['sess-c', 'sess-d']);
+    expect((ledger.getEntry(target.id) as UvEntry).body.status).toBe('open');
+    const item = (await s['sess-a'].engine.getDocket()).groups.flatMap((g) => g.items).find((i) => i.id === target.id)!;
+    expect(item.attestations!.map((t) => [t.agentSessionId, t.resolution])).toEqual([['sess-a', 'verified'], ['sess-b', 'refuted'], ['sess-c', 'refuted'], ['sess-d', 'refuted']]);
   });
 
-  it('a contest verified by a quorum stays a standing verdict: refutations within the window are a dispute, not a settlement', async () => {
+  it('a contest two sessions approved stays a standing verdict: refutations within the window are a dispute, not a settlement', async () => {
     const { s, clock, ledger, uv, personTb, addenda } = await sessions(['sess-a', 'sess-b', 'sess-c', 'sess-d']);
     const tb = await personTb();
     const contest = await uv(tb.id);
     await s['sess-a'].call('resolve_uv', resolve(contest.id, 'verified', [COMMIT]));
     clock.now = T0 + MIN;
-    expect((await s['sess-b'].call('resolve_uv', resolve(contest.id, 'verified', [FILE]))).status).toBe('raised');
+    expect((await s['sess-b'].call('resolve_uv', resolve(contest.id, 'verified', [FILE]))).status).toBe('approved');
     // Two sessions now refute, from two other angles, while a person is asked to override
     clock.now = T0 + 2 * MIN;
     const c = await s['sess-c'].call('resolve_uv', resolve(contest.id, 'refuted', [TEST]));
@@ -777,41 +831,50 @@ describe('resolve_uv: an agent attests; two sessions agreeing from different ang
     expect(back.detail).not.toMatch(/agent sessions disagree/);
   });
 
-  it('a verified contest is raised to a person: agents never override a TB', async () => {
+  it('a verified contest nominates at three and waits for a person: agents never override a TB, a person\'s approval does', async () => {
     const { url, events } = await startChannel();
-    const { s, clock, ledger, uv, personTb, addenda } = await sessions(['sess-a', 'sess-b', 'sess-c'], {
+    const { s, clock, ledger, engine, uv, personTb, addenda } = await sessions(['sess-a', 'sess-b', 'sess-c'], {
       objectionSinks: [{ kind: 'channel', url }],
     });
     const tb = await personTb();
     const contest = await uv(tb.id);
     await s['sess-a'].call('resolve_uv', resolve(contest.id, 'verified', [COMMIT]));
     clock.now = T0 + MIN;
-    const raised = await s['sess-b'].call('resolve_uv', resolve(contest.id, 'verified', [FILE]));
-    expect(raised.status).toBe('raised');
-    expect(raised.detail).toMatch(new RegExp(`2 agent sessions verified this contest from different angles; overriding TB ${tb.id} needs a person`));
-    expect(raised.raisedTo).toEqual([url]);
-    expect(events).toHaveLength(1);
-    expect(events[0].meta).toMatchObject({ kind: 'uv_contest_verified', uv_id: contest.id, tb_id: tb.id });
-
+    const second = await s['sess-b'].call('resolve_uv', resolve(contest.id, 'verified', [FILE]));
+    expect(second.status).toBe('approved');
+    // Nothing pages a person per item: the docket is a meeting they hold
+    expect(events).toHaveLength(0);
     expect(addenda()).toEqual([]);
     expect((ledger.getEntry(tb.id) as TbEntry).body.status).toBe('contested');
     expect((ledger.getEntry(contest.id) as UvEntry).body.status).toBe('open');
 
-    // The raised attestations are spent: a third session starts over
     clock.now = T0 + 2 * MIN;
     const third = await s['sess-c'].call('resolve_uv', resolve(contest.id, 'verified', [TEST]));
-    expect(third.status).toBe('attested');
-    expect(third.quorum).toMatchObject({ agreeing: 1, missing: ['another session'] });
+    expect(third.status).toBe('nominated');
+    expect((ledger.getEntry(tb.id) as TbEntry).body.status).toBe('contested');
+    expect((ledger.getEntry(contest.id) as UvEntry).body.status).toBe('open');
+
+    // A person's approval of the appeal overrides the TB and mints its successor, answered for by the person
+    const promoted = await engine.approveUv({ uvId: contest.id, role: 'human', by: 'johnnyclem' });
+    expect(promoted.status).toBe('promoted');
+    expect((ledger.getEntry(tb.id) as TbEntry).body.status).toBe('overridden');
+    expect((ledger.getEntry(contest.id) as UvEntry).body.status).toBe('verified');
+    const successor = (promoted as { tombstone: TbEntry }).tombstone;
+    expect(successor.body).toMatchObject({ signedBy: 'johnnyclem', answerableBy: 'johnnyclem' });
+    expect(successor.links.filter((l) => l.type === 'supersedes').map((l) => l.toId).sort()).toEqual([tb.id, contest.id].sort());
   });
 
-  it('a refuted contest settles by quorum, and the TB is active again', async () => {
-    const { s, clock, ledger, uv, personTb } = await sessions(['sess-a', 'sess-b']);
+  it('a refuted contest settles nothing by agents: the TB stays under appeal until a person refutes it', async () => {
+    const { s, clock, ledger, engine, uv, personTb } = await sessions(['sess-a', 'sess-b']);
     const tb = await personTb();
     const contest = await uv(tb.id);
     await s['sess-a'].call('resolve_uv', resolve(contest.id, 'refuted', [COMMIT]));
     clock.now = T0 + MIN;
     const res = await s['sess-b'].call('resolve_uv', resolve(contest.id, 'refuted', [TEST]));
-    expect(res.status).toBe('settled');
+    expect(res.status).toBe('agreed');
+    expect((ledger.getEntry(tb.id) as TbEntry).body.status).toBe('contested');
+    // ...someone other than the TB's own signer, who can't be the one to restore it (contempt of corpus)
+    await engine.resolveUv(contest.id, 'refuted', [COMMIT, TEST], { author: 'kim' });
     expect((ledger.getEntry(tb.id) as TbEntry).body.status).toBe('active');
   });
 
@@ -831,7 +894,7 @@ describe('resolve_uv: an agent attests; two sessions agreeing from different ang
 // MCP: propose_tombstone settles by quorum
 // ─────────────────────────────────────────────────────────────
 
-describe('propose_tombstone: agent drafts that agree from different angles within 15 minutes mint a TB', () => {
+describe('propose_tombstone: agent drafts mint nothing; three sessions drafting the same literals nominate', () => {
   const draft = (over: Record<string, unknown> = {}) => ({
     claim: 'LOG_BUDGET 30 is dead; the budget is 100',
     evidence: [COMMIT],
@@ -839,8 +902,8 @@ describe('propose_tombstone: agent drafts that agree from different angles withi
     ...over,
   });
 
-  it('two sessions drafting the same literals with disjoint evidence of two kinds settle it', async () => {
-    const { s, clock, ledger } = await sessions(['sess-a', 'sess-b']);
+  it('two sessions drafting the same literals with disjoint evidence of two kinds mint nothing; a third nominates, a person signs', async () => {
+    const { s, clock, ledger, engine } = await sessions(['sess-a', 'sess-b', 'sess-c']);
     const first = await s['sess-a'].call('propose_tombstone', draft({ rationale: 'config.ts was bumped' }));
     expect(first.status).toMatch(/awaiting notarization/);
     expect(first.quorum).toEqual({ agreeing: 1, needed: 2, windowEndsAt: at(15 * MIN), missing: ['another session'] });
@@ -848,31 +911,35 @@ describe('propose_tombstone: agent drafts that agree from different angles withi
     clock.now = T0 + 3 * MIN;
     // The same set of literals, in another order, with another claim
     const second = await s['sess-b'].call('propose_tombstone', draft({ claim: 'The old budget (30) is gone.', evidence: [FILE], literals: [...LITERALS].reverse() }));
-    expect(second.status).toBe('settled by quorum');
-    const tb = second.tombstone as TbEntry;
-    expect(tb).toMatchObject({ type: 'TB', author: AGENT, agentSessionId: 'sess-b', createdAt: at(3 * MIN) });
-    expect(tb.body).toMatchObject({
-      claim: 'LOG_BUDGET 30 is dead; the budget is 100',
-      signedBy: AGENT,
-      status: 'active',
-      literals: LITERALS,
-      evidence: [{ kind: 'commit', ref: 'a1b2c3', detail: COMMIT.detail }, FILE],
-      quorum: [
-        { author: AGENT, agentSessionId: 'sess-a', ts: at(0), evidence: [{ kind: 'commit', ref: 'a1b2c3', detail: COMMIT.detail }] },
-        { author: AGENT, agentSessionId: 'sess-b', ts: at(3 * MIN), evidence: [FILE] },
-      ],
-    });
-    const signs = tb.links.filter((x) => x.type === 'signs').map((x) => x.toId);
-    expect(signs.sort()).toEqual([first.proposal.id, second.proposal.id].sort());
-    for (const id of signs) expect((ledger.getEntry(id) as ProposalEntry).body.status).toBe('signed');
-    expect(ledger.getMatchableTombstones().map((t) => t.id)).toContain(tb.id);
-    expect(ledger.verify().ok).toBe(true);
+    expect(second.status).toMatch(/awaiting notarization/);
+    expect(second.status).toMatch(/no number of agent sessions mints a TB/);
+    expect(second.tombstone).toBeUndefined();
+    expect(second.quorum).toEqual({ agreeing: 2, needed: 2, windowEndsAt: at(18 * MIN), missing: [] });
+    expect(ledger.getStats().tombstones).toBe(0);
+    for (const p of [first.proposal, second.proposal]) expect((ledger.getEntry(p.id) as ProposalEntry).body.status).toBe('open');
 
-    // It travels as an agent-signed TB with a quorum, which a teammate takes as truth
+    // A third session, days later, from a third angle: the drafts are nominated and go first on the docket
+    clock.now = T0 + 2 * 24 * 60 * MIN;
+    const third = await s['sess-c'].call('propose_tombstone', draft({ evidence: [TEST] }));
+    expect(third.status).toMatch(/^nominated: three or more agent sessions drafted these literals/);
+    expect(third.quorum).toMatchObject({ nominated: true });
+    const docket = await engine.getDocket();
+    expect(docket.groups[0].items.map((i) => [i.kind, i.nominated, i.draft?.proposalsOfSameLiterals])).toEqual([
+      ['draft', true, 3],
+      ['draft', true, 3],
+      ['draft', true, 3],
+    ]);
+    expect(ledger.getStats().tombstones).toBe(0);
+
+    // Nothing travels: a teammate sees no TB
     const teammate = new TruthLedger(new Database(':memory:'));
-    const { lines } = exportWikiEntries(ledger);
-    expect(importWikiEntries(teammate, { lines })).toMatchObject({ committed: true, proposals: [] });
-    expect((teammate.getEntry(tb.id) as TbEntry).body.status).toBe('active');
+    expect(importWikiEntries(teammate, { lines: exportWikiEntries(ledger).lines })).toMatchObject({ committed: true, inserted: 0 });
+
+    // A person signs one of the drafts: that is the TB, answered for by the person
+    const tb = (await engine.notarizeProposal(third.proposal.id, 'johnnyclem')) as TbEntry;
+    expect(tb.body).toMatchObject({ signedBy: 'johnnyclem', answerableBy: 'johnnyclem', status: 'active', literals: LITERALS });
+    expect(tb.body.quorum).toBeUndefined();
+    expect(ledger.verify().ok).toBe(true);
   });
 
   it('one agent alone never settles: its drafts wait for a person', async () => {
@@ -899,13 +966,13 @@ describe('propose_tombstone: agent drafts that agree from different angles withi
     expect(ledger.getStats().tombstones).toBe(0);
   });
 
-  it('a draft without literals or settling evidence can\'t settle', async () => {
+  it('a draft without literals or settling evidence can\'t be nominated', async () => {
     const { s } = await sessions(['sess-a']);
     const bare = await s['sess-a'].call('propose_tombstone', { claim: 'fetchV1 is dead', evidence: [{ kind: 'chat', ref: 'slack:C01' }] });
     expect(bare.quorum.missing).toEqual(['literals', 'a settling evidence item', 'another session']);
     expect(bare.quorum.agreeing).toBe(0);
     // ...and says what it lacks
-    expect(bare.status).toMatch(/can't count toward a quorum/);
+    expect(bare.status).toMatch(/can't count toward a nomination/);
     expect(bare.status).toMatch(/literals/);
     expect(bare.status).toMatch(/commit, file, test, claimed-command or wiki/);
   });
@@ -918,7 +985,7 @@ describe('propose_tombstone: agent drafts that agree from different angles withi
     const res = await s['sess-b'].call('propose_tombstone', draft({ evidence: [FILE], literals: [LITERALS[1]] }));
     // A subset of the held TB's literals: already truth, and the result says so rather than wait for a quorum
     expect(res.status).toMatch(new RegExp(`already truth: TB ${tb.id} holds every literal`));
-    expect(res.status).not.toMatch(/until a person signs it or a quorum/);
+    expect(res.status).not.toMatch(/no number of agent sessions/);
     const again = await s['sess-b'].call('propose_tombstone', draft({ evidence: [FILE], targetRef: 'again' }));
     expect(again.status).toMatch(new RegExp(`already truth: TB ${tb.id} holds every literal`));
     expect(again.quorum).toMatchObject({ heldBy: tb.id, missing: [] });
@@ -941,26 +1008,30 @@ describe('the agent profile', () => {
     const client = new Client({ name: 'claude-code', version: '1.0.0' });
     await client.connect(clientSide);
     expect(client.getInstructions()).toContain(
-      'Your confidence is not evidence and settles nothing. On your own you can only attest: a claim settles when two or ' +
-        'more agent sessions agree from different angles within 15 minutes, or when a person signs. Agents never override ' +
-        'or strike a tombstone.'
+      'Your confidence is not evidence and settles nothing. Your claim is a UV until a person approves it: a UV becomes ' +
+        'a TB when a person approves it and one other approver agrees'
     );
+    expect(client.getInstructions()).toContain('Three agent sessions agreeing from different angles nominate a UV');
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name);
     expect(names).not.toContain('assert_tombstone');
+    expect(names).toContain('approve');
+    expect(names).toContain('get_docket');
     expect(Object.keys(tools.find((t) => t.name === 'resolve_uv')!.inputSchema.properties ?? {}).sort()).toEqual(['evidence', 'opinion', 'resolution', 'uvId']);
+    expect(Object.keys(tools.find((t) => t.name === 'approve')!.inputSchema.properties ?? {}).sort()).toEqual(['evidence', 'note', 'uvId']);
     const description = (name: string) => tools.find((t) => t.name === name)!.description!;
-    // Each draft must bring settling evidence of its own; a held claim mints nothing
-    expect(description('propose_tombstone')).toMatch(/Each draft must cite settling evidence of its own/);
+    // Each draft must bring settling evidence of its own; a held claim mints nothing; no number of agents mints
+    expect(description('propose_tombstone')).toMatch(/each citing settling evidence of its own/);
     expect(description('propose_tombstone')).toMatch(/already truth/);
-    // An override is never undone, by a refuted contest either
-    expect(description('resolve_uv')).toMatch(/active again unless another contest is open or it has been overridden \(an override is never undone\)/);
+    expect(description('propose_tombstone')).toMatch(/no number of agent sessions mints a TB/);
+    expect(description('resolve_uv')).toMatch(/A verified verdict is this session's approval/);
+    expect(description('approve')).toMatch(/Three agent sessions approving from different angles nominate it/);
     const res = (await client.callTool({ name: 'assert_tombstone', arguments: { claim: 'x', evidence: [COMMIT] } })) as { isError?: boolean; content: Array<{ text: string }> };
     expect(res.isError).toBe(true);
-    expect(res.content[0].text).toMatch(/propose_tombstone.*two or more agent sessions/);
+    expect(res.content[0].text).toMatch(/propose_tombstone.*no number of agent sessions mints a TB/);
   });
 
-  it('the operator profile\'s import_wiki_entries says an agent\'s line lands only with a quorum of agents', async () => {
+  it('the operator profile\'s import_wiki_entries says an agent-minted TB is filed for the docket, never truth', async () => {
     dir ??= mkdtempSync(join(tmpdir(), 'steno-quorum-'));
     writeFileSync(join(dir, 'op.jsonl'), '');
     const server = new StenographerServer({ logPath: join(dir, 'op.jsonl'), statePath: ':memory:', mode: 'catchup', embeddingModel: 'hashed', profile: 'operator' });
@@ -971,16 +1042,17 @@ describe('the agent profile', () => {
     await client.connect(clientSide);
     const { tools } = await client.listTools();
     const text = tools.find((t) => t.name === 'import_wiki_entries')!.description!;
-    expect(text).toMatch(/when an agent signed it, with a valid quorum of agents/);
+    expect(text).toMatch(/a TB agents minted under the 1.0 quorum rule is filed as a nominated draft for the docket \(agent-quorum\)/);
     expect(text).toMatch(/agent-without-quorum/);
     expect(text).toMatch(/an override, strike or ruling never applies from an agent/);
   });
 
-  it('ships the consumption rule that says a verdict settles only with another session, or a person', () => {
+  it('ships the consumption rule that says a UV becomes a TB only when a person approves it, and three agents nominate', () => {
     expect(CONSUMPTION_RULES).toContain(
-      'If your current task can check the UV, file your verdict and evidence with resolve_uv: it settles only when another ' +
-        'agent session agrees from a different angle (other evidence, another kind) within 15 minutes, or when a person rules.'
+      'If your current task can check the UV, approve it with your evidence (approve): a UV becomes a TB only when a person ' +
+        'approves it and one other approver agrees; three agent sessions agreeing nominate it for the person\'s review, and it stays a UV until then.'
     );
+    expect(CONSUMPTION_RULES).toContain('Corroborated UV (marker [UV · CORROBORATED])');
     expect(CONSUMPTION_RULES).not.toMatch(/settle the UV cheaply/);
   });
 });
@@ -1060,7 +1132,7 @@ describe('attestations from several processes on one state file', () => {
       );
       store.attestations.attest({ uvId: uv.id, resolution: 'verified', evidence: [COMMIT], author: AGENT, agentSessionId: 'sess-a' }, clock(T0));
       const draft = store.truth.draftTombstone({ claim: 'LOG_BUDGET 30 is dead', evidence: [COMMIT], literals: LITERALS }, { author: AGENT, agentSessionId: 'sess-a', timestamp: at(0) });
-      settleTombstoneQuorum(store.truth, draft, { author: AGENT, agentSessionId: 'sess-a', now: clock(T0) });
+      draftAgreement(store.truth, draft, { author: AGENT, agentSessionId: 'sess-a', now: clock(T0) });
       expect(read).toEqual([true, true]);
     } finally {
       store.close();
@@ -1114,13 +1186,23 @@ describe('wiki import: agent lines land only with a valid quorum of agents', () 
     return { lines, tb, uv, addendum };
   }
 
-  it('takes an agent-signed TB with a valid quorum as truth, with or without a registry', () => {
+  it('files an agent-signed TB with a valid quorum as a nominated draft, never truth, with or without a registry (R5 import policy)', () => {
     const { lines, tb } = writer();
     for (const signers of [null, SignerRegistry.load(REGISTRY)]) {
       const ledger = new TruthLedger(new Database(':memory:'));
       const result = importWikiEntries(ledger, { lines: lines.map((l) => JSON.stringify(l)) }, { signers });
-      expect(result).toMatchObject({ committed: true, proposals: [], held: [] });
-      expect((ledger.getEntry(tb.id) as TbEntry).body).toMatchObject({ status: 'active', quorum: (tb.body as TbEntry['body']).quorum });
+      expect(result).toMatchObject({ committed: true, held: [] });
+      expect(result.proposals).toMatchObject([{ id: tb.id, reason: 'agent-quorum' }]);
+      expect(result.proposals[0].detail).toMatch(/minted by 2 agent sessions under the 1.0 quorum rule/);
+      expect(ledger.getEntry(tb.id)).toBeNull();
+      const proposal = ledger.getEntry(result.proposals[0].proposalId) as ProposalEntry;
+      expect(proposal.body).toMatchObject({ kind: 'tombstone', requiresNotary: true, meta: { nominated: true } });
+      expect(proposal.body.draft).toEqual({ claim: tb.body.claim, evidence: tb.body.evidence, literals: tb.body.literals });
+      // ...and it goes first on the docket, with the drafts
+      const docket = buildDocket({ ledger, approvals: new UvApprovals(new Database(':memory:'), ledger), attestations: new UvAttestations(new Database(':memory:'), ledger) });
+      expect(docket.groups.flatMap((g) => g.items).map((i) => [i.kind, i.id, i.nominated])).toContainEqual(['draft', proposal.id, true]);
+      // The agents' resolution of the UV still applies: the policy is about TBs
+      expect(ledger.getEntry(tb.id)).toBeNull();
     }
   });
 
@@ -1129,7 +1211,7 @@ describe('wiki import: agent lines land only with a valid quorum of agents', () 
   // the line is kept like one with any other unknown field (spec, Unknown
   // values). Admission held every member to an ADDENDUM's verdict enum, so a
   // file with `verdict: "bogus"` on a TB member rolled back whole.
-  it('takes a quorum TB whose member carries a verdict, a field a TB member does not define, whatever its value', () => {
+  it('reads a quorum TB whose member carries a verdict, a field a TB member does not define, whatever its value', () => {
     const { lines, tb } = writer();
     const tbLine = lines.find((l) => l.id === tb.id)!;
     for (const verdict of ['bogus', 'verified', 7]) {
@@ -1139,11 +1221,9 @@ describe('wiki import: agent lines land only with a valid quorum of agents', () 
       for (const signers of [null, SignerRegistry.load(REGISTRY)]) {
         const ledger = new TruthLedger(new Database(':memory:'));
         const result = importWikiEntries(ledger, { lines: [encoded] }, { signers });
-        expect(result, String(verdict)).toMatchObject({ committed: true, errors: [], proposals: [], held: [] });
-        expect((ledger.getEntry(tb.id) as TbEntry).body).toMatchObject({ status: 'active', quorum: line.quorum });
-        // Kept as it came, and exported again verbatim
-        const exported = exportWikiEntries(ledger).lines.map(parse).find((l) => l.id === tb.id)!;
-        expect(exported.quorum).toEqual(line.quorum);
+        // The field is no reason to refuse or hold the line: it is filed as every agent-quorum TB is
+        expect(result, String(verdict)).toMatchObject({ committed: true, errors: [], held: [] });
+        expect(result.proposals, String(verdict)).toMatchObject([{ id: tb.id, reason: 'agent-quorum' }]);
       }
     }
   });
@@ -1298,9 +1378,10 @@ describe('wiki import: agent lines land only with a valid quorum of agents', () 
     expect(result.held[0].reason).toMatch(/agent:ghost/);
     expect(ledger.getEntry(tb.id)).toBeNull();
     expect((ledger.getEntry(uv.id) as UvEntry).body.status).toBe('open');
-    // Without a registry, the agent: prefix is the rule: both land
+    // Without a registry, the agent: prefix is the rule: the resolution lands, and the TB is filed as every agent-quorum TB is
     const open = new TruthLedger(new Database(':memory:'));
-    expect(importWikiEntries(open, { lines })).toMatchObject({ committed: true, proposals: [], held: [] });
+    expect(importWikiEntries(open, { lines })).toMatchObject({ committed: true, proposals: [{ id: tb.id, reason: 'agent-quorum' }], held: [] });
+    expect((open.getEntry(uv.id) as UvEntry).body.status).toBe('verified');
   });
 
   it('decodes a quorum line with values it does not know, and holds it: unknown values never refuse a line', () => {
@@ -1312,11 +1393,11 @@ describe('wiki import: agent lines land only with a valid quorum of agents', () 
     const quorum = [{ ...resolution.quorum[0], evidence: [COMMIT, FILE] }, { ...resolution.quorum[1], evidence: [bench] }];
     const newKind = { ...resolution, quorum, evidence: [COMMIT, FILE, bench] };
     // Its only link of a type this version doesn't know, or no link at all
-    const newLink = { ...resolution, 'x-steno': { ...resolution['x-steno'], links: [{ fromId: resolution.id, toId: uv.id, type: 'corroborates' }] } };
+    const newLink = { ...resolution, 'x-steno': { ...resolution['x-steno'], links: [{ fromId: resolution.id, toId: uv.id, type: 'echoes' }] } };
     const noLink = { ...resolution, 'x-steno': { ...resolution['x-steno'], links: [] } };
     for (const [change, why] of [
       [newKind, /evidence kind 'benchmark'/],
-      [newLink, /link type 'corroborates'/],
+      [newLink, /link type 'echoes'/],
       [noLink, /lists no links/],
     ] as const) {
       const sent = stream([uvLine, change]);

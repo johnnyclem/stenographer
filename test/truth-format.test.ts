@@ -20,12 +20,13 @@ import { Ajv2020 } from 'ajv/dist/2020.js';
 import addFormatsModule from 'ajv-formats';
 import { TruthLedger } from '../src/truth/ledger.js';
 import { SignerRegistry } from '../src/truth/identity.js';
-import { UvAttestations, settleTombstoneQuorum } from '../src/truth/attestations.js';
+import { UvAttestations } from '../src/truth/attestations.js';
 import { evidenceRefKey, quorumEvidence, type QuorumMember } from '../src/truth/quorum.js';
 import { importProposalDrafts } from '../src/truth/intake.js';
 import { canonicalize } from '../src/truth/jcs.js';
 import { decodeWikiLine, exportWikiEntries, importWikiEntries, wikiLineHash, WIKI_STATUSES } from '../src/truth/wiki.js';
-import { EVIDENCE_KINDS, evidenceClass, identityKey, type ProposalEntry, type TbEntry } from '../src/truth/types.js';
+import { EVIDENCE_KINDS, evidenceClass, identityKey, type ProposalEntry, type TbEntry, type UvEntry } from '../src/truth/types.js';
+import { UvApprovals } from '../src/truth/approvals.js';
 import { lineContentHash, premisesOfLine } from '../src/truth/derivation.js';
 import { deriveStanding, type StandingNode } from '../src/truth/status.js';
 
@@ -93,10 +94,10 @@ function stream(bodies: Array<Record<string, unknown>>, from = 1, prev: string |
 /** The top-level fields the spec defines, per line type: anything else on a line is a newer writer's. */
 const ENVELOPE_FIELDS = ['schemaVersion', 'seq', 'id', 'type', 'ts', 'author', 'prevHash', 'hash', 'x-steno'];
 const BODY_FIELDS: Record<string, string[]> = {
-  TB: ['claim', 'evidence', 'signedBy', 'literals', 'quorum', 'status'],
-  UV: ['assertion', 'basis', 'verifyBy', 'contests', 'status'],
+  TB: ['claim', 'evidence', 'signedBy', 'literals', 'quorum', 'inference', 'answerableBy', 'approvals', 'status'],
+  UV: ['assertion', 'basis', 'verifyBy', 'contests', 'inference', 'status'],
   ADDENDUM: ['evidence', 'note', 'quorum'],
-  RULING: ['kind', 'opinion', 'target'],
+  RULING: ['kind', 'opinion', 'target', 'answerableBy'],
   TRANSITION: ['target', 'status', 'cause'],
 };
 const unknownFields = (line: Record<string, unknown>) =>
@@ -367,8 +368,17 @@ function buildFixtures(): Map<string, string> {
     { ...agent, agentSessionId: 'sess_9c1d', evidence: [{ kind: 'test', ref: 'test/retry.test.ts', detail: 'per-tenant budget' }], note: 'the retry test pins it' },
     Date.parse(T(12))
   );
-  expect(settled.status).toBe('settled');
-  // ...and two agents' drafts of the same literals, from different angles, mint a TB together
+  // Since 1.1 no live path settles on agents' word (PRD R5): the attestations stand, and the stream still
+  // carries a quorum ADDENDUM, written by the library's 1.0 writer, so every reader holds one
+  expect(settled.status).toBe('agreed');
+  const agreeing = (settled as { members: Array<{ author: string; agentSessionId: string; createdAt: string; evidence: Array<{ kind: string; ref: string; detail?: string }> }> }).members;
+  ledger.resolveUvByQuorum(
+    tenant.id,
+    'verified',
+    agreeing.map((m) => ({ author: m.author, agentSessionId: m.agentSessionId, ts: m.createdAt, evidence: m.evidence, verdict: 'verified' as const })),
+    { author: 'agent:claude-code', agentSessionId: 'sess_9c1d', opinion: 'the retry test pins it', timestamp: T(12) }
+  );
+  // ...and two agents' drafts of the same literals, from different angles, minted a TB together under the 1.0 rule
   ledger.draftTombstone(
     { claim: 'The v1 search endpoint is gone; searchV2 replaced it.', evidence: [{ kind: 'commit', ref: 'c4fe0b1' }], literals: [{ dead: 'searchV1', current: 'searchV2' }] },
     { author: 'agent:claude-code', agentSessionId: 'sess_7f3a', timestamp: T(13) }
@@ -377,7 +387,9 @@ function buildFixtures(): Map<string, string> {
     { claim: 'searchV1 was removed.', evidence: [{ kind: 'file', ref: 'src/api/search.ts:1', detail: 'export { searchV2 }' }], literals: [{ dead: 'searchV1', current: 'searchV2' }] },
     { author: 'agent:codex', agentSessionId: 'sess_2b8e', timestamp: T(14) }
   );
-  expect(settleTombstoneQuorum(ledger, second, { author: 'agent:codex', agentSessionId: 'sess_2b8e', now: Date.parse(T(14)) })).toHaveProperty('tombstone');
+  const drafts = ledger.listProposals('open', 'tombstone').filter((p) => p.body.signal.source === 'agent-draft').map((p) => p.id);
+  expect(drafts).toContain(second.id);
+  ledger.mintTombstoneByQuorum(drafts, { author: 'agent:codex', agentSessionId: 'sess_2b8e', timestamp: T(14) });
 
   const full = exportWikiEntries(ledger);
   expect(full.skipped).toEqual([]);
@@ -454,6 +466,14 @@ function buildFixtures(): Map<string, string> {
     [unawareStream.find((l) => l.type === 'TB'), { outcome: 'proposal', reason: 'agent-without-quorum', note: 'a TB an agent signed alone: agents settle claims only as a quorum' }],
     [unawareStream.find((l) => l.type === 'ADDENDUM'), { outcome: 'held', note: "an agent's verification without a quorum" }],
     ...quorumRouting(quorumAddendum, quorumTb, 8),
+    [
+      quorumTb,
+      {
+        outcome: 'proposal',
+        reason: 'agent-quorum',
+        note: 'a TB two agent sessions minted under the 1.0 quorum rule: no number of agent sessions mints a TB, so it is filed as a nominated draft for the docket, never truth',
+      },
+    ],
   ];
   const derivationRouting: Array<[unknown, Record<string, unknown>]> = [
     [
@@ -607,7 +627,40 @@ function buildFixtures(): Map<string, string> {
       'chain-fork.jsonl': [{ line: 3, reason: 'a line from another stream', error: 'chain broken: prevHash' }],
     })
   );
+
+  // valid/review.jsonl: an agent's claim is a UV; three sessions nominate it, a person approves and promotes it
+  const reviewDb = new Database(':memory:');
+  const review = new TruthLedger(reviewDb);
+  const approvals = new UvApprovals(reviewDb, review);
+  // The next hour: a nomination takes approvals any time apart, so the third comes a day later
+  const H = (minute: number) => `2026-09-01T11:${String(minute).padStart(2, '0')}:00.000Z`;
+  const claim = review.assertUv(
+    { assertion: 'The retry cap is read once, at start-up.', basis: 'config.ts loads it before the loop', verifyBy: { kind: 'inspect', value: 'src/config.ts' } },
+    { author: 'agent:claude-code', agentSessionId: 'sess_7f3a', timestamp: H(0) }
+  );
+  const approve = (agentSessionId: string, evidence: Array<{ kind: 'commit' | 'file' | 'test'; ref: string; detail?: string }>, at: string) =>
+    approvals.approve({ uvId: claim.id, by: 'agent:codex', role: 'agent', agentSessionId, evidence }, Date.parse(at));
+  expect(approve('sess_2b8e', [{ kind: 'commit', ref: 'c0ffee1', detail: 'loadConfig() moved before the loop' }], H(1)).status).toBe('approved');
+  expect(approve('sess_9c1d', [{ kind: 'file', ref: 'src/config.ts:12', detail: 'const cap = loadConfig().retryCap' }], H(2)).status).toBe('approved');
+  const nominated = approve('sess_4d2a', [{ kind: 'test', ref: 'test/config.test.ts', detail: 'reads the cap once' }], '2026-09-02T11:02:00.000Z');
+  expect(nominated.status).toBe('nominated');
+  const promoted = approvals.approve({ uvId: claim.id, by: 'johnnyclem', role: 'human', note: 'The config change is in and the test pins it.' }, Date.parse('2026-09-03T09:30:00.000Z'));
+  expect(promoted.status).toBe('promoted');
+  const reviewStream = exportWikiEntries(review);
+  expect(reviewStream.skipped).toEqual([]);
+  files.set('valid/review.jsonl', jsonl(reviewStream.lines));
+  files.set('valid/review.expected.json', json(foldReview(reviewStream.lines)));
   return files;
+}
+
+/** The fold with standing, plus what a reader derives from a nomination: a UV with a `corroborates` ADDENDUM into it is corroborated. */
+function foldReview(stream: string[]): Record<string, { type: string; status: string | null; current: boolean; standing: string; reasons: unknown[]; corroborated?: true }> {
+  const out: Record<string, { type: string; status: string | null; current: boolean; standing: string; reasons: unknown[]; corroborated?: true }> = foldWithStanding(stream);
+  for (const line of stream.map(parse)) {
+    if (line.type !== 'ADDENDUM') continue;
+    for (const l of line['x-steno']?.links ?? []) if (l.type === 'corroborates' && out[l.toId]) out[l.toId].corroborated = true;
+  }
+  return out;
 }
 
 /** Lines that break the derivation rules (spec, Derivation), from a valid derived TB: the schema takes them, the codec refuses them. */
@@ -806,7 +859,7 @@ function quorumRouting(addendum: Record<string, any>, quorumTb: Record<string, a
   const unknownKind = variant('01J9QUORUMUNKNOWNKIND00000', (l) => ({ ...l, quorum: [m1, { ...m2, evidence: [bench] }], evidence: [...m1.evidence, bench] }));
   const unknownLink = variant('01J9QUORUMUNKNOWNLINK00000', (l) => ({
     ...l,
-    'x-steno': { ...l['x-steno'], links: l['x-steno'].links.map((k: Record<string, unknown>) => ({ ...k, type: 'corroborates' })) },
+    'x-steno': { ...l['x-steno'], links: l['x-steno'].links.map((k: Record<string, unknown>) => ({ ...k, type: 'echoes' })) },
   }));
   const noLinks = variant('01J9QUORUMNOLINKS000000000', (l) => ({ ...l, 'x-steno': { ...l['x-steno'], links: [] } }));
   const subMs = new Date(Date.parse(m1.ts) + 900_000).toISOString().replace('Z', '9Z');
@@ -839,11 +892,11 @@ function quorumRouting(addendum: Record<string, any>, quorumTb: Record<string, a
       [{ fromId: l.id, toId: uvLink.toId, type: 'verifies' }]
     )
   );
-  const linksString = variant('01J9QUORUMLINKSSTRING00000', (l) => withTopLevelLinks(l, 'corroborates'));
+  const linksString = variant('01J9QUORUMLINKSSTRING00000', (l) => withTopLevelLinks(l, 'echoes'));
   // A TB an agent quorum signed whose only link has a type this version doesn't know
   const tbUnknownLink = (() => {
     const line = tbWith('01J9QUORUMTBUNKNOWNLINK000', [t1, t2]);
-    return rehash({ ...line, 'x-steno': { ...line['x-steno'], links: [{ fromId: line.id, toId: tbLine.id, type: 'corroborates' }] } });
+    return rehash({ ...line, 'x-steno': { ...line['x-steno'], links: [{ fromId: line.id, toId: tbLine.id, type: 'echoes' }] } });
   })();
   const keepsRule5 =
     "it decodes (rule 5 reads x-steno.links, whose link the members' verdicts match, and a field the format doesn't define never refuses a line), " +
@@ -861,7 +914,7 @@ function quorumRouting(addendum: Record<string, any>, quorumTb: Record<string, a
       },
     ],
     [unknownKind, { outcome: 'held', heldReason: "evidence kind 'benchmark'", note: 'a quorum member citing only an evidence kind this version does not know: it decodes, and the import fails closed' }],
-    [unknownLink, { outcome: 'held', heldReason: "link type 'corroborates'", note: 'a quorum ADDENDUM whose only link has a type this version does not know: it decodes, and the import fails closed' }],
+    [unknownLink, { outcome: 'held', heldReason: "link type 'echoes'", note: 'a quorum ADDENDUM whose only link has a type this version does not know: it decodes, and the import fails closed' }],
     [noLinks, { outcome: 'held', heldReason: 'lists no links', note: 'a quorum ADDENDUM that lists no links: checked for agreeing verdicts only, and held, since what it changes is unknown' }],
     [edge, { outcome: 'held', heldReason: 'is not held here', note: 'members 900 000.9 ms apart: rule 4 reads timestamps to the millisecond, so it decodes (held: its UV is not in this ledger)' }],
     [
@@ -887,11 +940,12 @@ function quorumRouting(addendum: Record<string, any>, quorumTb: Record<string, a
     [
       tbMemberVerdict,
       {
-        outcome: 'inserted',
-        status: 'active',
+        outcome: 'proposal',
+        reason: 'agent-quorum',
         note:
           "a TB an agent quorum signed, one of whose members carries verdict 'bogus': only an ADDENDUM's members define verdict, so on a TB member " +
-          'it is an unknown field, whatever its value. It decodes, and the import takes the TB as truth and keeps the field, as for a TB member without it',
+          'it is an unknown field, whatever its value. It decodes, and the import files it as it files every TB agents minted under the 1.0 rule: ' +
+          'a nominated draft for the docket, never truth (agent-quorum), the field no reason to refuse or hold it',
       },
     ],
     [linksOverrides, { outcome: 'held', heldReason: 'is not held here', note: `a quorum ADDENDUM that verifies its UV, with a top-level links: [{"type":"overrides"}]: ${keepsRule5}` }],
@@ -903,14 +957,14 @@ function quorumRouting(addendum: Record<string, any>, quorumTb: Record<string, a
         note: `a quorum ADDENDUM whose members say refuted and whose x-steno link refutes its UV, with a top-level links holding a verifies link: ${keepsRule5}`,
       },
     ],
-    [linksString, { outcome: 'held', heldReason: 'is not held here', note: `a quorum ADDENDUM that verifies its UV, with a top-level links: "corroborates", a string: ${keepsRule5}` }],
+    [linksString, { outcome: 'held', heldReason: 'is not held here', note: `a quorum ADDENDUM that verifies its UV, with a top-level links: "echoes", a string: ${keepsRule5}` }],
     [
       tbUnknownLink,
       {
         outcome: 'proposal',
         reason: 'unknown-value',
         note:
-          "a TB an agent quorum signed whose x-steno.links carries a link type this version does not know ('corroborates'): " +
+          "a TB an agent quorum signed whose x-steno.links carries a link type this version does not know ('echoes'): " +
           'it decodes (the link rules and the quorum rules refuse no line over an unknown link type), and the import fails closed: filed for a person, never truth',
       },
     ],
@@ -990,21 +1044,29 @@ describe('valid/ledger.jsonl: one ledger, every kind of wiki line', () => {
     const ledger = fresh();
     const all = fixture();
     const transitions = all.filter((l) => parse(l).type === 'TRANSITION').length;
+    // The one line that doesn't land as truth: the TB agents minted under the 1.0 quorum rule (R5 import policy)
+    const quorumTb = all.map(parse).find((l) => l.type === 'TB' && l.quorum)!;
     const result = importWikiEntries(ledger, { lines: all }, { signers: signers() });
-    expect(result).toMatchObject({ committed: true, inserted: all.length - transitions, derived: transitions, proposals: [], held: [], errors: [] });
+    expect(result).toMatchObject({ committed: true, inserted: all.length - transitions - 1, derived: transitions, held: [], errors: [] });
+    expect(result.proposals).toMatchObject([{ id: quorumTb.id, reason: 'agent-quorum' }]);
     for (const [id, want] of Object.entries(expected<Record<string, { status: string; current: boolean }>>('fixtures/valid/ledger.expected.json'))) {
+      if (id === quorumTb.id) {
+        expect(ledger.getEntry(id)).toBeNull();
+        expect((ledger.getEntry(result.proposals[0].proposalId) as ProposalEntry).body.meta).toMatchObject({ nominated: true });
+        continue;
+      }
       const entry = ledger.getEntry(id)!;
       const current = ledger.getTruth('current').some((e) => e.id === id);
       expect(current, id).toBe(want.current);
       if (want.status !== 'struck') expect((entry.body as { status: string }).status, id).toBe(want.status);
     }
     expect(ledger.verify().ok).toBe(true);
-    // Exported again by the importer: the same lines but for what the writer adds
+    // Exported again by the importer: the same lines but for what the writer adds, and the TB it filed instead
     const strip = (l: string) => {
       const { prevHash: _p, hash: _h, 'x-steno': x, ...rest } = parse(l);
       return x ? { ...rest, 'x-steno': { ...x, origin: undefined, ledgerHash: undefined } } : rest;
     };
-    expect(exportWikiEntries(ledger).lines.map(strip)).toEqual(all.map(strip));
+    expect(exportWikiEntries(ledger).lines.map(strip)).toEqual(all.filter((l) => parse(l).id !== quorumTb.id && parse(l).target !== quorumTb.id).map(strip));
     expect(importWikiEntries(ledger, { lines: all }, { signers: signers() })).toMatchObject({ inserted: 0, unchanged: all.length - transitions });
   });
 
@@ -1210,6 +1272,58 @@ describe('valid/unknown.jsonl: what a newer writer may send', () => {
       const back = exportWikiEntries(ledger).lines.map(parse).find((l) => l.type === type)!;
       for (const [key, value] of Object.entries(added)) expect(canonicalize(back[key]), what).toBe(canonicalize(value));
     }
+  });
+});
+
+describe('valid/review.jsonl: a nomination, and a promotion with its approvals', () => {
+  const fixture = () => lines('fixtures/valid/review.jsonl');
+
+  it('every line passes the schema and the codec, and the lines chain', () => {
+    const all = fixture();
+    for (const [i, line] of all.entries()) {
+      expect(schemaValid(line), `line ${i + 1}: ${ajv.errorsText(validate.errors)}`).toBe(true);
+      expect(decodeWikiLine(line)).toMatchObject({ version: 2, seq: i + 1 });
+      expect(parse(line).prevHash).toBe(i === 0 ? null : parse(all[i - 1]).hash);
+    }
+  });
+
+  it('carries the nomination (three agent sessions, any time apart, corroborating the UV) and the promoted TB with its approvals and answerable person', () => {
+    const all = fixture().map(parse);
+    const uv = all.find((l) => l.type === 'UV')!;
+    const nomination = all.find((l) => l.type === 'ADDENDUM' && l['x-steno'].links.some((k: { type: string }) => k.type === 'corroborates'))!;
+    expect(nomination.quorum).toHaveLength(3);
+    expect(nomination.quorum.map((m: { verdict: string }) => m.verdict)).toEqual(['verified', 'verified', 'verified']);
+    expect(nomination['x-steno'].links).toEqual([{ fromId: nomination.id, toId: uv.id, type: 'corroborates' }]);
+    // No TRANSITION follows the nomination: the UV's status did not change
+    expect(all.find((l) => l.type === 'TRANSITION' && l.cause.ref === nomination.id)).toBeUndefined();
+    const tb = all.find((l) => l.type === 'TB')!;
+    expect(tb).toMatchObject({ author: 'johnnyclem', signedBy: 'johnnyclem', answerableBy: 'johnnyclem', claim: uv.assertion, status: 'active' });
+    expect(tb.approvals.map((a: { by: string; role: string }) => [a.by, a.role])).toEqual([
+      ['agent:codex', 'agent'],
+      ['agent:codex', 'agent'],
+      ['agent:codex', 'agent'],
+      ['johnnyclem', 'human'],
+    ]);
+    expect(tb['x-steno'].links).toContainEqual({ fromId: tb.id, toId: uv.id, type: 'supersedes' });
+    // The promotion ruling changes no status, so it doesn't travel (spec, What travels in a wiki stream)
+    expect(all.find((l) => l.type === 'RULING')).toBeUndefined();
+    expect(foldReview(fixture())).toEqual(expected('fixtures/valid/review.expected.json'));
+    expect(foldReview(fixture())[uv.id]).toMatchObject({ status: 'verified', corroborated: true });
+  });
+
+  it('imports into a fresh ledger: the UV is corroborated, then verified, and the TB a person signed is truth', () => {
+    const ledger = fresh();
+    const all = fixture();
+    const uvId = all.map(parse).find((l) => l.type === 'UV')!.id;
+    const tbId = all.map(parse).find((l) => l.type === 'TB')!.id;
+    // Up to the nomination: the UV is open and corroborated
+    const nominationAt = all.findIndex((l) => parse(l).type === 'ADDENDUM');
+    expect(importWikiEntries(ledger, { lines: all.slice(0, nominationAt + 1) }, { signers: signers() })).toMatchObject({ committed: true, held: [], proposals: [], errors: [] });
+    expect(ledger.getEntry(uvId)).toMatchObject({ corroborated: true, body: { status: 'open' } });
+    expect(importWikiEntries(ledger, { lines: all }, { signers: signers() })).toMatchObject({ committed: true, held: [], proposals: [], errors: [] });
+    expect((ledger.getEntry(uvId) as UvEntry).body.status).toBe('verified');
+    expect((ledger.getEntry(tbId) as TbEntry).body).toMatchObject({ answerableBy: 'johnnyclem', status: 'active' });
+    expect(ledger.verify().ok).toBe(true);
   });
 });
 

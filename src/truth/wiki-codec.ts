@@ -18,6 +18,9 @@
  *   `x-steno.links`, each pinned by the premise's content hash, and an
  *   `inference`. Standing is computed on read over them (status.ts) and
  *   never written to a line.
+ * - A TB a person promoted from a UV carries `approvals` and `answerableBy`;
+ *   an ADDENDUM with a `corroborates` link and a three-member `quorum`
+ *   nominates a UV (it stays open). Every ruling names `answerableBy`.
  * - Unknown or missing statuses are excluded from current truth (fail
  *   closed). Proposals never travel in a wiki file; PROPOSAL lines are the
  *   intake's format (intake.ts).
@@ -153,6 +156,10 @@ const QuorumMember = z
   .object({ author: z.string(), agentSessionId: z.string(), ts: Timestamp, evidence: z.array(Evidence).min(1, 'a quorum member cites evidence') })
   .passthrough();
 const AddendumQuorumMember = QuorumMember.extend({ verdict: z.enum(['verified', 'refuted']) });
+/** Who approved a promoted UV (spec, Approvals): a person, an agent session, or the reporter with the passages it cites. */
+const Approval = z
+  .object({ by: Identity, role: Text, ts: Timestamp, agentSessionId: z.string().optional(), cites: z.array(Text).optional() })
+  .passthrough();
 const XSteno = z
   .object({
     origin: Text.optional(),
@@ -185,6 +192,8 @@ const TbLine = z
     literals: z.array(Literal).min(1, 'omit literals rather than send none').optional(),
     quorum: z.array(QuorumMember).optional(),
     inference: Blankless.optional(),
+    answerableBy: Identity.optional(),
+    approvals: z.array(Approval).min(1, 'omit approvals rather than send none').optional(),
     status: Text.optional(),
   })
   .passthrough();
@@ -212,7 +221,7 @@ const AddendumLine = z
   })
   .passthrough();
 const RulingLine = z
-  .object({ ...Envelope, type: z.literal('RULING'), author: Identity, kind: Text, opinion: Blankless, target: ID })
+  .object({ ...Envelope, type: z.literal('RULING'), author: Identity, kind: Text, opinion: Blankless, target: ID, answerableBy: Identity.optional() })
   .passthrough();
 const ProposalLine = z
   .object({

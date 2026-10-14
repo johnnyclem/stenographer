@@ -80,9 +80,11 @@ export {
 export {
   QUORUM_WINDOW_MS,
   QUORUM_MIN_MEMBERS,
+  NOMINATION_MIN_MEMBERS,
   AGENT_PREFIX,
   checkQuorum,
   chooseQuorum,
+  chooseNomination,
   evidenceKey,
   evidenceRefKey,
   sameEvidence,
@@ -101,12 +103,44 @@ export {
 export {
   UvAttestations,
   ensureAttestationSchema,
+  draftAgreement,
+  draftNominated,
   settleTombstoneQuorum,
   type Attestation,
   type AttestOutcome,
   type QuorumClock,
   type TombstoneQuorumProgress,
 } from './truth/attestations.js';
+export {
+  UvApprovals,
+  ensureApprovalSchema,
+  toWireApprovals,
+  type UvApproval,
+  type ApprovalSummary,
+  type ApproveOutcome,
+  type ApprovalClock,
+} from './truth/approvals.js';
+export {
+  buildDocket,
+  formatDocketItem,
+  lexicalPassages,
+  type Docket,
+  type DocketItem,
+  type DocketItemKind,
+  type RecordPassage,
+} from './truth/docket.js';
+export { runReviewCLI, parseEvidenceLines } from './truth/review-cli.js';
+export {
+  DERIVATION_DETECTOR,
+  INFERENCE_AT_FAULT,
+  detectSuspects,
+  triggersSuspicion,
+  suspicionTargetRef,
+  type SuspectPremise,
+  type SuspicionInput,
+  type SuspicionDraft,
+  type Suspicion,
+} from './truth/suspicion.js';
 export {
   verifyLedger,
   chainRecord,

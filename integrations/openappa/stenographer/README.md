@@ -46,16 +46,17 @@ the identity it attributes writes to. Restricted to `self`; it keeps the
 session's trust.
 
 *Truth writes* — `propose_tombstone`, `assert_uv`, `resolve_uv`,
-`backfill_legacy_tombstones`, and `export_wiki_entries` with `file`.
-They need trusted data and record `stenographer.changed`
-(`stenographer.exported` for the export). Agents settle claims only
-together: one agent's draft (`propose_tombstone`) or verdict
-(`resolve_uv`) settles nothing, but the one that completes a quorum —
-two or more agent sessions agreeing from different angles within 15
-minutes — mints the TB or settles the UV with no person. So a draft is a
-truth write too, and records `stenographer.proposed` as well. A
-suspicious trajectory cannot draft a TB, assert a UV, contest a TB or
-attest to a UV unless an authority approves the exact call.
+`approve`, `backfill_legacy_tombstones`, and `export_wiki_entries` with
+`file`. They need trusted data and record `stenographer.changed`
+(`stenographer.exported` for the export). Agents settle nothing: one
+agent's draft (`propose_tombstone`), verdict (`resolve_uv`) or approval
+(`approve`) is a UV-class claim until a person approves it, but three
+agent sessions agreeing from different angles nominate it with an
+ADDENDUM in the ledger, and an approval counts toward a person's
+promotion. So a draft and an approval are truth writes too, and a draft
+records `stenographer.proposed` as well. A suspicious trajectory cannot
+draft a TB, assert a UV, contest a TB, attest to a UV or approve one
+unless an authority approves the exact call.
 
 *A person's acts* — `sign_proposal`, `dismiss_proposal`,
 `override_tombstone`, `file_ruling`, `rule_on_objection`, and the
@@ -109,24 +110,24 @@ OpenAPPA checks a call's requirements against the label its own result
 would leave, so a rule cannot require `trusted` data and also declare a
 `suspicious` result: no call could meet it without an authority that
 lifts trust. Write results therefore keep the session's trust. Some of
-them can quote text nobody vouched for: `resolve_uv` returns the UV it
-attests to, and, when it completes a quorum, an addendum with the
-evidence other agent sessions brought; `propose_tombstone` can return
-the drafter's earlier open draft for a `targetRef`, which another
-session under the same agent identity may have written, or the TB a
-quorum minted, with the earliest draft's claim and every draft's
-evidence; `dismiss_proposal` returns the draft it rejects; and
-`rule_on_objection` returns the objection with its quoted transcript
-line. The two person's acts are reviewed under `hitl` before they run;
-`resolve_uv` and `propose_tombstone` are not.
+them can quote text nobody vouched for: `resolve_uv` and `approve`
+return the UV they attest to and what other sessions approved, and, when
+three sessions nominate it, the nomination addendum with the evidence
+they brought; `propose_tombstone` can return the drafter's earlier open
+draft for a `targetRef`, which another session under the same agent
+identity may have written; `dismiss_proposal` returns the draft it
+rejects; and `rule_on_objection` returns the objection with its quoted
+transcript line. The person's acts are reviewed under `hitl` before they
+run; the agent's `resolve_uv`, `approve` and `propose_tombstone` are not.
 
-A draft needs trusted data, since it can complete a quorum. Drafts filed
-from sessions OpenAPPA doesn't protect still enter the proposal inbox,
-come back out of `list_proposals` as `suspicious`, and become truth when
+A draft and an approval need trusted data, since three sessions' nominate
+and an approval counts toward a promotion. Drafts filed from sessions
+OpenAPPA doesn't protect still enter the proposal inbox, come back out of
+`list_proposals` and `get_docket` as `suspicious`, and become truth when
 a person signs one — through `sign_proposal` (gated here), the terminal
-notary (`stenographer notarize`) or the REST notary routes — or when
-they complete a quorum. The last two notary paths are not MCP tool
-calls, and no OpenAPPA rule sees them.
+notary (`stenographer notarize`), `stenographer review` or the REST
+notary routes. The terminal and REST paths are not MCP tool calls, and
+no OpenAPPA rule sees them.
 
 The ledger is kept outside the trajectory. OpenAPPA labels what a call
 returns, not what the ledger stores, so the battery labels every ledger

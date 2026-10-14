@@ -1,12 +1,11 @@
 /**
- * The agent quorum, switched off (`--agent-quorum off`, config `agentQuorum`).
+ * The agent quorum setting (`--agent-quorum off`, config `agentQuorum`).
  *
- * A host that broadcasts one prompt to several attached sessions makes their
- * agreement correlated, not independent: two of them finding a file and a
- * test is one person's question answered twice. Such a host turns the quorum
- * off, and then only a person settles. The setting lives in the state file,
- * so a session whose process didn't pass the flag obeys it too. Agreeing
- * drafts stay open for a person; agreeing verdicts are raised to one.
+ * Since 1.1 agents settle nothing on any live path (PRD R5): drafts mint
+ * nothing and verdicts are approvals a person completes, whatever the
+ * setting. The setting still governs the library's 1.0 quorum writes
+ * (resolveUvByQuorum, mintTombstoneByQuorum), lives in the state file so
+ * every process on it obeys, and is turned back on only by an operator.
  */
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { createServer, type Server } from 'node:http';
@@ -121,42 +120,41 @@ describe('the ledger keeps the setting, and its quorum writes refuse while it is
   });
 });
 
-describe('propose_tombstone with the quorum off: agreeing drafts wait for a person', () => {
+describe('propose_tombstone, on or off: agreeing drafts wait for a person', () => {
   it('two sessions drafting the same literals from different angles mint nothing; a person signs one', async () => {
     const { s, clock, ledger, engine } = await sessions({ 'sess-a': { agentQuorum: 'off' }, 'sess-b': { agentQuorum: 'off' } });
     const first = await s['sess-a'].call('propose_tombstone', draft());
-    expect(first.status).toBe('awaiting notarization — not truth until a person signs it (the agent quorum is off on this ledger)');
-    expect(first.quorum.quorumOff).toBe(true);
+    expect(first.status).toBe('awaiting notarization — not truth until a person signs it in review: no number of agent sessions mints a TB');
+    expect(first.quorum.quorumOff).toBeUndefined();
 
     clock.now = T0 + 3 * MIN;
     const second = await s['sess-b'].call('propose_tombstone', draft({ evidence: [FILE] }));
-    // A quorum would have formed: with it off, nothing is minted
     expect(second.status).toMatch(/awaiting notarization/);
-    expect(second.status).not.toMatch(/quorum of agent sessions agrees/);
     expect(second.tombstone).toBeUndefined();
-    expect(second.quorum).toMatchObject({ agreeing: 2, missing: [], quorumOff: true });
+    expect(second.quorum).toMatchObject({ agreeing: 2, missing: [] });
     expect(ledger.getStats().tombstones).toBe(0);
     for (const p of [first.proposal, second.proposal]) expect((ledger.getEntry(p.id) as ProposalEntry).body.status).toBe('open');
 
     // The notary path is untouched: a person signs, and that is the TB
     const tb = (await engine.notarizeProposal(second.proposal.id, 'johnnyclem')) as TbEntry;
-    expect(tb.body).toMatchObject({ signedBy: 'johnnyclem', status: 'active' });
+    expect(tb.body).toMatchObject({ signedBy: 'johnnyclem', answerableBy: 'johnnyclem', status: 'active' });
     expect(tb.body.quorum).toBeUndefined();
     expect(ledger.verify().ok).toBe(true);
   });
 
-  it('a session whose process did not pass the flag obeys the ledger', async () => {
+  it('a session whose process did not pass the flag reads the setting from the ledger', async () => {
     const { s, clock, ledger } = await sessions({ desk: { agentQuorum: 'off' }, 'sess-a': {}, 'sess-b': {} });
+    expect(s['sess-a'].server.engine.agentQuorum()).toBe('off');
     await s['sess-a'].call('propose_tombstone', draft());
     clock.now = T0 + MIN;
     const res = await s['sess-b'].call('propose_tombstone', draft({ evidence: [FILE] }));
-    expect(res.quorum.quorumOff).toBe(true);
+    expect(res.status).toMatch(/awaiting notarization/);
     expect(ledger.getStats().tombstones).toBe(0);
   });
 });
 
-describe('resolve_uv with the quorum off: agreeing verdicts are raised to a person', () => {
-  it('two sessions verifying from different angles leave the UV open and raise it', async () => {
+describe('resolve_uv, on or off: agreeing verdicts are approvals a person completes', () => {
+  it('two sessions verifying from different angles leave the UV open, and nobody is paged', async () => {
     const { url, events } = await startChannel();
     const { s, clock, ledger, engine } = await sessions({
       'sess-a': { agentQuorum: 'off' },
@@ -165,39 +163,35 @@ describe('resolve_uv with the quorum off: agreeing verdicts are raised to a pers
     const uv = await engine.assertUv({ assertion: 'LOG_BUDGET is 100 everywhere.', basis: 'the config change', verifyBy: { kind: 'inspect', value: 'config.ts' }, author: 'sam' });
 
     const first = await s['sess-a'].call('resolve_uv', resolve(uv.id, 'verified', [COMMIT]));
-    expect(first.status).toBe('attested');
+    expect(first.status).toBe('approved');
     clock.now = T0 + 5 * MIN;
     const second = await s['sess-b'].call('resolve_uv', resolve(uv.id, 'verified', [FILE]));
-    expect(second.status).toBe('raised');
-    expect(second.detail).toBe('2 agent sessions verified this UV from different angles; the agent quorum is off on this ledger, so a person settles it');
+    expect(second.status).toBe('approved');
+    expect(second.approvals).toMatchObject({ approvers: 2, human: false, missing: ['a human approval'] });
     expect((ledger.getEntry(uv.id) as UvEntry).body.status).toBe('open');
     expect(ledger.getChainedRecords().filter((r) => r.type === 'ADDENDUM')).toEqual([]);
-    expect(events).toHaveLength(1);
-    expect(events[0].meta).toEqual({ kind: 'uv_agents_agree', uv_id: uv.id });
+    expect(events).toHaveLength(0);
 
-    // The verdicts that were raised don't count again: a third agreeing session is raised, not settled
-    clock.now = T0 + 6 * MIN;
-    const third = await s['sess-a'].call('resolve_uv', resolve(uv.id, 'verified', [{ kind: 'test', ref: 'test/config.test.ts' }]));
-    expect(third.status).not.toBe('settled');
-    expect((ledger.getEntry(uv.id) as UvEntry).body.status).toBe('open');
-
-    // A person settles it
-    const settled = await engine.resolveUv(uv.id, 'verified', [FILE], { author: 'johnnyclem' });
-    expect(settled.uv.body.status).toBe('verified');
+    // A person's approval promotes it, with the agents' evidence
+    const promoted = await engine.approveUv({ uvId: uv.id, role: 'human', by: 'johnnyclem' });
+    expect(promoted.status).toBe('promoted');
+    expect((ledger.getEntry(uv.id) as UvEntry).body.status).toBe('verified');
   });
 });
 
 describe("a teammate's ledger", () => {
-  it('a TB their agents settled by quorum still imports: the setting governs what this ledger\'s agents settle', async () => {
-    const { s, clock, ledger } = await sessions({ 'sess-a': {}, 'sess-b': {} });
-    await s['sess-a'].call('propose_tombstone', draft());
-    clock.now = T0 + MIN;
-    const minted = await s['sess-b'].call('propose_tombstone', draft({ evidence: [FILE] }));
-    expect(minted.status).toBe('settled by quorum');
-    const ours = new TruthLedger(new Database(':memory:'));
-    ours.setAgentQuorum('off');
-    expect(importWikiEntries(ours, { lines: exportWikiEntries(ledger).lines })).toMatchObject({ committed: true });
-    expect((ours.getEntry(minted.tombstone.id) as TbEntry).body.status).toBe('active');
+  it('a TB their agents minted under the 1.0 quorum rule is filed for the docket, whatever the setting', async () => {
+    const theirs = new TruthLedger(new Database(':memory:'));
+    const a = theirs.draftTombstone(draft(), { author: AGENT, agentSessionId: 'sess-a', timestamp: new Date(T0).toISOString() });
+    const b = theirs.draftTombstone(draft({ evidence: [FILE] }), { author: AGENT, agentSessionId: 'sess-b', timestamp: new Date(T0 + MIN).toISOString() });
+    const minted = theirs.mintTombstoneByQuorum([a.id, b.id], { author: AGENT, agentSessionId: 'sess-b', timestamp: new Date(T0 + MIN).toISOString() });
+    for (const setting of ['on', 'off'] as const) {
+      const ours = new TruthLedger(new Database(':memory:'));
+      ours.setAgentQuorum(setting);
+      const result = importWikiEntries(ours, { lines: exportWikiEntries(theirs).lines });
+      expect(result).toMatchObject({ committed: true, proposals: [{ id: minted.id, reason: 'agent-quorum' }] });
+      expect(ours.getEntry(minted.id)).toBeNull();
+    }
   });
 });
 
@@ -209,7 +203,7 @@ describe('who turns it back on', () => {
     ).toThrow(/only the operator profile turns it back on/);
   });
 
-  it('the operator profile turns it back on, and agreeing drafts settle again', async () => {
+  it('the operator profile turns it back on; agreeing drafts still mint nothing', async () => {
     const { s, clock, ledger, statePath } = await sessions({ 'sess-a': { agentQuorum: 'off' }, 'sess-b': {} });
     const operator = new StenographerServer({ logPath: join(dir!, 'op.jsonl'), statePath, mode: 'catchup', embeddingModel: 'hashed', profile: 'operator', agentQuorum: 'on' });
     servers.push(operator);
@@ -217,12 +211,13 @@ describe('who turns it back on', () => {
     await s['sess-a'].call('propose_tombstone', draft());
     clock.now = T0 + MIN;
     const res = await s['sess-b'].call('propose_tombstone', draft({ evidence: [FILE] }));
-    expect(res.status).toBe('settled by quorum');
+    expect(res.status).toMatch(/awaiting notarization/);
+    expect(ledger.getStats().tombstones).toBe(0);
   });
 });
 
 describe('what the agent is told', () => {
-  it('its initialize instructions and tool descriptions say only a person settles', async () => {
+  it('its initialize instructions and tool descriptions say only a person settles, on or off', async () => {
     dir = mkdtempSync(join(tmpdir(), 'steno-quorum-off-'));
     writeFileSync(join(dir, 'log.jsonl'), '');
     const server = new StenographerServer({ logPath: join(dir, 'log.jsonl'), statePath: ':memory:', mode: 'catchup', embeddingModel: 'hashed', agentQuorum: 'off' });
@@ -231,15 +226,15 @@ describe('what the agent is told', () => {
     await server.connect(serverSide);
     const client = new Client({ name: 'claude-code', version: '1.0.0' });
     await client.connect(clientSide);
-    expect(client.getInstructions()).toMatch(/the agent quorum is off: nothing an agent files settles a claim, however many agree; only a person signs or resolves/);
+    expect(client.getInstructions()).toMatch(/Your claim is a UV until a person approves it/);
     expect(client.getInstructions()).not.toMatch(/two or more agent sessions agree/);
     const { tools } = await client.listTools();
     const description = (name: string) => tools.find((t) => t.name === name)!.description!;
-    expect(description('propose_tombstone')).toMatch(/becomes truth only when a person signs it: the agent quorum is off/);
+    expect(description('propose_tombstone')).toMatch(/becomes truth only when a person signs it in review/);
     expect(description('propose_tombstone')).not.toMatch(/settled by quorum/);
-    expect(description('resolve_uv')).toMatch(/the UV is raised to a person/);
+    expect(description('resolve_uv')).toMatch(/a person rules/);
     const res = (await client.callTool({ name: 'assert_tombstone', arguments: { claim: 'x', evidence: [COMMIT] } })) as { isError?: boolean; content: Array<{ text: string }> };
-    expect(res.content[0].text).toMatch(/when a person signs it \(the agent quorum is off/);
+    expect(res.content[0].text).toMatch(/when a person signs it in review/);
   });
 });
 

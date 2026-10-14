@@ -12,6 +12,7 @@ import { TruthLedger } from '../truth/ledger.js';
 import { ensureObjectionSchema } from '../truth/objections.js';
 import { ensureDeliverySchema } from '../truth/delivery.js';
 import { ensureAttestationSchema } from '../truth/attestations.js';
+import { ensureApprovalSchema } from '../truth/approvals.js';
 
 export type Migration = (db: Database.Database) => void;
 
@@ -196,8 +197,11 @@ export const MIGRATIONS: Migration[] = [
   // rests on. The ledger's setup adds them and backfills existing rows,
   // without rewriting anything the chain covers; this step records that a
   // 1.0 build must not open the file, since it would write no standing.
+  // Approvals (1.1, PRD R5) wait in uv_approvals until a promotion writes
+  // them into a TB: operational state like attestations.
   (db) => {
     TruthLedger.ensureSchema(db);
+    ensureApprovalSchema(db);
   },
 ];
 

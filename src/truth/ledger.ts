@@ -21,6 +21,7 @@ import { deriveAll, deriveStanding, deriveStatus, deriveStruck, recordedStatus, 
 import { checkQuorum, hasAgentPrefix, literalSetKey, quorumEvidence, type AgentClassifier, type QuorumMember } from './quorum.js';
 import { contentHash, premisesOf, type PremiseRef } from './derivation.js';
 import { INBOUND_LINKS, LINE_BODY_FIELDS, LINE_ENVELOPE_FIELDS, OUTBOUND_LINKS } from './format.js';
+import { DERIVATION_DETECTOR, detectSuspects, triggersSuspicion, type SuspectPremise } from './suspicion.js';
 import { TruthWriteError } from './errors.js';
 import {
   ulid,
@@ -63,6 +64,7 @@ import {
   type FiledRulingKind,
   type Premise,
   type Standing,
+  type Approval,
   InferenceSchema,
   MAX_PREMISES,
 } from './types.js';
@@ -175,6 +177,15 @@ const QuorumMemberSchema = z.object({
  */
 const AddendumQuorumMemberSchema = QuorumMemberSchema.extend({ verdict: z.enum(['verified', 'refuted']).optional() });
 
+/** An approval as a promoted TB stores it (spec, Approvals). Who may approve is the approvals path's (approvals.ts). */
+const ApprovalSchema = z.object({
+  by: z.string().min(1),
+  role: z.string().min(1),
+  ts: z.string().refine(isRfc3339DateTime, "an approval's ts is an RFC 3339 date-time naming a real time"),
+  agentSessionId: z.string().optional(),
+  cites: z.array(z.string().min(1)).optional(),
+});
+
 // What admit() checks, per entry type. Bodies are checked as stored: the
 // same building blocks the write-time input schemas use (types.ts), without
 // their transforms, so a validated body is stored exactly as given.
@@ -189,6 +200,8 @@ const STORED_BODY: Partial<Record<TruthEntryType, z.ZodTypeAny>> = {
       literals: z.array(TombstonedLiteralSchema).optional(),
       quorum: z.array(QuorumMemberSchema).optional(),
       inference: InferenceSchema.optional(),
+      answerableBy: z.string().min(1).optional(),
+      approvals: z.array(ApprovalSchema).min(1).optional(),
       // Recorded by a pre-1.0 ledger or a v1 wiki line; a terminal one is a floor (status.ts)
       status: z.enum(TB_STATUSES).optional(),
       extra: extraFields('TB'),
@@ -220,6 +233,7 @@ const STORED_BODY: Partial<Record<TruthEntryType, z.ZodTypeAny>> = {
       target: z.string().min(1),
       objectionId: z.string().min(1).optional(),
       outcome: z.enum(['sustained', 'overruled']).optional(),
+      answerableBy: z.string().min(1).optional(),
       extra: extraFields('RULING'),
     })
     .strict(),
@@ -243,6 +257,8 @@ const LINK_TARGET: Partial<Record<LinkType, readonly TruthEntryType[]>> = {
   dismisses: ['PROPOSAL'],
   // A premise is a TB or a UV the ledger holds (a precedent ruling, when those exist)
   derives: ['TB', 'UV'],
+  // A nomination corroborates a UV (spec, Nomination)
+  corroborates: ['UV'],
 };
 
 const HEX64 = /^[0-9a-f]{64}$/;
@@ -568,7 +584,8 @@ export class TruthLedger {
    * belongs to the backfill path and 'detector:*' to the pipelines that file
    * proposals (`allowDetector`). Returns the canonical (stored) form.
    */
-  private accountable(identity: string, role: string, opts: { allowDetector?: boolean } = {}): string {
+  /** The canonical form of an identity that may act as `role`, or a TruthWriteError: the floor every write path checks. */
+  accountable(identity: string, role: string, opts: { allowDetector?: boolean } = {}): string {
     if (typeof identity !== 'string' || isAnonymousIdentity(identity)) {
       throw new TruthWriteError(
         `${role} '${identity}' is not an accountable identity — anonymous writes are rejected at the schema level`
@@ -634,6 +651,16 @@ export class TruthLedger {
         `contempt of corpus: ${action} of ${target.id} traces to the same agent session (${session}) as its target — one opinion wearing two hats is not two witnesses`
       );
     }
+  }
+
+  /**
+   * The contempt rule, for a path outside the ledger that records an act
+   * on an entry before anything is written (an approval, approvals.ts):
+   * `actor` may not stand behind `target` as author, signer, drafter or
+   * agent session. Throws ContemptError.
+   */
+  assertIndependent(actor: { author: string; signedBy?: string | null; agentSessionId?: string | null }, target: TruthEntry, action: string): void {
+    this.requireIndependence(actor, target, action);
   }
 
   /**
@@ -957,6 +984,12 @@ export class TruthLedger {
         `a TB signed by agent '${body.signedBy}' needs a quorum: agents settle a claim only as two or more agent ` +
           'sessions agreeing from different angles within 15 minutes, or a person signs it'
       );
+    }
+    if (entry.type === 'ADDENDUM' && own.some((l) => l.type === 'corroborates')) {
+      // A nomination (spec, Nomination): three or more agent sessions, and nothing else on the line
+      if (body.quorum === undefined) fail('a nomination (an ADDENDUM with a corroborates link) carries the quorum of agent sessions that nominated');
+      if (own.some((l) => l.type !== 'corroborates')) fail('a nomination settles nothing: an ADDENDUM with a corroborates link carries no other link');
+      if (own.length !== 1) fail('a nomination corroborates one UV');
     }
     if (entry.type === 'ADDENDUM' && this.isAgent(entry.author)) {
       if (own.some((l) => l.type === 'overrides')) {
@@ -1320,7 +1353,8 @@ export class TruthLedger {
     // What the notary changed is theirs to cite: a wiki ref an edit adds must resolve
     if (edits?.evidence !== undefined) this.requireCitedEvidence(edits.evidence);
     if (proposal.body.kind === 'tombstone') {
-      return this.insertTb(TbInputSchema.parse({ ...draft, signedBy }), writeCtx, signs, { signed: true });
+      const parsed = TbInputSchema.parse({ ...draft, signedBy });
+      return this.insertTb({ ...parsed, ...(this.isAgent(signedBy) ? {} : { answerableBy: signedBy }) }, writeCtx, signs, { signed: true });
     }
     return this.insertUv(UvInputSchema.parse(draft), writeCtx, signs, { signed: true });
   }
@@ -1364,7 +1398,8 @@ export class TruthLedger {
   ): TbEntry {
     const parsed = TbInputSchema.parse(input);
     const author = this.accountable(ctx.author, 'author');
-    return this.insertTb(parsed, { ...ctx, author });
+    // A TB a person asserts directly is answered for by that person; an agent's TB (a quorum) names nobody
+    return this.insertTb({ ...parsed, ...(this.isAgent(parsed.signedBy) ? {} : { answerableBy: parsed.signedBy }) }, { ...ctx, author });
   }
 
   assertUv(
@@ -1395,6 +1430,10 @@ export class TruthLedger {
       quorum?: QuorumMember[];
       premises?: Premise[];
       inference?: string;
+      /** The person who answers for it (spec, Answerability): the signer, unless the TB names nobody (a quorum TB). */
+      answerableBy?: string;
+      /** A promoted TB: who approved the UV it was promoted from. */
+      approvals?: Approval[];
     },
     ctx: WriteContext,
     links: Array<{ toId: string; type: LinkType }> = [],
@@ -1419,6 +1458,8 @@ export class TruthLedger {
           ...(input.literals && input.literals.length > 0 ? { literals: input.literals } : {}),
           ...(input.quorum ? { quorum: input.quorum } : {}),
           ...(input.premises ? { inference: input.inference } : {}),
+          ...(input.answerableBy ? { answerableBy: input.answerableBy } : {}),
+          ...(input.approvals && input.approvals.length > 0 ? { approvals: input.approvals } : {}),
         } satisfies Omit<TbBody, 'status'>,
       },
       TruthLedger.outbound(id, [...links, ...TruthLedger.derivesLinks(input.premises)]),
@@ -1560,6 +1601,10 @@ export class TruthLedger {
         },
         TruthLedger.outbound(id, [{ toId: uvId, type: resolution === 'verified' ? 'verifies' : 'refutes' }])
       );
+      this.fileSuspicion(
+        { id, evidence: quorumEvidence(members), links: TruthLedger.outbound(id, [{ toId: uvId, type: resolution === 'verified' ? 'verifies' : 'refutes' }]) },
+        ctx.timestamp ?? new Date().toISOString()
+      );
       return id;
     });
     return { uv: this.getEntry(uvId) as UvEntry, addendum: this.getEntry(addendumId) as AddendumEntry };
@@ -1630,8 +1675,18 @@ export class TruthLedger {
     uvId: string,
     resolution: 'verified' | 'refuted',
     evidence: Evidence[],
-    ctx: WriteContext & { signedBy?: string; opinion?: string; mintTombstone?: string; allowMint?: boolean }
-  ): { uv: UvEntry; addendum: AddendumEntry; tombstone: TbEntry | null; ruling: RulingEntry | null } {
+    ctx: WriteContext & {
+      signedBy?: string;
+      opinion?: string;
+      mintTombstone?: string;
+      allowMint?: boolean;
+      /**
+       * A promotion (approvals.ts): the TB carries the approvals, is answered
+       * for by its signer, and keeps the UV's derivation and supersedes it.
+       */
+      promotion?: { approvals: Approval[] };
+    }
+  ): { uv: UvEntry; addendum: AddendumEntry; tombstone: TbEntry | null; ruling: RulingEntry | null; suspects: ProposalEntry[] } {
     const author = this.accountable(ctx.author, 'resolver');
     const signedBy = ctx.signedBy ? this.accountable(ctx.signedBy, 'signer') : undefined;
     ctx = { ...ctx, author, signedBy };
@@ -1644,6 +1699,9 @@ export class TruthLedger {
     const mintsTb = Boolean(
       (resolution === 'verified' && contestedTb) || ctx.mintTombstone
     );
+    if (ctx.promotion && !(resolution === 'verified' && mintsTb && signedBy)) {
+      throw new TruthWriteError('a promotion verifies the UV and mints its TB under a person\'s signature');
+    }
     if (mintsTb && ctx.allowMint === false) {
       throw new NotarizationRequiredError(
         contestedTb && resolution === 'verified'
@@ -1659,13 +1717,17 @@ export class TruthLedger {
       );
     }
 
-    const { addendumId, tombstoneId, rulingId } = this.tx(() => {
+    const { addendumId, tombstoneId, rulingId, suspects } = this.tx(() => {
       const now = ctx.timestamp ?? new Date().toISOString();
 
       // The addendum resolves the UV and, verifying a contest, overrides its
       // TB. A refuted contest needs no link to the TB: with the UV no longer
       // open, the contest stops counting, and an override never un-counts.
       const addendumId = ulid();
+      const addendumLinks = TruthLedger.outbound(addendumId, [
+        { toId: uvId, type: resolution === 'verified' ? 'verifies' : 'refutes' },
+        ...(contestedTb && resolution === 'verified' ? [{ toId: contestedTb.id, type: 'overrides' as const }] : []),
+      ]);
       this.append(
         {
           id: addendumId,
@@ -1677,11 +1739,10 @@ export class TruthLedger {
           origin: 'local',
           body: { evidence: parsedEvidence, note: ctx.opinion ?? null },
         },
-        TruthLedger.outbound(addendumId, [
-          { toId: uvId, type: resolution === 'verified' ? 'verifies' : 'refutes' },
-          ...(contestedTb && resolution === 'verified' ? [{ toId: contestedTb.id, type: 'overrides' as const }] : []),
-        ])
+        addendumLinks
       );
+      // What the refutation (or the override of a contested TB) says about the premises underneath (R4)
+      const suspects = this.fileSuspicion({ id: addendumId, evidence: parsedEvidence, links: addendumLinks }, now);
 
       let tombstoneId: string | null = null;
       if (mintsTb) {
@@ -1691,16 +1752,27 @@ export class TruthLedger {
           (resolution === 'verified' && contestedTb
             ? `Overridden: "${contestedTb.body.claim}" — contradicted by verified assertion: ${uv.body.assertion}`
             : `Refuted: "${uv.body.assertion}"`);
-        const supersedes =
-          resolution === 'verified' && contestedTb
-            ? contestedTb.id
-            : resolution === 'refuted'
-              ? uvId // the correction is discoverable from the refuted UV
-              : null;
+        const supersedes = [
+          ...(resolution === 'verified' && contestedTb ? [contestedTb.id] : []),
+          // The correction is discoverable from the refuted UV; a promotion replaces the UV it came from
+          ...(resolution === 'refuted' || ctx.promotion ? [uvId] : []),
+        ];
+        // A promoted TB keeps the UV's derivation: the same premises, pinned as the UV pinned them
+        const premises = ctx.promotion
+          ? uv.links.filter((l) => l.type === 'derives' && l.fromId === uv.id).map((l) => ({ id: l.toId, contentHash: l.contentHash! }))
+          : [];
         const tb = this.insertTb(
-          { claim, evidence: parsedEvidence, signedBy: signer },
+          {
+            claim,
+            evidence: parsedEvidence,
+            signedBy: signer,
+            // Every TB a person signs is answered for by that person (spec, Answerability)
+            ...(this.isAgent(signer) ? {} : { answerableBy: signer }),
+            ...(ctx.promotion ? { approvals: ctx.promotion.approvals } : {}),
+            ...(premises.length > 0 ? { premises, inference: uv.body.inference } : {}),
+          },
           { ...ctx, timestamp: now, embedding: ctx.embedding },
-          supersedes ? [{ toId: supersedes, type: 'supersedes' }] : []
+          supersedes.map((toId) => ({ toId, type: 'supersedes' as const }))
         );
         tombstoneId = tb.id;
       }
@@ -1714,7 +1786,7 @@ export class TruthLedger {
         );
       }
 
-      return { addendumId, tombstoneId, rulingId };
+      return { addendumId, tombstoneId, rulingId, suspects };
     });
 
     return {
@@ -1722,6 +1794,7 @@ export class TruthLedger {
       addendum: this.getEntry(addendumId) as AddendumEntry,
       tombstone: tombstoneId ? (this.getEntry(tombstoneId) as TbEntry) : null,
       ruling: rulingId ? (this.getEntry(rulingId) as RulingEntry) : null,
+      suspects,
     };
   }
 
@@ -1738,7 +1811,7 @@ export class TruthLedger {
     tbId: string,
     addendum: { evidence: Evidence[]; note?: string },
     ctx: WriteContext
-  ): { tombstone: TbEntry; addendum: AddendumEntry } {
+  ): { tombstone: TbEntry; addendum: AddendumEntry; suspects: ProposalEntry[] } {
     ctx = { ...ctx, author: this.accountable(ctx.author, 'author') };
     const parsedEvidence = addendum.evidence.map((e) => EvidenceSchema.parse(e));
     if (parsedEvidence.length === 0) {
@@ -1752,22 +1825,28 @@ export class TruthLedger {
     }
 
     const addendumId = ulid();
-    this.append(
-      {
-        id: addendumId,
-        type: 'ADDENDUM',
-        createdAt: ctx.timestamp ?? new Date().toISOString(),
-        author: ctx.author,
-        provenance: ctx.provenance ?? MANUAL,
-        agentSessionId: ctx.agentSessionId ?? null,
-        origin: 'local',
-        body: { evidence: parsedEvidence, note: addendum.note ?? null },
-      },
-      TruthLedger.outbound(addendumId, [{ toId: tbId, type: 'overrides' }])
-    );
+    const suspects = this.tx(() => {
+      const now = ctx.timestamp ?? new Date().toISOString();
+      const links = TruthLedger.outbound(addendumId, [{ toId: tbId, type: 'overrides' }]);
+      this.append(
+        {
+          id: addendumId,
+          type: 'ADDENDUM',
+          createdAt: now,
+          author: ctx.author,
+          provenance: ctx.provenance ?? MANUAL,
+          agentSessionId: ctx.agentSessionId ?? null,
+          origin: 'local',
+          body: { evidence: parsedEvidence, note: addendum.note ?? null },
+        },
+        links
+      );
+      return this.fileSuspicion({ id: addendumId, evidence: parsedEvidence, links }, now);
+    });
     return {
       tombstone: this.getEntry(tbId) as TbEntry,
       addendum: this.getEntry(addendumId) as AddendumEntry,
+      suspects,
     };
   }
 
@@ -1810,6 +1889,7 @@ export class TruthLedger {
             claim: `Contempt of corpus: ${input.target} — ${input.opinion}`,
             evidence: [{ kind: 'wiki', ref: rulingId, detail: 'contempt ruling' }],
             signedBy: ctx.author,
+            answerableBy: ctx.author,
           },
           ctx
         );
@@ -1860,6 +1940,7 @@ export class TruthLedger {
           target: input.tbId,
           objectionId: input.objectionId,
           outcome: input.outcome,
+          answerableBy: ctx.author,
         },
       },
       [],
@@ -1904,7 +1985,8 @@ export class TruthLedger {
         provenance: ctx.provenance ?? MANUAL,
         agentSessionId: ctx.agentSessionId ?? null,
         origin: 'local',
-        body: { kind: input.kind, opinion: input.opinion, target: input.target },
+        // A ruling is answered for by the person who filed it (spec, Answerability)
+        body: { kind: input.kind, opinion: input.opinion, target: input.target, answerableBy: ctx.author },
       },
       TruthLedger.outbound(id, links),
       { embedding: ctx.embedding }
@@ -2011,7 +2093,10 @@ export class TruthLedger {
    * an agent's verification of a contest (which would override its TB), is
    * 'held': nothing is written, and a later import retries it.
    */
-  importChange(entry: NewEntry, links: TruthLink[]): { outcome: 'inserted' | 'unchanged' } | { outcome: 'held'; reason: string } {
+  importChange(
+    entry: NewEntry,
+    links: TruthLink[]
+  ): { outcome: 'inserted'; suspects: ProposalEntry[] } | { outcome: 'unchanged' } | { outcome: 'held'; reason: string } {
     return this.atomically(() => {
       if (entry.type !== 'ADDENDUM' && entry.type !== 'RULING') {
         throw new TruthWriteError(`entry ${entry.id}: only an ADDENDUM or RULING changes a status, not a ${entry.type}`);
@@ -2053,8 +2138,136 @@ export class TruthLedger {
         throw err;
       }
       this.append(entry, links, { imported: true });
-      return { outcome: 'inserted' as const };
+      // Each ledger that applies a refutation runs the suspicion detector itself: proposals never travel
+      const body = entry.body as { evidence?: Evidence[] };
+      const suspects = entry.type === 'ADDENDUM' && Array.isArray(body.evidence) ? this.fileSuspicion({ id: entry.id, evidence: body.evidence, links }, entry.createdAt) : [];
+      return { outcome: 'inserted' as const, suspects };
     });
+  }
+
+  // ─────────────────────────────────────────────────────────
+  // Suspicion (R4), nomination (R5) and what the docket reads
+  // ─────────────────────────────────────────────────────────
+
+  /**
+   * After an ADDENDUM that refutes a UV or overrides a TB: files the
+   * detector's proposals against the pinned premises of what it falsified
+   * (suspicion.ts), once per falsified entry and premise. Runs inside the
+   * write's transaction. Returns the proposals filed now.
+   */
+  private fileSuspicion(addendum: { id: string; evidence: Evidence[]; links: TruthLink[] }, timestamp: string): ProposalEntry[] {
+    if (!triggersSuspicion(addendum.evidence)) return [];
+    const filed: ProposalEntry[] = [];
+    for (const link of addendum.links) {
+      if (link.fromId !== addendum.id || (link.type !== 'refutes' && link.type !== 'overrides')) continue;
+      const falsified = this.getEntry(link.toId);
+      if (!falsified || (falsified.type !== 'TB' && falsified.type !== 'UV')) continue;
+      const pinned = this.premisesOf(falsified.id).filter((p) => p.kind === 'derives');
+      if (pinned.length === 0) continue;
+      const premises = pinned.flatMap((p): SuspectPremise[] => {
+        const entry = this.getEntry(p.id);
+        if (!entry) return [];
+        const body = entry.body as { claim?: string; assertion?: string; opinion?: string; status?: string | null };
+        // Other falsified entries resting on the same premise: a premise shared by two failures ranks first
+        const sharedWith = this.dependentsOf(p.id)
+          .filter((d) => d.kind === 'derives' && d.id !== falsified.id)
+          .map((d) => this.getEntry(d.id))
+          .filter((d): d is TruthEntry => Boolean(d) && isDead({ type: d!.type, body: d!.body as { status?: unknown }, struck: this.isStruck(d!.id) }))
+          .map((d) => d.id);
+        return [
+          {
+            id: entry.id,
+            type: entry.type,
+            status: body.status ?? null,
+            struck: this.isStruck(entry.id),
+            derived: this.premisesOf(entry.id).some((q) => q.kind === 'derives'),
+            text: body.claim ?? body.assertion ?? body.opinion ?? '',
+            sharedWith,
+          },
+        ];
+      });
+      const text = (falsified.body as { claim?: string; assertion?: string }).claim ?? (falsified.body as { assertion?: string }).assertion ?? '';
+      const { proposals } = detectSuspects({
+        falsified: { id: falsified.id, type: falsified.type, text, outcome: link.type === 'refutes' ? 'refuted' : 'overridden' },
+        evidence: addendum.evidence,
+        premises,
+      });
+      for (const p of proposals) {
+        // Raised once per falsified entry and premise, whatever became of the earlier proposal (dismissed closes the review)
+        if (this.proposalsFor(p.targetRef).some((e) => identityKey(e.author) === DERIVATION_DETECTOR)) continue;
+        filed.push(
+          this.addProposal(
+            { kind: 'uv', draft: p.draft, signal: p.signal, targetRef: p.targetRef, requiresNotary: false },
+            { author: DERIVATION_DETECTOR, provenance: { kind: 'wiki', ref: addendum.id }, timestamp }
+          )
+        );
+      }
+    }
+    return filed;
+  }
+
+  /**
+   * Nominates an open UV (spec, Nomination): one ADDENDUM with a
+   * `corroborates` link, carrying the three or more agent sessions that
+   * approved it from different angles as its `quorum` (each with verdict
+   * `verified`), written by the agent whose approval completed it. The UV's
+   * status doesn't change: it reads as `corroborated`, and waits for a
+   * person. Admission checks the nomination's rules.
+   */
+  nominateUv(uvId: string, members: QuorumMember[], ctx: WriteContext): { uv: UvEntry; addendum: AddendumEntry } {
+    const author = this.accountable(ctx.author, 'nominator');
+    const addendumId = this.tx(() => {
+      const uv = this.mustGetTyped<UvEntry>(uvId, 'UV');
+      if (uv.body.status !== 'open') throw new TruthWriteError(`UV ${uvId} is already ${uv.body.status}`);
+      if (this.isStruck(uvId)) throw new TruthWriteError(`UV ${uvId} is struck`);
+      if (this.isCorroborated(uvId)) throw new TruthWriteError(`UV ${uvId} is already nominated`);
+      const quorum = members.map((m) => ({ ...m, evidence: m.evidence.map((e) => EvidenceSchema.parse(e)), verdict: 'verified' as const }));
+      const id = ulid();
+      this.append(
+        {
+          id,
+          type: 'ADDENDUM',
+          createdAt: ctx.timestamp ?? new Date().toISOString(),
+          author,
+          provenance: ctx.provenance ?? MANUAL,
+          agentSessionId: ctx.agentSessionId ?? null,
+          origin: 'local',
+          body: { evidence: quorumEvidence(quorum), note: `Nominated by ${quorum.length} agent sessions for a person's review.`, quorum },
+        },
+        TruthLedger.outbound(id, [{ toId: uvId, type: 'corroborates' }])
+      );
+      return id;
+    });
+    return { uv: this.getEntry(uvId) as UvEntry, addendum: this.getEntry(addendumId) as AddendumEntry };
+  }
+
+  /** Whether a UV was nominated: a `corroborates` link into it from an ADDENDUM that isn't struck. */
+  isCorroborated(uvId: string): boolean {
+    const row = this.db
+      .prepare(
+        `SELECT 1 FROM truth_links l JOIN truth_entries e ON e.id = l.from_id
+         WHERE l.to_id = ? AND l.link_type = 'corroborates' AND e.struck = 0 LIMIT 1`
+      )
+      .get(uvId);
+    return Boolean(row);
+  }
+
+  /**
+   * Open UVs that are pinned premises of a refuted UV or an overridden TB
+   * (R4): the detector files no proposal against them, and they go first in
+   * the verification queue.
+   */
+  suspectUvs(): Set<string> {
+    const rows = this.db
+      .prepare(
+        `SELECT DISTINCT p.premise_id AS id FROM truth_premises p
+         JOIN truth_entries d ON d.id = p.entry_id
+         JOIN truth_entries u ON u.id = p.premise_id
+         WHERE p.kind = 'derives' AND u.type = 'UV' AND u.status = 'open' AND u.struck = 0
+           AND ((d.type = 'UV' AND d.status = 'refuted') OR (d.type = 'TB' AND d.status = 'overridden'))`
+      )
+      .all() as Array<{ id: string }>;
+    return new Set(rows.map((r) => r.id));
   }
 
   /** Every PROPOSAL filed against `targetRef`, in any status, oldest first. */
@@ -2278,6 +2491,9 @@ export class TruthLedger {
       row.type === 'TB' || row.type === 'UV'
         ? { ...this.standingOf(row.id, standingMemo), contentHash: contentHash(row.type, row.author, stored) }
         : {};
+    // A nominated UV: a corroborates link into it from an ADDENDUM that isn't struck
+    const corroborated =
+      row.type === 'UV' && links.some((l) => l.to_id === row.id && l.link_type === 'corroborates') && this.isCorroborated(row.id) ? { corroborated: true as const } : {};
     return {
       id: row.id,
       type: row.type,
@@ -2294,6 +2510,7 @@ export class TruthLedger {
         ...(l.content_hash ? { contentHash: l.content_hash } : {}),
       })),
       ...derivation,
+      ...corroborated,
     };
   }
 }
