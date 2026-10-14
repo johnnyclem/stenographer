@@ -560,6 +560,19 @@ export class StenographerServer {
         run: () => e.getContestedTruth(),
       }),
       tool({
+        name: 'get_derivation',
+        description:
+          'The derivation tree of a truth entry: what it rests on (direction "down", the default: its pinned premises and ' +
+          'the entries its evidence cites, all the way down) or what rests on it ("up"). Each node carries its status, ' +
+          'standing, signer and answerable person, and a failing premise is marked (failing: premise-struck, ' +
+          'premise-overridden, premise-refuted, premise-open, premise-under-appeal or premise-missing). This is the answer ' +
+          'to "why is this clouded or unsupported": the exact premise that failed and who signed it. Null for an id the ' +
+          'ledger does not hold.',
+        input: args({ id: Id('The entry id'), direction: z.enum(['down', 'up']).describe('Premises below it, or entries above it').default('down') }),
+        annotations: READ_ONLY,
+        run: ({ id, direction }) => e.getDerivation(id, direction),
+      }),
+      tool({
         name: 'get_truth',
         description:
           'Truth-ledger entries by filter (default "current": active/contested TBs and open UVs; struck, ' +

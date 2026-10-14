@@ -124,7 +124,10 @@ export function formatObjection(o: Objection): string {
     `Exhibit ${tb.id} (signed by ${tb.body.signedBy ?? 'migration'}): ${tb.body.claim}`,
   ];
   if (o.exhibit.contestedBy.length > 0) {
-    lines.push(`Contested by: ${o.exhibit.contestedBy.map((uv) => `${uv.id} — ${uv.body.assertion}`).join('; ')}`);
+    lines.push(`Under appeal: ${o.exhibit.contestedBy.map((uv) => `${uv.id} — ${uv.body.assertion}`).join('; ')}`);
+  }
+  if (o.weakness === 'clouded' && tb.reasons && tb.reasons.length > 0) {
+    lines.push(`Clouded: ${tb.reasons.map((r) => `${r.reason} ${r.premise}${r.via ? ` (via ${r.via})` : ''}`).join('; ')}`);
   }
   lines.push(
     `If the objection is right, correct course; if it is wrong or immaterial, say so. A person rules on it with rule_on_objection(objectionId: "${o.id}") in the operator profile.`

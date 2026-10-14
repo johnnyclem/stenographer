@@ -24,6 +24,7 @@
 
 import type Database from 'better-sqlite3';
 import { ulid, type TbEntry, type UvEntry, type TombstonedLiteral } from './types.js';
+import { displayStatus } from './format.js';
 import type { TruthLedger } from './ledger.js';
 import type { ConversationMessage } from '../types.js';
 import { LiteralMatcher, MatchDeadlineError } from './literal-matcher.js';
@@ -54,8 +55,30 @@ export interface Objection {
   /** False for shadow-mode objections: recorded and rulable, never emitted on /flags. */
   delivered: boolean;
   rulingId: string | null;
+  /**
+   * Set when the TB was weak when the objection was raised: under appeal
+   * (status contested) or clouded (standing clouded). Such an objection is
+   * recorded in shadow and never delivered, and the gate lets the call
+   * through (R3); 1.0 denied on a contested TB, so this says which denials
+   * stopped.
+   */
+  weakness?: TombstoneWeakness;
   /** Set when the pre-dispatch gate raised it, before the call ran. */
   gate?: GateCall;
+}
+
+/** Why a TB raises only a shadow objection: it is under appeal, or clouded. */
+export type TombstoneWeakness = 'under appeal' | 'clouded';
+
+/**
+ * A matchable TB's weakness, if any: under appeal (its status is
+ * `contested`), or clouded (its standing is). A sound, active TB has none;
+ * an unsupported TB never reaches the matcher (TruthLedger.getMatchableTombstones).
+ */
+export function tombstoneWeakness(tb: TbEntry): TombstoneWeakness | null {
+  if (tb.body.status === 'contested') return 'under appeal';
+  if (tb.standing === 'clouded') return 'clouded';
+  return null;
 }
 
 /** The tool call a gate objection was raised against. */
@@ -163,6 +186,8 @@ interface ActiveLiteral {
   literal: TombstonedLiteral;
   /** Ledger order (TB, then literal): the order objections are raised in. */
   order: number;
+  /** Set when the TB is under appeal or clouded: a hit is a shadow objection, never a denial. */
+  weakness: TombstoneWeakness | null;
 }
 
 /** The active TBs and their literals, compiled into one matcher. */
@@ -173,7 +198,7 @@ export interface CompiledTombstones {
 
 /** Compiles the literals of `tombstones` (in order) into one matcher. */
 export function compileTombstones(tombstones: TbEntry[]): CompiledTombstones {
-  const literals = tombstones.flatMap((tb) => (tb.body.literals ?? []).map((literal) => ({ tb, literal })));
+  const literals = tombstones.flatMap((tb) => (tb.body.literals ?? []).map((literal) => ({ tb, literal, weakness: tombstoneWeakness(tb) })));
   return { tombstones, matcher: new LiteralMatcher(literals.map((l, order) => ({ key: { ...l, order }, literal: l.literal }))) };
 }
 
@@ -253,7 +278,8 @@ export class ObjectionLog {
 
     const raised: Objection[] = [];
     for (const [key, hit] of [...found].sort(([a], [b]) => a.order - b.order)) {
-      const objection = this.record(sessionId, msg.id, key.tb, key.literal, hit, mode === 'deliver');
+      // A weak TB (under appeal, clouded) is recorded in shadow, never delivered
+      const objection = this.record(sessionId, msg.id, key.tb, key.literal, hit, mode === 'deliver' && key.weakness === null);
       if (objection) raised.push(objection);
     }
     return raised;
@@ -289,7 +315,8 @@ export class ObjectionLog {
         : [];
     const what = literal.subject ? `${literal.subject} = ${literal.dead}` : literal.dead;
     const replacement = literal.current ? `; current value: ${literal.current}` : '';
-    const asterisk = contestedBy.length > 0 ? ' (TB is contested — see exhibit)' : '';
+    const weakness = tombstoneWeakness(tb);
+    const asterisk = weakness ? ` (TB is ${weakness} — see exhibit)` : '';
 
     const id = ulid();
     const createdAt = new Date().toISOString();
@@ -299,6 +326,7 @@ export class ObjectionLog {
       exhibit: { tombstone: tb, contestedBy },
       transcriptLine: hit.line,
       source: hit.source,
+      ...(weakness ? { weakness } : {}),
       ...(gate ? { gate } : {}),
     };
 
@@ -417,8 +445,14 @@ function rowToObjection(row: any): Objection {
     status: row.status,
     delivered: row.delivered === 1,
     rulingId: row.ruling_id ?? null,
+    ...(record.weakness ? { weakness: record.weakness } : {}),
     ...(record.gate ? { gate: record.gate } : {}),
   };
+}
+
+/** The status a person reads on an objection's exhibit: under appeal for a contested TB. */
+export function exhibitStatus(o: Objection): string {
+  return displayStatus(o.exhibit.tombstone.body.status);
 }
 
 const settledKey = (tbId: string, dead: string): string => `${tbId}\u0000${dead}`;

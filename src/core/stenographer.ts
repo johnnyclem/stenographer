@@ -33,6 +33,7 @@ import {
 } from '../truth/wiki.js';
 import { appendWikiFile, defaultWikiDir, readWikiFile, type WikiFileTarget } from '../truth/wiki-file.js';
 import type { TruthFilter } from '../truth/ledger.js';
+import { buildDerivation, type DerivationNode, type TraceDirection } from '../truth/trace.js';
 import type { Objection, ObjectionMode, ObjectionStatus, ObjectionStats } from '../truth/objections.js';
 import { createSinkTransport, type ObjectionTransport } from '../truth/delivery.js';
 import { formatProposalNotice, formatUvNotice, raiseForNotarization, raiseUvForPerson, type UvRaise } from '../truth/notary.js';
@@ -1623,6 +1624,16 @@ export class Stenographer implements StenographerAPI {
   /** All TB+UV disputes, for humans and dashboards. */
   async getContestedTruth(): Promise<Array<{ tombstone: TbEntry; contestedBy: UvEntry[] }>> {
     return this.store.truth.getContested();
+  }
+
+  /**
+   * The derivation tree of an entry: what it rests on (down), or what rests
+   * on it (up), each node with its status, standing, signer and answerable
+   * person, and the failing premise marked (trace.ts). Null for an id this
+   * ledger doesn't hold.
+   */
+  async getDerivation(id: string, direction: TraceDirection = 'down'): Promise<DerivationNode | null> {
+    return buildDerivation(this.store.truth, id, direction);
   }
 
   /** Truth entries by filter; ties between TB and UV break toward the TB. */

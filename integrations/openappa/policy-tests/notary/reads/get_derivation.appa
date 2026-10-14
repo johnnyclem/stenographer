@@ -1,0 +1,33 @@
+# get_derivation from a fresh trajectory, which starts trusted and public.
+# Replay only proposes calls: nothing runs, and each result is empty.
+
+# The derivation tree of an entry: the premises below it, their status,
+# standing, signer and answerable person, the failing premise marked.
+# A read has no requirement: it runs.
+mcp/stenographer/get_derivation {
+  id: "01M1E6JK8SQAJ8K0JBRHTD10YG"
+  direction: "down"
+}
+expect allow
+
+# Its nodes carry claims and assertions written outside this trajectory
+# (agents' UVs among them), so it is suspicious: a ledger write now has no
+# remedy under this root.
+mcp/stenographer/assert_uv {
+  assertion: "The per-tenant cap follows from the global cap."
+  basis: "The derivation tree shows the global cap resting on the retry budget."
+  verifyBy: {"kind": "inspect", "value": "src/retry.ts"}
+}
+expect deny
+
+# It is restricted to self: it cannot go to a public destination.
+mcp/mail/send {
+  to: "public"
+}
+expect deny
+
+# The person running the session can receive it.
+mcp/mail/send {
+  to: "self"
+}
+expect allow

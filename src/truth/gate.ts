@@ -51,10 +51,12 @@ import { TruthLedger } from './ledger.js';
 import { canonicalize, sha256Hex } from './jcs.js';
 import { assertingFields } from './asserting.js';
 import { MatchDeadlineError } from './literal-matcher.js';
-import { compileTombstones, findGateRuling, ObjectionLog, type GateCall, type Objection } from './objections.js';
+import { compileTombstones, findGateRuling, ObjectionLog, tombstoneWeakness, type GateCall, type Objection, type TombstoneWeakness } from './objections.js';
 import { checkWikiChain, decodeWikiLine, type DecodedWikiLine } from './wiki.js';
 import { MAX_WIKI_FILE_BYTES } from './wiki-file.js';
 import { hasAgentPrefix } from './quorum.js';
+import { deriveStanding, type StandingNode } from './status.js';
+import { premisesOfLine } from './derivation.js';
 import { TombstonedLiteralSchema, type TbEntry, type TombstonedLiteral } from './types.js';
 import { assertSchemaSupported } from '../store/migrations.js';
 
@@ -88,6 +90,13 @@ export interface GateHit {
   line: string;
   /** Open UVs contesting the TB. */
   contestedBy: string[];
+  /**
+   * Set when the TB is under appeal or clouded: the hit is recorded as a
+   * shadow objection and never denies (R3). A 1.0 gate denied on a
+   * contested TB; the --log line carries this so those denials can be
+   * counted before enforce is switched on.
+   */
+  weakness: TombstoneWeakness | null;
   /** The objection on file for this call (state mode). */
   objection: Objection | null;
   /** A person's ruling on this TB for this exact call, if any. */
@@ -199,6 +208,9 @@ const ACTIVE = new Set(['active', 'contested']);
  * truth format v2: a line's current status is that of the highest-seq
  * TRANSITION targeting it, else its own; only active and contested TBs
  * count, and only signed ones (an unsigned line is a proposal, not truth).
+ * Standing is folded over the stream too (spec, "Derivation"): an
+ * unsupported TB is left out, and each TB carries its standing so a
+ * clouded one records a shadow objection instead of denying.
  * A file with an unreadable or edited line, or a broken chain, is refused
  * (thrown, so the gate's --on-error decides): a missing or edited
  * TRANSITION would otherwise bring an overridden TB back. A v1 TB carries
@@ -242,11 +254,29 @@ export function wikiMatchableTombstones(
   }
   const statusOf = (id: string, own: unknown) => (latest.has(id) ? latest.get(id)!.status : own);
 
+  // The standing fold a reader applies: every TB and UV line, its folded status, and the premises its line names
+  const nodes = new Map<string, StandingNode>();
+  for (const { decoded } of read) {
+    if (decoded.type !== 'TB' && decoded.type !== 'UV') continue;
+    const line = decoded.line;
+    const id = String(line.id);
+    const status = statusOf(id, line.status);
+    nodes.set(id, {
+      type: decoded.type,
+      status: status === 'struck' ? null : typeof status === 'string' ? status : null,
+      struck: status === 'struck',
+      premises: premisesOfLine(line).map((p) => ({ id: p.id, kind: p.kind })),
+    });
+  }
+  const standing = deriveStanding(nodes.keys(), (id) => nodes.get(id));
+
   const tombstones: TbEntry[] = [];
   for (const { line } of tbs) {
     const id = String(line.id);
     const status = statusOf(id, line.status);
     if (typeof status !== 'string' || !ACTIVE.has(status)) continue;
+    const derived = standing.get(id) ?? { standing: 'sound' as const, reasons: [] };
+    if (derived.standing === 'unsupported') continue;
     if (typeof line.signedBy !== 'string' || !line.signedBy) continue;
     // Agents settle only together: an agent's TB counts only with a quorum of agents (the codec checked its rules)
     if (hasAgentPrefix(line.signedBy) && !(Array.isArray(line.quorum) && line.quorum.every((m: { author?: unknown }) => typeof m?.author === 'string' && hasAgentPrefix(m.author)))) {
@@ -273,6 +303,8 @@ export function wikiMatchableTombstones(
         status: status as TbEntry['body']['status'],
         literals,
       },
+      standing: derived.standing,
+      reasons: derived.reasons,
     });
   }
 
@@ -309,8 +341,10 @@ function describeHit(hit: GateHit): string {
   const signer = tb.body.signedBy ? `signed by ${clean(tb.body.signedBy, 80)}` : 'unsigned';
   const contest =
     hit.contestedBy.length > 0
-      ? ` It is contested by ${hit.contestedBy.join(', ')} (still ground truth until a person resolves it).`
-      : '';
+      ? ` It is under appeal by ${hit.contestedBy.join(', ')} (trust it, verify it, cite the appeal; never grounds for a denial while the appeal is open).`
+      : hit.weakness === 'clouded'
+        ? ` It is clouded${tb.reasons && tb.reasons.length > 0 ? ` (${tb.reasons.map((r) => `${r.reason} ${r.premise}`).join('; ')})` : ''}: ground truth with an asterisk, cite the weak premise.`
+        : '';
   let filed = '';
   if (hit.ruling?.status === 'sustained') {
     const ruling = hit.ruling.rulingId ? ` (ruling ${hit.ruling.rulingId})` : '';
@@ -433,6 +467,7 @@ export function evaluateGate(
         field,
         line,
         contestedBy: source!.contestedBy(tb.id),
+        weakness: tombstoneWeakness(tb),
         objection: null,
         ruling: source!.state ? findGateRuling(source!.state.db, tb.id, digest) : null,
       }));
@@ -458,7 +493,8 @@ export function evaluateGate(
             literal: h.literal,
             line: h.line,
             call: { ...call, field: h.field },
-            delivered: options.mode === 'enforce',
+            // A weak TB (under appeal, clouded) records a shadow objection and never denies
+            delivered: options.mode === 'enforce' && h.weakness === null,
           });
         }
       } catch (err) {
@@ -472,11 +508,21 @@ export function evaluateGate(
     }
 
     if (open.length === 0) return result({ ...partial, decision: 'allow', hits, notes });
-    const reason = denyReason(toolName, open);
+    // A TB under appeal or clouded is less than a TB: it records a shadow
+    // objection and lets the call through (R3). 1.0 denied on a contested TB;
+    // the note and the --log line say so, so those denials can be counted.
+    const weak = open.filter((h) => h.weakness !== null);
+    for (const h of weak) {
+      const filed = h.objection ? `; recorded as shadow objection ${h.objection.id}` : '';
+      notes.push(`stenographer gate: ${h.tb.id} matched but is ${h.weakness}; allowed${filed} (a 1.0 gate would have denied)`);
+    }
+    const blocking = open.filter((h) => h.weakness === null);
+    if (blocking.length === 0) return result({ ...partial, decision: 'allow', hits, notes });
+    const reason = denyReason(toolName, blocking);
     if (options.mode === 'enforce') {
       return result({ ...partial, decision: 'deny', output: denyOutput(reason), hits, notes });
     }
-    const filed = open.filter((h) => h.objection).map((h) => h.objection!.id);
+    const filed = blocking.filter((h) => h.objection).map((h) => h.objection!.id);
     notes.push(
       `stenographer gate (shadow): would deny this ${toolName} call${filed.length > 0 ? `; filed as objection ${filed.join(', ')}` : ''}`,
       reason
@@ -643,6 +689,8 @@ export async function runGateCLI(
           field: h.field,
           line: h.line,
           objectionId: h.objection?.id ?? null,
+          weakness: h.weakness,
+          standing: h.tb.standing ?? null,
           ruling: h.ruling ? { objectionId: h.ruling.id, status: h.ruling.status, rulingId: h.ruling.rulingId } : null,
         })),
       },

@@ -66,8 +66,10 @@ export interface ContextHit {
   /** Who signed the TB; null for a migrated one. */
   signer: string | null;
   author: string;
-  /** `active`, or `contested` (an open UV disputes it; see contested_by). */
+  /** `active`, or `contested` (an open UV disputes it: the TB is under appeal; see contested_by). */
   status: string;
+  /** `sound`, or `clouded` (a premise below it is weak; see the ledger's reasons). Unsupported TBs never match. */
+  standing: string;
   /** Where in the arguments: `command`, `edits[0].new_string`, ... */
   argument: string;
   /** The argument line that asserts the literal. */
@@ -98,7 +100,8 @@ const ABOUT =
   "Literals this call asserts (in the arguments that carry new content: file content, the new side of an edit, " +
   "the writing parts of a shell command) that a signed tombstone (TB) in stenographer's asserted-truth ledger " +
   'declares dead. claim is the TB text, written by author and signed by signer; status contested means an ' +
-  'open UV disputes it (contested_by). Facts from the ledger, not a judgment of the call.';
+  'open UV disputes it (contested_by): the TB is under appeal. standing clouded means a premise below it is ' +
+  'weak. Facts from the ledger, not a judgment of the call.';
 
 /**
  * The harness's own name for a tool OpenAPPA names canonically: a served
@@ -167,6 +170,7 @@ export function answerContextConsult(
       signer: tb.body.signedBy ?? null,
       author: tb.author,
       status: tb.body.status,
+      standing: tb.standing ?? 'sound',
       argument: path,
       line,
       contested_by:

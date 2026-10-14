@@ -139,7 +139,7 @@ export {
   citedPremises,
   type PremiseRef,
 } from './truth/derivation.js';
-export { LINE_ENVELOPE_FIELDS, LINE_BODY_FIELDS, OUTBOUND_LINKS, INBOUND_LINKS, MARKERS } from './truth/format.js';
+export { LINE_ENVELOPE_FIELDS, LINE_BODY_FIELDS, OUTBOUND_LINKS, INBOUND_LINKS, MARKERS, displayStatus, markerFor } from './truth/format.js';
 export { canonicalize, sha256Hex, CanonicalizationError } from './truth/jcs.js';
 export { runVerifyCLI, verifyStateFile, formatLedgerCheck, startupLedgerCheck, type LedgerCheck } from './truth/verify-cli.js';
 export {
@@ -245,6 +245,7 @@ export {
   type DeadLetter,
 } from './truth/delivery.js';
 export { displayText } from './truth/display.js';
+export { buildDerivation, formatDerivation, runTraceCLI, MAX_TRACE_DEPTH, type DerivationNode, type TraceDirection } from './truth/trace.js';
 export {
   raiseForNotarization,
   raiseUvForPerson,

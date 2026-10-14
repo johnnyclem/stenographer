@@ -112,6 +112,10 @@ name = "mcp/stenographer/search_truth"
 delta = { audience = ["self"], trust = "suspicious" }
 
 [[policy.tool]]
+name = "mcp/stenographer/get_derivation"
+delta = { audience = ["self"], trust = "suspicious" }
+
+[[policy.tool]]
 name = "mcp/stenographer/get_contested"
 delta = { audience = ["self"], trust = "suspicious" }
 

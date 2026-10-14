@@ -37,7 +37,7 @@ export {
   citedPremises,
   type PremiseRef,
 } from './truth/derivation.js';
-export { LINE_ENVELOPE_FIELDS, LINE_BODY_FIELDS, OUTBOUND_LINKS, INBOUND_LINKS, MARKERS } from './truth/format.js';
+export { LINE_ENVELOPE_FIELDS, LINE_BODY_FIELDS, OUTBOUND_LINKS, INBOUND_LINKS, MARKERS, displayStatus, markerFor } from './truth/format.js';
 export {
   QUORUM_WINDOW_MS,
   QUORUM_MIN_MEMBERS,
