@@ -33,7 +33,7 @@ mode those are every session's logs, quoting whatever those sessions read
 (web pages, tool output, files). Results enter `suspicious` and are
 restricted to `self`: the index is the person's own state file.
 
-*Ledger reads* — `get_truth`, `search_truth`, `get_contested`,
+*Ledger reads* — `get_truth`, `search_truth`, `get_derivation`, `get_contested`,
 `get_verification_queue`, `list_proposals`, `list_objections`, and
 `export_wiki_entries` without `file` (the inline export). UVs and drafts
 are written by agents, some in sessions no policy protected; detector

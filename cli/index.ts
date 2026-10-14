@@ -27,6 +27,10 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
     const { runGateCLI } = await import('../dist/truth/gate.js');
     process.exitCode = await runGateCLI(args);
   },
+  trace: async (args) => {
+    const { runTraceCLI } = await import('../dist/truth/trace.js');
+    process.exitCode = await runTraceCLI(args);
+  },
 };
 
 async function main() {
@@ -49,6 +53,12 @@ Usage:
                                                         and every status re-derived from links
                                                         (exit 0 intact, 1 integrity failure,
                                                         2 could not run)
+  stenographer trace <id> [--up|--down] [--json] [--state <path>]
+                                                        What an entry rests on (--down, the
+                                                        default) or what rests on it (--up):
+                                                        each node's status, standing, signer
+                                                        and answerable person, the failing
+                                                        premise marked
   stenographer gate [--state <path> | --wiki <file>] [--mode shadow|enforce]
                     [--timeout-ms <n>] [--on-error allow|deny]
                     [--tools <list>] [--log <file>]

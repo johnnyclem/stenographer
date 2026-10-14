@@ -88,6 +88,7 @@ const QUERIES = {
     kind: z.enum(['tombstone', 'uv']).optional(),
   }),
   contextFrame: z.object({ budget: count(2000, MAX_BUDGET) }),
+  derivation: z.object({ direction: z.enum(['down', 'up']).default('down') }),
 };
 
 const nonBlank = (what: string) => z.string().refine((v) => v.trim().length > 0, `${what} is required`);
@@ -235,6 +236,15 @@ export class RestServer {
     }
     if (req.method !== 'GET') {
       sendJson(res, 405, { error: 'Method not allowed' });
+      return;
+    }
+
+    const derivationMatch = path.match(/^\/truth\/([^/]+)\/derivation$/);
+    if (derivationMatch) {
+      const { direction } = parseQuery(QUERIES.derivation, url);
+      const tree = await this.engine.getDerivation(decodeSegment(derivationMatch[1]), direction);
+      if (!tree) sendJson(res, 404, { error: `no such entry: ${decodeSegment(derivationMatch[1])}` });
+      else sendJson(res, 200, { direction, tree });
       return;
     }
 

@@ -46,12 +46,35 @@ export const INBOUND_LINKS: Partial<Record<TruthEntryType, readonly LinkType[]>>
 
 /**
  * The markers consumers render current truth with (short-hand, smallchat
- * and HyperVault print the same strings). A TB may be relied on, a
- * contested TB carries its dispute, and an open UV is the dragon marker:
- * flag, don't block.
+ * and HyperVault print the same strings). A TB may be relied on; a TB
+ * under appeal (status `contested`) carries its appeal and is never grounds
+ * for a denial; a clouded TB (standing `clouded`) carries its weak premise;
+ * an open UV is the dragon marker: flag, don't block. An unsupported entry
+ * is history and gets no marker.
  */
 export const MARKERS = {
   TB: '[TB]',
-  TB_CONTESTED: '[TB ⚠ CONTESTED]',
+  TB_UNDER_APPEAL: '[TB ⚠ UNDER APPEAL]',
+  TB_CLOUDED: '[TB ⚠ CLOUDED]',
   UV: '[UV — UNVERIFIED]',
 } as const;
+
+/**
+ * A status as a person reads it: `contested` is shown as "under appeal"
+ * (the wire value stays `contested`), and a struck entry is "struck".
+ */
+export function displayStatus(status: string | null | undefined, struck = false): string {
+  if (struck) return 'struck';
+  if (status === 'contested') return 'under appeal';
+  return status ?? 'unknown';
+}
+
+/** The marker for a current TB or UV, by status and standing; null for one consumers don't cite. */
+export function markerFor(type: TruthEntryType, status: string | null | undefined, standing?: string | null): string | null {
+  if (standing === 'unsupported') return null;
+  if (type === 'UV') return status === 'open' ? MARKERS.UV : null;
+  if (type !== 'TB') return null;
+  if (status === 'contested') return MARKERS.TB_UNDER_APPEAL;
+  if (status === 'active') return standing === 'clouded' ? MARKERS.TB_CLOUDED : MARKERS.TB;
+  return null;
+}

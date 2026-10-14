@@ -98,6 +98,7 @@ describe('OpenAPPA context provider (POST /appa/context)', () => {
       signer: 'johnnyclem',
       author: 'johnnyclem',
       status: 'active',
+      standing: 'sound',
       argument: 'command',
       line: expect.stringContaining('LOG_BUDGET=30'),
       contested_by: [],

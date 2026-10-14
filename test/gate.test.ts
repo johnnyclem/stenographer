@@ -140,6 +140,102 @@ describe('gate: hook fixtures (enforce)', () => {
   });
 });
 
+describe('gate: standing and appeals (R3)', () => {
+  /** A ledger where the LOG_BUDGET TB rests on a premise, and that premise is struck: the TB is unsupported. */
+  function seedUnsupported(path: string): { tb: TbEntry; premise: TbEntry } {
+    const db = new Database(path);
+    const ledger = new TruthLedger(db);
+    const premise = ledger.assertTombstone(
+      { claim: 'The worker pool is capped at 100 log lines.', evidence: [{ kind: 'commit', ref: 'b00c0de' }], signedBy: 'sam' },
+      { author: 'sam' }
+    );
+    const tb = ledger.assertTombstone(
+      {
+        claim: 'LOG_BUDGET 30 is dead; the budget is 100',
+        evidence: [{ kind: 'commit', ref: 'a1b2c3' }],
+        signedBy: 'johnnyclem',
+        literals: [LOG_BUDGET],
+        premises: [{ id: premise.id, contentHash: premise.contentHash! }],
+        inference: 'The pool cap is the log budget.',
+      },
+      { author: 'johnnyclem' }
+    );
+    ledger.fileRuling({ kind: 'strike', opinion: 'the cap commit was reverted', target: premise.id }, { author: 'johnnyclem' });
+    const struck = ledger.getEntry(tb.id) as TbEntry;
+    db.close();
+    return { tb: struck, premise };
+  }
+
+  it("a TB whose premise is struck is unsupported: the call that was denied is allowed, and no objection is filed", () => {
+    const own = join(dir, 'unsupported.db');
+    const { tb } = seedUnsupported(own);
+    expect(tb.standing).toBe('unsupported');
+    const result = evaluateGate(fixture('write'), options({ statePath: own }));
+    expect(result).toMatchObject({ decision: 'allow', output: null, error: null, hits: [] });
+    expect(objections(own)).toEqual([]);
+  });
+
+  it('a TB under appeal lets the call through and records a shadow objection, in enforce mode', async () => {
+    const db = new Database(statePath);
+    const ledger = new TruthLedger(db);
+    const appeal = ledger.assertUv(
+      { assertion: 'The log budget of 30 was fine for the worker pool.', basis: 'observed', verifyBy: { kind: 'observe', value: 'the pool' }, contests: budgetTb.id },
+      { author: 'reviewer-2' }
+    );
+    db.close();
+    const log = join(dir, 'gate.log');
+    const { code, stdout, stderr } = await runCli(['--state', statePath, '--mode', 'enforce', '--log', log], JSON.stringify(fixture('write')));
+    expect({ code, stdout }).toEqual({ code: 0, stdout: '' });
+    expect(stderr).toContain(`${budgetTb.id} matched but is under appeal; allowed`);
+    expect(stderr).toContain('a 1.0 gate would have denied');
+
+    const [objection] = objections();
+    expect(objection).toMatchObject({ tbId: budgetTb.id, status: 'pending', delivered: false, weakness: 'under appeal' });
+    expect(objection.exhibit.contestedBy.map((u) => u.id)).toEqual([appeal.id]);
+    const logged = JSON.parse(readFileSync(log, 'utf8').trim().split('\n').at(-1)!);
+    expect(logged).toMatchObject({ decision: 'allow', mode: 'enforce', hits: [{ tbId: budgetTb.id, weakness: 'under appeal', objectionId: objection.id }] });
+
+    // The other TB is sound: the same call asserting its literal is still denied
+    const both = { ...fixture('write'), tool_input: { file_path: 'a.ts', content: 'const LOG_BUDGET = 30; const limiter = new legacyRateLimiter();' } };
+    const denied = evaluateGate(both, options());
+    expect(denied.decision).toBe('deny');
+    expect(reasonOf(denied.output)).toContain(limiterTb.id);
+    expect(reasonOf(denied.output)).not.toContain(budgetTb.id);
+  });
+
+  it('a clouded TB (its premise an open UV) is let through with a shadow objection that names the weak premise', () => {
+    const own = join(dir, 'clouded.db');
+    const db = new Database(own);
+    const ledger = new TruthLedger(db);
+    const premise = ledger.assertUv({ assertion: 'The pool is capped at 100 lines.', basis: 'the doc', verifyBy: { kind: 'inspect', value: 'src/pool.ts' } }, { author: 'sam' });
+    const tb = ledger.assertTombstone(
+      {
+        claim: 'LOG_BUDGET 30 is dead; the budget is 100',
+        evidence: [{ kind: 'commit', ref: 'a1b2c3' }],
+        signedBy: 'johnnyclem',
+        literals: [LOG_BUDGET],
+        premises: [{ id: premise.id, contentHash: premise.contentHash! }],
+        inference: 'The pool cap is the log budget.',
+      },
+      { author: 'johnnyclem' }
+    );
+    db.close();
+    const result = evaluateGate(fixture('write'), options({ statePath: own }));
+    expect(result).toMatchObject({ decision: 'allow', output: null, hits: [{ tb: { id: tb.id }, weakness: 'clouded' }] });
+    expect(result.notes.join('\n')).toContain('is clouded; allowed');
+    expect(objections(own)).toMatchObject([{ tbId: tb.id, delivered: false, weakness: 'clouded' }]);
+  });
+
+  it('--wiki folds standing too: a TB whose premise is struck in the stream enforces nothing', () => {
+    const wiki = join(__dirname, '..', 'spec', 'truth-format', 'fixtures', 'valid', 'derivation.jsonl');
+    const { tombstones } = wikiMatchableTombstones(readFileSync(wiki, 'utf8').split('\n'));
+    // The cap TB carries MAX_RETRIES 3 → 5, but rests on the struck budget TB
+    expect(tombstones).toEqual([]);
+    const input = { ...fixture('write'), tool_input: { file_path: 'a.ts', content: 'const MAX_RETRIES = 3;' } };
+    expect(evaluateGate(input, options({ wikiPath: wiki, mode: 'enforce' }))).toMatchObject({ decision: 'allow', output: null, hits: [] });
+  });
+});
+
 describe('gate: shadow mode', () => {
   it('records a shadow objection and allows the call', () => {
     const result = evaluateGate(fixture('write'), options({ mode: 'shadow', onError: 'allow' }));

@@ -268,7 +268,7 @@ describe('engine objections (§12)', () => {
     expect(await e.getObjections()).toHaveLength(1);
   });
 
-  it('contested TBs still object, with the contest in the exhibit', async () => {
+  it('a TB under appeal (contested) records a shadow objection with the appeal in the exhibit, and delivers nothing (R3)', async () => {
     const { engine: e, log } = await liveEngine({ objectionMode: 'deliver' });
     const tb = await assertBudgetTb(e);
     const uv = await e.assertUv({
@@ -281,9 +281,47 @@ describe('engine objections (§12)', () => {
 
     appendFileSync(log, assistant('a1', 'LOG_BUDGET = 30'));
     await settle(e);
-    const [flag] = await e.getObjections();
-    expect(flag.objection).toContain('contested');
+    expect(await e.getObjections()).toEqual([]);
+    const [flag] = await e.getObjections({ includeShadow: true });
+    expect(flag).toMatchObject({ delivered: false, weakness: 'under appeal' });
+    expect(flag.objection).toContain('TB is under appeal');
     expect(flag.exhibit.contestedBy.map((u) => u.id)).toEqual([uv.id]);
+    expect(flag.exhibit.tombstone.body.status).toBe('contested');
+
+    // Refuting the appeal makes the TB sound again: the next assertion is delivered
+    await e.resolveUv(uv.id, 'refuted', [{ kind: 'file', ref: 'config.ts:3', detail: 'LOG_BUDGET = 100' }], { author: 'kim' });
+    appendFileSync(log, assistant('a2', 'LOG_BUDGET = 30 again'));
+    await settle(e);
+    expect((await e.getObjections()).map((o) => o.messageId)).toEqual(['a2']);
+  });
+
+  it('a clouded TB records a shadow objection naming the weak premise; an unsupported TB raises nothing (R3)', async () => {
+    const { engine: e, log } = await liveEngine({ objectionMode: 'deliver' });
+    const premise = await e.assertUv({ assertion: 'The worker pool logs at most 100 lines.', basis: 'the design doc', verifyBy: { kind: 'inspect', value: 'src/pool.ts' }, author: 'sam' });
+    const held = e.store.truth.getEntry(premise.id)!;
+    const tb = await e.assertTombstone({
+      claim: 'LOG_BUDGET 30 is dead; the budget is 100',
+      evidence: [{ kind: 'commit', ref: 'a1b2c3' }],
+      signedBy: 'johnnyclem',
+      literals: [LOG_BUDGET],
+      premises: [{ id: premise.id, contentHash: held.contentHash! }],
+      inference: 'The pool budget is the log budget.',
+    });
+    expect(tb.standing).toBe('clouded');
+
+    appendFileSync(log, assistant('a1', 'LOG_BUDGET = 30'));
+    await settle(e);
+    expect(await e.getObjections()).toEqual([]);
+    const [shadow] = await e.getObjections({ includeShadow: true });
+    expect(shadow).toMatchObject({ delivered: false, weakness: 'clouded', tbId: tb.id });
+    expect(shadow.exhibit.tombstone.reasons).toEqual([{ premise: premise.id, reason: 'premise-open' }]);
+
+    // The premise refuted: the TB is unsupported, history, and raises nothing
+    await e.resolveUv(premise.id, 'refuted', [{ kind: 'file', ref: 'src/pool.ts:9', detail: 'no cap' }], { author: 'kim' });
+    expect(e.store.truth.getEntry(tb.id)!.standing).toBe('unsupported');
+    appendFileSync(log, assistant('a2', 'LOG_BUDGET = 30 once more'));
+    await settle(e);
+    expect(await e.getObjections({ includeShadow: true })).toHaveLength(1);
   });
 
   it('catch-up replays are recorded for shadow judging, never delivered', async () => {

@@ -1105,6 +1105,23 @@ export class TruthLedger {
     return held ? premisesOf(held) : [];
   }
 
+  /** What rests on an entry: the entries that name it as a premise, pinned or cited, in ledger order. */
+  dependentsOf(id: string): Array<{ id: string; kind: 'derives' | 'wiki' }> {
+    const rows = this.db
+      .prepare(`
+        SELECT p.entry_id, p.kind FROM truth_premises p JOIN truth_entries e ON e.id = p.entry_id
+        WHERE p.premise_id = ? ORDER BY e.seq, p.rowid
+      `)
+      .all(id) as Array<{ entry_id: string; kind: 'derives' | 'wiki' }>;
+    return rows.map((r) => ({ id: r.entry_id, kind: r.kind }));
+  }
+
+  /** Whether an entry is struck (the cached derivation; false for one not held). */
+  isStruck(id: string): boolean {
+    const row = this.db.prepare('SELECT struck FROM truth_entries WHERE id = ?').get(id) as { struck: number } | undefined;
+    return Boolean(row?.struck);
+  }
+
   /** Validates the hash chain, the links, and every cached status (see chain.ts). */
   verify(): IntegrityReport {
     return verifyLedger(this.db);
@@ -1851,17 +1868,25 @@ export class TruthLedger {
     return this.getEntry(id) as RulingEntry;
   }
 
-  /** Active or contested TBs that carry matchable literals, excluding struck ones. */
+  /**
+   * Active or under-appeal TBs that carry matchable literals, excluding
+   * struck and unsupported ones: an unsupported TB raises nothing and
+   * denies nothing (R3). Each carries its standing, so the objection engine
+   * and the gate can tell a sound TB from a weak one (clouded, or under
+   * appeal), which records a shadow objection and denies nothing.
+   */
   getMatchableTombstones(): TbEntry[] {
     const rows = this.db
       .prepare(`
         SELECT * FROM truth_entries
         WHERE type = 'TB' AND status IN ('active','contested') AND struck = 0
+          AND COALESCE(standing, 'sound') != 'unsupported'
           AND json_array_length(json_extract(body, '$.literals')) > 0
         ORDER BY created_at ASC
       `)
       .all() as any[];
-    return rows.map((r) => this.rowToEntry(r) as TbEntry);
+    const memo = new Map<string, DerivedStanding>();
+    return rows.map((r) => this.rowToEntry(r, memo) as TbEntry);
   }
 
   private insertRuling(

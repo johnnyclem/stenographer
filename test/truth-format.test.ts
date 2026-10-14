@@ -400,7 +400,7 @@ function buildFixtures(): Map<string, string> {
   const derivation = new TruthLedger(new Database(':memory:'));
   const pinOf = (e: { id: string; contentHash?: string }) => ({ id: e.id, contentHash: e.contentHash! });
   const retryBudget = derivation.assertTombstone(
-    { claim: 'The retry retryBudget is 100.', evidence: [{ kind: 'commit', ref: '9f2c1ab' }], signedBy: 'johnnyclem' },
+    { claim: 'The retry budget is 100.', evidence: [{ kind: 'commit', ref: '9f2c1ab' }], signedBy: 'johnnyclem' },
     { author: 'johnnyclem', timestamp: T(50) }
   );
   const cost = derivation.assertUv(
@@ -414,7 +414,7 @@ function buildFixtures(): Map<string, string> {
       signedBy: 'johnnyclem',
       literals: [{ subject: 'MAX_RETRIES', dead: '3', current: '5' }],
       premises: [pinOf(retryBudget), pinOf(cost)],
-      inference: 'The retryBudget in the first premise divided by the cost in the second.',
+      inference: 'The budget in the first premise divided by the cost in the second.',
     },
     { author: 'johnnyclem', timestamp: T(52) }
   );
@@ -430,12 +430,12 @@ function buildFixtures(): Map<string, string> {
   );
   // An unpinned premise: wiki evidence naming an entry this ledger holds
   derivation.assertTombstone(
-    { claim: 'The retry retryBudget flag is gone.', evidence: [{ kind: 'wiki', ref: retryBudget.id }, { kind: 'commit', ref: 'b4d1dea' }], signedBy: 'kim' },
+    { claim: 'The retry budget flag is gone.', evidence: [{ kind: 'wiki', ref: retryBudget.id }, { kind: 'commit', ref: 'b4d1dea' }], signedBy: 'kim' },
     { author: 'kim', timestamp: T(54) }
   );
   // Verifying the UV premise clears the cloud; striking the TB premise makes everything on it unsupported
   derivation.resolveUv(cost.id, 'verified', [{ kind: 'file', ref: 'pricing.md:4', detail: '20 per retry' }], { author: 'alex', timestamp: T(55) });
-  derivation.fileRuling({ kind: 'strike', opinion: 'the retryBudget commit was reverted', target: retryBudget.id }, { author: 'johnnyclem', timestamp: T(56) });
+  derivation.fileRuling({ kind: 'strike', opinion: 'the budget commit was reverted', target: retryBudget.id }, { author: 'johnnyclem', timestamp: T(56) });
   const derivationStream = exportWikiEntries(derivation);
   expect(derivationStream.skipped).toEqual([]);
   files.set('valid/derivation.jsonl', jsonl(derivationStream.lines));
@@ -443,7 +443,7 @@ function buildFixtures(): Map<string, string> {
   const derivedTb = derivationStream.lines.map(parse).find((l) => l.id === cap.id)!;
   const retryBudgetLine = derivationStream.lines.map(parse).find((l) => l.id === retryBudget.id)!;
   // The same premise with other content, as a one-line stream of its own (routing: a pin that doesn't match)
-  const otherBudget = rehash({ ...retryBudgetLine, claim: 'The retry retryBudget is 200.', seq: 1, prevHash: null });
+  const otherBudget = rehash({ ...retryBudgetLine, claim: 'The retry budget is 200.', seq: 1, prevHash: null });
 
   const routing: Array<[unknown, Record<string, unknown>]> = [
     [otherStream.find((l) => l.author === 'migration'), { outcome: 'proposal', reason: 'unsigned', note: "a backfilled TB: author 'migration', no signer" }],

@@ -572,9 +572,11 @@ export const DraftEditsSchema = z
 // MCP tool descriptions so consuming agents inherit them.
 // ─────────────────────────────────────────────────────────────
 
-export const CONSUMPTION_RULES = `Consumption rules by confidence type:
+export const CONSUMPTION_RULES = `Consumption rules by confidence type and standing:
 - Active TB: treat as ground truth. A reviewer may block on it; a code agent may rely on it.
-- Contested TB: ground truth with a visible asterisk — cite both the TB and the contesting UV.
+- TB under appeal (status contested): less than a TB and more than a UV. Trust it, verify it, and cite the appeal (the contesting UV) with it; never grounds for a denial while the appeal is open.
+- Clouded TB (standing clouded): ground truth with an asterisk. Cite the weak premise its reasons name (an open UV, a TB under appeal, or a premise not held here).
+- Unsupported entry (standing unsupported): history. A premise below it is overridden, refuted or struck; never cite it as support, never deny on it.
 - Open UV: FLAG, DON'T BLOCK. A finding grounded only in a UV is phrased as a question or heads-up, never a demanded change. If your current task can check the UV, file your verdict and evidence with resolve_uv: it settles only when another agent session agrees from a different angle (other evidence, another kind) within 15 minutes, or when a person rules.
 - Refuted UV / overridden TB: retrievable for history, excluded from current-truth by default, never citable as support for a claim.`;
 
