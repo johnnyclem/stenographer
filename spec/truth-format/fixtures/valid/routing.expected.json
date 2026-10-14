@@ -125,5 +125,28 @@
     "outcome": "proposal",
     "reason": "unknown-value",
     "note": "a TB an agent quorum signed whose x-steno.links carries a link type this version does not know ('corroborates'): it decodes (the link rules and the quorum rules refuse no line over an unknown link type), and the import fails closed: filed for a person, never truth"
+  },
+  {
+    "line": 22,
+    "outcome": "inserted",
+    "status": "active",
+    "standing": "clouded",
+    "note": "a derived TB whose premises this ledger does not hold: clouded (premise-missing) until they arrive. Stenographer 1.0, which doesn't know derives, files it as unknown-value"
+  },
+  {
+    "line": 23,
+    "outcome": "inserted",
+    "status": "active",
+    "standing": "sound",
+    "note": "the premise the next line pins, with other content than the pin names"
+  },
+  {
+    "line": 24,
+    "outcome": "proposal",
+    "reason": "conflict",
+    "after": [
+      23
+    ],
+    "note": "the same derived TB after that premise: its pin names content this ledger does not hold, so it is a conflict, never truth"
   }
 ]

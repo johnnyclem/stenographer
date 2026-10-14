@@ -262,9 +262,13 @@
           "$ref": "#/$defs/id"
         },
         "type": {
-          "description": "An open string. Known: supersedes, contests, verifies, refutes, signs, overrides, strikes, dismisses.",
+          "description": "An open string. Known: supersedes, contests, verifies, refutes, signs, overrides, strikes, dismisses, derives.",
           "type": "string",
           "minLength": 1
+        },
+        "contentHash": {
+          "description": "On a derives link: the premise's content hash when the derived entry was written (README, Derivation). The codec requires it on a derives link and refuses it on any other.",
+          "$ref": "#/$defs/hash"
         }
       },
       "required": [
@@ -403,6 +407,10 @@
           "description": "Present when agents settled it: the agent sessions that agreed (README, Agent quorum). A TB an agent signs needs one, and a TB with one carries the literals its members agreed on.",
           "$ref": "#/$defs/quorum"
         },
+        "inference": {
+          "description": "On a derived TB: one sentence stating the inference from its premises (the derives links in x-steno.links) to the claim (README, Derivation). The codec requires it with derives links and refuses it without.",
+          "$ref": "#/$defs/text"
+        },
         "status": {
           "$ref": "#/$defs/status"
         }
@@ -445,6 +453,10 @@
               "type": "null"
             }
           ]
+        },
+        "inference": {
+          "description": "On a derived UV: one sentence stating the inference from its premises (the derives links in x-steno.links) to the assertion (README, Derivation).",
+          "$ref": "#/$defs/text"
         },
         "status": {
           "$ref": "#/$defs/status"

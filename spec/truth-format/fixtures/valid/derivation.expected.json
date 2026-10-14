@@ -1,0 +1,53 @@
+{
+  "01M1E6JK8QHST8RZF45PNRBMXG": {
+    "type": "TB",
+    "status": "struck",
+    "current": false,
+    "standing": "sound",
+    "reasons": []
+  },
+  "01M1E6JK8RY2RTGX9TRXJABTWR": {
+    "type": "UV",
+    "status": "verified",
+    "current": false,
+    "standing": "sound",
+    "reasons": []
+  },
+  "01M1E6JK8SQAJ8K0JBRHTD10YG": {
+    "type": "TB",
+    "status": "active",
+    "current": false,
+    "standing": "unsupported",
+    "reasons": [
+      {
+        "premise": "01M1E6JK8QHST8RZF45PNRBMXG",
+        "reason": "premise-struck"
+      }
+    ]
+  },
+  "01M1E6JK8T990YNBMTS1KP26ZW": {
+    "type": "UV",
+    "status": "open",
+    "current": false,
+    "standing": "unsupported",
+    "reasons": [
+      {
+        "premise": "01M1E6JK8QHST8RZF45PNRBMXG",
+        "reason": "premise-struck",
+        "via": "01M1E6JK8SQAJ8K0JBRHTD10YG"
+      }
+    ]
+  },
+  "01M1E6JK8VNTSQ9WD7KZ8AG3GA": {
+    "type": "TB",
+    "status": "active",
+    "current": false,
+    "standing": "unsupported",
+    "reasons": [
+      {
+        "premise": "01M1E6JK8QHST8RZF45PNRBMXG",
+        "reason": "premise-struck"
+      }
+    ]
+  }
+}

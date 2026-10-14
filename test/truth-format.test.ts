@@ -26,6 +26,8 @@ import { importProposalDrafts } from '../src/truth/intake.js';
 import { canonicalize } from '../src/truth/jcs.js';
 import { decodeWikiLine, exportWikiEntries, importWikiEntries, wikiLineHash, WIKI_STATUSES } from '../src/truth/wiki.js';
 import { EVIDENCE_KINDS, evidenceClass, identityKey, type ProposalEntry, type TbEntry } from '../src/truth/types.js';
+import { lineContentHash, premisesOfLine } from '../src/truth/derivation.js';
+import { deriveStanding, type StandingNode } from '../src/truth/status.js';
 
 const SPEC = join(import.meta.dirname, '..', 'spec', 'truth-format');
 const FIXTURES = join(SPEC, 'fixtures');
@@ -112,6 +114,34 @@ function fold(stream: string[]): Record<string, { type: string; status: string |
   }
   for (const entry of Object.values(out)) {
     entry.current = entry.type === 'TB' ? ['active', 'contested'].includes(entry.status!) : entry.status === 'open';
+  }
+  return out;
+}
+
+/**
+ * The standing fold a reader computes beside the status fold (spec,
+ * "Standing"): each TB or UV's premises from its line (derives links and
+ * wiki evidence refs), each premise's status from the fold, and the walk
+ * down. `current` is the status fold's, minus unsupported entries.
+ */
+function foldWithStanding(stream: string[]): Record<string, { type: string; status: string | null; current: boolean; standing: string; reasons: unknown[] }> {
+  const statuses = fold(stream);
+  const nodes = new Map<string, StandingNode>();
+  for (const line of stream.map(parse)) {
+    if (line.type !== 'TB' && line.type !== 'UV') continue;
+    const state = statuses[line.id];
+    nodes.set(line.id, {
+      type: line.type,
+      status: state.status === 'struck' ? null : state.status,
+      struck: state.status === 'struck',
+      premises: premisesOfLine(line).map((p) => ({ id: p.id, kind: p.kind })),
+    });
+  }
+  const standing = deriveStanding(nodes.keys(), (id) => nodes.get(id));
+  const out: ReturnType<typeof foldWithStanding> = {};
+  for (const [id, state] of Object.entries(statuses)) {
+    const s = standing.get(id)!;
+    out[id] = { ...state, current: state.current && s.standing !== 'unsupported', standing: s.standing, reasons: s.reasons };
   }
   return out;
 }
@@ -366,6 +396,55 @@ function buildFixtures(): Map<string, string> {
   const lone = unaware.assertUv({ assertion: 'Exports run hourly.', basis: 'the cron table', verifyBy: { kind: 'inspect', value: 'cron.d/export' } }, { author: 'sam', timestamp: T(45) });
   unaware.resolveUv(lone.id, 'verified', [{ kind: 'file', ref: 'cron.d/export:1', detail: '0 * * * *' }], { author: 'agent:claude-code', agentSessionId: 'sess_7f3a', timestamp: T(46) });
   const unawareStream = exportWikiEntries(unaware).lines.map(parse);
+  // valid/derivation.jsonl: what entries rest on, and the standing readers derive from it
+  const derivation = new TruthLedger(new Database(':memory:'));
+  const pinOf = (e: { id: string; contentHash?: string }) => ({ id: e.id, contentHash: e.contentHash! });
+  const retryBudget = derivation.assertTombstone(
+    { claim: 'The retry retryBudget is 100.', evidence: [{ kind: 'commit', ref: '9f2c1ab' }], signedBy: 'johnnyclem' },
+    { author: 'johnnyclem', timestamp: T(50) }
+  );
+  const cost = derivation.assertUv(
+    { assertion: 'Each retry costs 20.', basis: 'the pricing doc', verifyBy: { kind: 'inspect', value: 'pricing.md' } },
+    { author: 'sam', timestamp: T(51) }
+  );
+  const cap = derivation.assertTombstone(
+    {
+      claim: 'Retries are capped at 5; the old cap of 3 is dead.',
+      evidence: [{ kind: 'test', ref: 'test/retry.test.ts' }],
+      signedBy: 'johnnyclem',
+      literals: [{ subject: 'MAX_RETRIES', dead: '3', current: '5' }],
+      premises: [pinOf(retryBudget), pinOf(cost)],
+      inference: 'The retryBudget in the first premise divided by the cost in the second.',
+    },
+    { author: 'johnnyclem', timestamp: T(52) }
+  );
+  derivation.assertUv(
+    {
+      assertion: 'The per-tenant cap is 5 too.',
+      basis: 'the cap is global',
+      verifyBy: { kind: 'ask', value: 'ops' },
+      premises: [pinOf(derivation.getEntry(cap.id)!)],
+      inference: 'A global cap binds each tenant.',
+    },
+    { author: 'sam', timestamp: T(53) }
+  );
+  // An unpinned premise: wiki evidence naming an entry this ledger holds
+  derivation.assertTombstone(
+    { claim: 'The retry retryBudget flag is gone.', evidence: [{ kind: 'wiki', ref: retryBudget.id }, { kind: 'commit', ref: 'b4d1dea' }], signedBy: 'kim' },
+    { author: 'kim', timestamp: T(54) }
+  );
+  // Verifying the UV premise clears the cloud; striking the TB premise makes everything on it unsupported
+  derivation.resolveUv(cost.id, 'verified', [{ kind: 'file', ref: 'pricing.md:4', detail: '20 per retry' }], { author: 'alex', timestamp: T(55) });
+  derivation.fileRuling({ kind: 'strike', opinion: 'the retryBudget commit was reverted', target: retryBudget.id }, { author: 'johnnyclem', timestamp: T(56) });
+  const derivationStream = exportWikiEntries(derivation);
+  expect(derivationStream.skipped).toEqual([]);
+  files.set('valid/derivation.jsonl', jsonl(derivationStream.lines));
+  files.set('valid/derivation.expected.json', json(foldWithStanding(derivationStream.lines)));
+  const derivedTb = derivationStream.lines.map(parse).find((l) => l.id === cap.id)!;
+  const retryBudgetLine = derivationStream.lines.map(parse).find((l) => l.id === retryBudget.id)!;
+  // The same premise with other content, as a one-line stream of its own (routing: a pin that doesn't match)
+  const otherBudget = rehash({ ...retryBudgetLine, claim: 'The retry retryBudget is 200.', seq: 1, prevHash: null });
+
   const routing: Array<[unknown, Record<string, unknown>]> = [
     [otherStream.find((l) => l.author === 'migration'), { outcome: 'proposal', reason: 'unsigned', note: "a backfilled TB: author 'migration', no signer" }],
     [otherStream.find((l) => l.type === 'TB' && l.author === 'mallory'), { outcome: 'proposal', reason: 'unverifiable', note: 'a signer signers.json does not list' }],
@@ -376,6 +455,28 @@ function buildFixtures(): Map<string, string> {
     [unawareStream.find((l) => l.type === 'ADDENDUM'), { outcome: 'held', note: "an agent's verification without a quorum" }],
     ...quorumRouting(quorumAddendum, quorumTb, 8),
   ];
+  const derivationRouting: Array<[unknown, Record<string, unknown>]> = [
+    [
+      derivedTb,
+      {
+        outcome: 'inserted',
+        status: 'active',
+        standing: 'clouded',
+        note: "a derived TB whose premises this ledger does not hold: clouded (premise-missing) until they arrive. Stenographer 1.0, which doesn't know derives, files it as unknown-value",
+      },
+    ],
+    [otherBudget, { outcome: 'inserted', status: 'active', standing: 'sound', note: "the premise the next line pins, with other content than the pin names" }],
+    [
+      derivedTb,
+      {
+        outcome: 'proposal',
+        reason: 'conflict',
+        after: [routing.length + 2],
+        note: 'the same derived TB after that premise: its pin names content this ledger does not hold, so it is a conflict, never truth',
+      },
+    ],
+  ];
+  routing.push(...derivationRouting);
   files.set('valid/routing.jsonl', jsonl(routing.map(([line]) => line)));
   files.set('valid/routing.expected.json', json(routing.map(([, want], i) => ({ line: i + 1, ...want }))));
 
@@ -443,6 +544,11 @@ function buildFixtures(): Map<string, string> {
     [rehash({ ...tbLine, ts: '2026-02-30T10:00:00.000Z' }), 'a date that does not exist (February 30)'],
     [rehash({ ...tbLine, ts: '2026-09-01T24:00:00Z' }), 'an hour out of range (24:00)'],
     [rehash({ ...tbLine, status: '' }), 'an empty status'],
+    [rehash({ ...derivedTb, inference: '' }), 'a derived TB with an empty inference'],
+    [
+      rehash({ ...derivedTb, 'x-steno': { ...derivedTb['x-steno'], links: derivedTb['x-steno'].links.map((l: Record<string, unknown>) => ({ ...l, contentHash: 'notahash' })) } }),
+      'a derives link whose contentHash is not a hash',
+    ],
     [rehash({ ...quorumAddendum, quorum: quorumAddendum.quorum.slice(0, 1), evidence: quorumAddendum.quorum[0].evidence }), 'a quorum of one member'],
     [
       rehash({ ...quorumAddendum, quorum: quorumAddendum.quorum.map(({ verdict: _v, ...m }: Record<string, unknown>) => m) }),
@@ -482,6 +588,8 @@ function buildFixtures(): Map<string, string> {
     [rehash({ ...parse(proposals[1]), author: 'system' }), 'a proposal with an anonymous author', 'anonymous'],
     [rehash({ ...transitionLine, author: 'migration' }), "'migration' authoring a TRANSITION", 'reserved'],
     [rehash({ ...transitionLine, author: 'detector:supersession' }), 'a detector authoring a TRANSITION', 'reserved'],
+    // Derivation: the line rules JSON Schema can't express
+    ...derivationInvalid(derivedTb, retryBudgetLine),
     // The agent quorum: one line per rule a quorum can break
     ...quorumInvalid(quorumAddendum, quorumTb, contestLine, tbLine),
   ];
@@ -500,6 +608,32 @@ function buildFixtures(): Map<string, string> {
     })
   );
   return files;
+}
+
+/** Lines that break the derivation rules (spec, Derivation), from a valid derived TB: the schema takes them, the codec refuses them. */
+function derivationInvalid(derived: Record<string, any>, premise: Record<string, any>): Array<[Record<string, unknown>, string, string]> {
+  const links = derived['x-steno'].links as Array<Record<string, unknown>>;
+  const withLinks = (replaced: Array<Record<string, unknown>>, rest: Record<string, unknown> = {}) =>
+    rehash({ ...derived, ...rest, 'x-steno': { ...derived['x-steno'], links: replaced } });
+  const { inference: _i, ...noInference } = derived;
+  const pin = links[0].contentHash as string;
+  return [
+    [withLinks(links.map(({ contentHash: _h, ...l }) => l)), 'a derives link without a contentHash', 'carries the premise'],
+    [withLinks([...links, { fromId: derived.id, toId: derived.id, type: 'derives', contentHash: pin }]), 'an entry deriving from itself', 'cannot derive from itself'],
+    [withLinks([...links, { ...links[0], contentHash: '0'.repeat(64) }]), 'a premise named twice (with two pins)', 'named once'],
+    [rehash({ ...noInference, 'x-steno': derived['x-steno'] }), 'derives links without an inference', 'premises and inference come together'],
+    [rehash({ ...premise, inference: 'An inference with nothing to infer from.' }), 'an inference without derives links', 'premises and inference come together'],
+    [
+      withLinks([{ fromId: derived.id, toId: premise.id, type: 'supersedes', contentHash: pin }]),
+      'a contentHash on a link that is not a derives link',
+      'only a derives link carries a contentHash',
+    ],
+    [
+      withLinks(Array.from({ length: 17 }, (_, i) => ({ fromId: derived.id, toId: `01PREMISE${String(i).padStart(17, '0')}`, type: 'derives', contentHash: pin }))),
+      'seventeen premises (the cap is 16)',
+      'at most 16 premises',
+    ],
+  ];
 }
 
 /**
@@ -906,6 +1040,45 @@ describe('valid/proposals.jsonl: the suite PROPOSAL envelope', () => {
   });
 });
 
+describe('valid/derivation.jsonl: what entries rest on', () => {
+  const fixture = () => lines('fixtures/valid/derivation.jsonl');
+
+  it('every line passes the schema and the codec, the lines chain, and the pins recompute from the premise lines', () => {
+    const all = fixture();
+    const byId = new Map(all.map(parse).map((l) => [l.id, l]));
+    for (const [i, line] of all.entries()) {
+      expect(schemaValid(line), `line ${i + 1}: ${ajv.errorsText(validate.errors)}`).toBe(true);
+      expect(decodeWikiLine(line)).toMatchObject({ version: 2, seq: i + 1 });
+      expect(parse(line).prevHash).toBe(i === 0 ? null : parse(all[i - 1]).hash);
+      for (const premise of premisesOfLine(parse(line))) {
+        if (premise.kind === 'derives') expect(lineContentHash(byId.get(premise.id)!), `line ${i + 1} pins ${premise.id}`).toBe(premise.contentHash);
+      }
+    }
+    const derived = all.map(parse).filter((l) => l.inference);
+    expect(derived.map((l) => l.type).sort()).toEqual(['TB', 'UV']);
+    expect(all.map(parse).some((l) => l.type === 'TB' && l.evidence?.some((e: { kind: string }) => e.kind === 'wiki'))).toBe(true);
+  });
+
+  it("folds, by the readers' rule, to the expected statuses and standing", () => {
+    const want = expected<Record<string, { standing: string; reasons: Array<{ reason: string }> }>>('fixtures/valid/derivation.expected.json');
+    expect(foldWithStanding(fixture())).toEqual(want);
+    // The story: a cloud that lifts when the UV premise is verified, then a strike at the root that undermines everything on it
+    const standings = Object.values(want).map((e) => e.standing).sort();
+    expect(standings).toEqual(['sound', 'sound', 'unsupported', 'unsupported', 'unsupported']);
+    expect(Object.values(want).flatMap((e) => e.reasons.map((r) => r.reason))).toContain('premise-struck');
+  });
+
+  it('imports into a fresh ledger with the same standing the readers fold, and verifies', () => {
+    const ledger = fresh();
+    const result = importWikiEntries(ledger, { lines: fixture() }, { signers: signers() });
+    expect(result).toMatchObject({ committed: true, proposals: [], held: [], errors: [] });
+    for (const [id, want] of Object.entries(expected<Record<string, { standing: string; reasons: unknown[] }>>('fixtures/valid/derivation.expected.json'))) {
+      expect(ledger.getEntry(id), id).toMatchObject({ standing: want.standing, reasons: want.reasons });
+    }
+    expect(ledger.verify().ok).toBe(true);
+  });
+});
+
 describe('valid/unknown.jsonl: what a newer writer may send', () => {
   const fixture = () => lines('fixtures/valid/unknown.jsonl');
   const want = () =>
@@ -1043,7 +1216,7 @@ describe('valid/unknown.jsonl: what a newer writer may send', () => {
 describe('valid/routing.jsonl: lines stenographer does not simply take as truth', () => {
   it('pass the schema and the codec, and import (each on its own) as expected', () => {
     const fixture = lines('fixtures/valid/routing.jsonl');
-    const want = expected<Array<{ line: number; outcome: string; reason?: string; status?: string; after?: number[]; heldReason?: string }>>(
+    const want = expected<Array<{ line: number; outcome: string; reason?: string; status?: string; standing?: string; after?: number[]; heldReason?: string }>>(
       'fixtures/valid/routing.expected.json'
     );
     for (const w of want) {
@@ -1056,7 +1229,11 @@ describe('valid/routing.jsonl: lines stenographer does not simply take as truth'
       const result = importWikiEntries(ledger, { lines: [line] }, { signers: signers() });
       const id = parse(line).id;
       expect(result.committed, `line ${w.line}`).toBe(true);
-      if (w.outcome === 'inserted') expect((ledger.getEntry(id)!.body as { status: string }).status).toBe(w.status);
+      if (w.outcome === 'inserted') {
+        const entry = ledger.getEntry(id)!;
+        expect((entry.body as { status: string }).status).toBe(w.status);
+        if (w.standing) expect(entry.standing, `line ${w.line}`).toBe(w.standing);
+      }
       if (w.outcome === 'proposal') expect(result.proposals, `line ${w.line}`).toMatchObject([{ reason: w.reason }]);
       if (w.outcome === 'held') {
         expect(result.held, `line ${w.line}`).toHaveLength(1);

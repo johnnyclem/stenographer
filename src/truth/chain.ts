@@ -13,8 +13,9 @@
  * status is derived from links (status.ts) and re-derived here.
  *
  * What this detects: any change to a chained entry or link, an entry or link
- * inserted or deleted anywhere but the tail, reordering, and a cached status
- * that its links don't justify. What it does not: truncating the newest
+ * inserted or deleted anywhere but the tail, reordering, a cached status
+ * that its links don't justify, a premise index that its entries don't
+ * justify, and a cached standing its premises don't. What it does not: truncating the newest
  * entries, or rewriting the whole chain from some point on — anyone who can
  * write the SQLite file can recompute every later hash. Comparing the head
  * hash `stenographer verify` prints against a copy kept elsewhere catches
@@ -23,7 +24,8 @@
 
 import type Database from 'better-sqlite3';
 import { canonicalize, sha256Hex } from './jcs.js';
-import { deriveAll, recordedStatus } from './status.js';
+import { deriveAll, deriveStanding, recordedStatus, type StandingNode } from './status.js';
+import { premisesOf } from './derivation.js';
 import type { LinkType, MarkerBody, TruthEntryType, TruthLink } from './types.js';
 
 /** Version of the record layout above, kept in truth_meta. */
@@ -46,6 +48,8 @@ export interface LedgerRow {
   prev_hash: string | null;
   hash: string | null;
   appended_links: string | null;
+  /** 1.1: the cached standing of a TB or UV (status.ts deriveStanding). */
+  standing?: string | null;
 }
 
 /** The hashed fields of a row. Parses the stored JSON, so appends and checks hash the same values. */
@@ -87,8 +91,11 @@ export type IntegrityFailureKind =
   | 'unchained-entry'
   | 'undeclared-link'
   | 'missing-link'
+  | 'link-hash'
+  | 'premises'
   | 'status'
-  | 'struck';
+  | 'struck'
+  | 'standing';
 
 export interface IntegrityFailure {
   kind: IntegrityFailureKind;
@@ -132,16 +139,17 @@ export function verifyLedger(db: Database.Database): IntegrityReport {
   }
 
   const rows = db.prepare('SELECT * FROM truth_entries WHERE seq IS NOT NULL ORDER BY seq').all() as LedgerRow[];
-  const tableLinks = db.prepare('SELECT from_id, to_id, link_type FROM truth_links ORDER BY rowid').all() as Array<{
+  const tableLinks = db.prepare('SELECT from_id, to_id, link_type, content_hash FROM truth_links ORDER BY rowid').all() as Array<{
     from_id: string;
     to_id: string;
     link_type: string;
+    content_hash: string | null;
   }>;
   report.entries = rows.length;
   report.links = tableLinks.length;
 
   // 1. The chain, in insertion order
-  const declared = new Map<string, string>();
+  const declared = new Map<string, { owner: string; link: TruthLink }>();
   const bodies = new Map<string, unknown>();
   let prev: LedgerRow | null = null;
   for (const row of rows) {
@@ -165,7 +173,7 @@ export function verifyLedger(db: Database.Database): IntegrityReport {
     let hash: string;
     try {
       hash = recordHash(chainRecord(row));
-      for (const link of JSON.parse(row.appended_links ?? '[]') as TruthLink[]) declared.set(linkKey(link), row.id);
+      for (const link of JSON.parse(row.appended_links ?? '[]') as TruthLink[]) declared.set(linkKey(link), { owner: row.id, link });
       bodies.set(row.id, JSON.parse(row.body));
     } catch (err) {
       return fail({
@@ -209,15 +217,25 @@ export function verifyLedger(db: Database.Database): IntegrityReport {
   for (const l of tableLinks) {
     const key = linkKey({ fromId: l.from_id, toId: l.to_id, type: l.link_type });
     present.add(key);
-    if (!declared.has(key)) {
+    const owned = declared.get(key);
+    if (!owned) {
       return fail({
         kind: 'undeclared-link',
         id: l.to_id,
         message: `link ${l.from_id} -${l.link_type}-> ${l.to_id} was not written by any entry in the chain`,
       });
     }
+    if ((l.content_hash ?? null) !== (owned.link.contentHash ?? null)) {
+      return fail({
+        kind: 'link-hash',
+        id: owned.owner,
+        message:
+          `link ${l.from_id} -${l.link_type}-> ${l.to_id} holds content hash ${l.content_hash ?? 'null'}, ` +
+          `but entry ${owned.owner} wrote it with ${owned.link.contentHash ?? 'null'}`,
+      });
+    }
   }
-  for (const [key, owner] of declared) {
+  for (const [key, { owner }] of declared) {
     if (!present.has(key)) {
       const [fromId, toId, type] = key.split('\u0000');
       return fail({
@@ -228,7 +246,37 @@ export function verifyLedger(db: Database.Database): IntegrityReport {
     }
   }
 
-  // 3. Cached status equals the derivation from links
+  // 3. The premise index holds exactly what each entry rests on
+  const premiseRows = db.prepare('SELECT entry_id, premise_id, kind FROM truth_premises ORDER BY rowid').all() as Array<{
+    entry_id: string;
+    premise_id: string;
+    kind: 'derives' | 'wiki';
+  }>;
+  const indexed = new Map<string, string[]>();
+  for (const p of premiseRows) indexed.set(p.entry_id, [...(indexed.get(p.entry_id) ?? []), `${p.kind}:${p.premise_id}`]);
+  const premises = new Map<string, StandingNode['premises']>();
+  for (const row of rows) {
+    const links = JSON.parse(row.appended_links ?? '[]') as TruthLink[];
+    const want = premisesOf({ id: row.id, type: row.type as TruthEntryType, body: bodies.get(row.id) as Record<string, unknown>, links });
+    premises.set(row.id, want.map((p) => ({ id: p.id, kind: p.kind })));
+    const have = (indexed.get(row.id) ?? []).sort().join('\n');
+    const need = want.map((p) => `${p.kind}:${p.id}`).sort().join('\n');
+    if (have !== need) {
+      return fail({
+        kind: 'premises',
+        id: row.id,
+        seq: row.seq!,
+        message: `${row.type} ${row.id} rests on [${need.split('\n').filter(Boolean).join(', ')}], but the premise index holds [${have.split('\n').filter(Boolean).join(', ')}]`,
+      });
+    }
+    indexed.delete(row.id);
+  }
+  const stray = indexed.keys().next();
+  if (!stray.done) {
+    return fail({ kind: 'premises', id: stray.value, message: `the premise index holds entries for ${stray.value}, which is not in the chain` });
+  }
+
+  // 4. Cached status equals the derivation from links
   const derived = deriveAll(
     rows.map((r) => ({ id: r.id, type: r.type as TruthEntryType, recorded: recordedStatus(bodies.get(r.id)) })),
     tableLinks.map((l) => ({ fromId: l.from_id, toId: l.to_id, type: l.link_type as LinkType }))
@@ -249,6 +297,31 @@ export function verifyLedger(db: Database.Database): IntegrityReport {
         id: row.id,
         seq: row.seq!,
         message: `${row.type} ${row.id} is cached as ${row.struck ? '' : 'not '}struck, but its links make it ${want.struck ? '' : 'not '}struck`,
+      });
+    }
+  }
+
+  // 5. Cached standing equals the derivation over premises
+  const byId = new Map(rows.map((r) => [r.id, r]));
+  const node = (id: string): StandingNode | undefined => {
+    const row = byId.get(id);
+    if (!row) return undefined;
+    const state = derived.get(id)!;
+    return { type: row.type as TruthEntryType, status: state.status, struck: state.struck, premises: premises.get(id) ?? [] };
+  };
+  const standing = deriveStanding(
+    rows.filter((r) => r.type === 'TB' || r.type === 'UV').map((r) => r.id),
+    node
+  );
+  for (const row of rows) {
+    if (row.type !== 'TB' && row.type !== 'UV') continue;
+    const want = standing.get(row.id)!.standing;
+    if ((row.standing ?? null) !== want) {
+      return fail({
+        kind: 'standing',
+        id: row.id,
+        seq: row.seq!,
+        message: `${row.type} ${row.id} is cached as ${row.standing ?? 'null'}, but its premises make it ${want}`,
       });
     }
   }

@@ -17,8 +17,11 @@ import type Database from 'better-sqlite3';
 import { z } from 'zod';
 import { CHAIN_VERSION, chainRecord, recordHash, linkKey, verifyLedger, type IntegrityReport, type LedgerRow } from './chain.js';
 import { canonicalize } from './jcs.js';
-import { deriveAll, deriveStatus, deriveStruck, recordedStatus, type InboundLink } from './status.js';
+import { deriveAll, deriveStanding, deriveStatus, deriveStruck, recordedStatus, type DerivedStanding, type InboundLink, type StandingNode } from './status.js';
 import { checkQuorum, hasAgentPrefix, literalSetKey, quorumEvidence, type AgentClassifier, type QuorumMember } from './quorum.js';
+import { contentHash, premisesOf, type PremiseRef } from './derivation.js';
+import { INBOUND_LINKS, LINE_BODY_FIELDS, LINE_ENVELOPE_FIELDS, OUTBOUND_LINKS } from './format.js';
+import { TruthWriteError } from './errors.js';
 import {
   ulid,
   canonicalIdentity,
@@ -58,13 +61,15 @@ import {
   type VerifyBy,
   type TombstonedLiteral,
   type FiledRulingKind,
+  type Premise,
+  type Standing,
+  InferenceSchema,
+  MAX_PREMISES,
 } from './types.js';
+import { ContemptError, NotarizationRequiredError } from './errors.js';
 
-export class TruthWriteError extends Error {}
-/** Contempt of corpus: corroboration must be provenance-independent (§11). */
-export class ContemptError extends TruthWriteError {}
-/** An agent-drafted proposal reached a signing path that isn't the notary's. */
-export class NotarizationRequiredError extends TruthWriteError {}
+export { TruthWriteError, ContemptError, NotarizationRequiredError } from './errors.js';
+export { INBOUND_LINKS, LINE_BODY_FIELDS, LINE_ENVELOPE_FIELDS, OUTBOUND_LINKS } from './format.js';
 
 export interface WriteContext {
   author: string;
@@ -85,6 +90,12 @@ const CHAIN_COLUMNS: Array<[string, string]> = [
   ['prev_hash', 'TEXT'],
   ['hash', 'TEXT'],
   ['appended_links', 'TEXT'],
+];
+
+/** The columns 1.1 adds (derivation and standing), per table. */
+const DERIVATION_COLUMNS: Array<[table: string, column: string, type: string]> = [
+  ['truth_entries', 'standing', 'TEXT'],
+  ['truth_links', 'content_hash', 'TEXT'],
 ];
 
 /**
@@ -122,25 +133,13 @@ interface AppendOptions {
   backfill?: boolean;
   /** Wiki import: the entry may carry links into itself, and links to entries this ledger doesn't hold. */
   imported?: boolean;
+  /**
+   * A proposal signed: its evidence was checked when the draft was filed, or
+   * came from a wiki line, so a `wiki` ref this ledger doesn't hold is kept
+   * as the draft had it. One it holds must still be alive.
+   */
+  signed?: boolean;
 }
-
-/**
- * A wiki line's top-level fields that aren't its entry's body: the envelope,
- * the chain, and this ledger's own `x-steno`, which the export writes afresh.
- */
-export const LINE_ENVELOPE_FIELDS: readonly string[] = ['schemaVersion', 'seq', 'id', 'type', 'ts', 'author', 'prevHash', 'hash', 'x-steno'];
-
-/**
- * The body fields a wiki line of each entry type carries (spec/truth-format).
- * Any other top-level field of an imported line is a newer writer's: it is
- * kept in the body's `extra` and exported again as written.
- */
-export const LINE_BODY_FIELDS: Readonly<Record<'TB' | 'UV' | 'ADDENDUM' | 'RULING', readonly string[]>> = {
-  TB: ['claim', 'evidence', 'signedBy', 'literals', 'quorum', 'status'],
-  UV: ['assertion', 'basis', 'verifyBy', 'contests', 'status'],
-  ADDENDUM: ['evidence', 'note', 'quorum'],
-  RULING: ['kind', 'opinion', 'target'],
-};
 
 /** An imported line's unknown fields: never one the line itself defines, which the export would write twice. */
 const extraFields = (type: keyof typeof LINE_BODY_FIELDS) =>
@@ -189,6 +188,7 @@ const STORED_BODY: Partial<Record<TruthEntryType, z.ZodTypeAny>> = {
       signedBy: z.string().nullable(),
       literals: z.array(TombstonedLiteralSchema).optional(),
       quorum: z.array(QuorumMemberSchema).optional(),
+      inference: InferenceSchema.optional(),
       // Recorded by a pre-1.0 ledger or a v1 wiki line; a terminal one is a floor (status.ts)
       status: z.enum(TB_STATUSES).optional(),
       extra: extraFields('TB'),
@@ -200,6 +200,7 @@ const STORED_BODY: Partial<Record<TruthEntryType, z.ZodTypeAny>> = {
       basis: z.string().min(1),
       verifyBy: VerifyBySchema,
       contests: z.string().min(1).nullable().optional(),
+      inference: InferenceSchema.optional(),
       status: z.enum(UV_STATUSES).optional(),
       extra: extraFields('UV'),
     })
@@ -232,16 +233,6 @@ const STORED_BODY: Partial<Record<TruthEntryType, z.ZodTypeAny>> = {
   MARKER: z.object({ kind: z.literal('chained-at-migration') }).passthrough(),
 };
 
-/** The links each entry type writes from itself. */
-export const OUTBOUND_LINKS: Record<TruthEntryType, readonly LinkType[]> = {
-  TB: ['supersedes', 'signs'],
-  UV: ['contests', 'signs'],
-  ADDENDUM: ['verifies', 'refutes', 'overrides'],
-  RULING: ['strikes', 'dismisses'],
-  PROPOSAL: [],
-  MARKER: LINK_TYPES,
-};
-
 /** What a link of each type may point at (any entry, when absent). */
 const LINK_TARGET: Partial<Record<LinkType, readonly TruthEntryType[]>> = {
   overrides: ['TB'],
@@ -250,13 +241,18 @@ const LINK_TARGET: Partial<Record<LinkType, readonly TruthEntryType[]>> = {
   refutes: ['UV'],
   signs: ['PROPOSAL'],
   dismisses: ['PROPOSAL'],
+  // A premise is a TB or a UV the ledger holds (a precedent ruling, when those exist)
+  derives: ['TB', 'UV'],
 };
 
-/** Links into itself an imported entry may carry: its own history, written in a ledger we don't hold. */
-export const INBOUND_LINKS: Partial<Record<TruthEntryType, readonly LinkType[]>> = {
-  TB: ['overrides', 'contests', 'supersedes', 'strikes'],
-  UV: ['verifies', 'refutes', 'supersedes', 'strikes'],
-};
+const HEX64 = /^[0-9a-f]{64}$/;
+
+/** A premise is dead when it is overridden, refuted or struck: nothing is signed on it, and what rests on it is unsupported. */
+function isDead(entry: { type: TruthEntryType; body: { status?: unknown }; struck: boolean }): boolean {
+  if (entry.struck) return true;
+  const status = entry.body.status;
+  return (entry.type === 'TB' && status === 'overridden') || (entry.type === 'UV' && status === 'refuted');
+}
 
 function formatIssues(error: z.ZodError): string {
   return error.issues.map((i) => (i.path.length > 0 ? `${i.path.join('.')}: ${i.message}` : i.message)).join('; ');
@@ -385,12 +381,43 @@ export class TruthLedger {
       });
     }
 
+    // 1.1: standing is cached like status, a derives link keeps its premise's
+    // content hash, and truth_premises indexes what each entry rests on (its
+    // derives links and wiki evidence refs) so standing can be re-derived for
+    // the entries a write touches. A ledger from 1.0 gains them once, here.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS truth_premises (
+        entry_id TEXT NOT NULL,
+        premise_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        UNIQUE(entry_id, premise_id, kind)
+      )
+    `);
+    let upgraded = false;
+    const columnsOf = (table: string) =>
+      new Set((this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((c) => c.name));
+    const derivationMissing = () => DERIVATION_COLUMNS.filter(([table, column]) => !columnsOf(table).has(column));
+    if (derivationMissing().length > 0) {
+      if (this.db.readonly) {
+        throw new TruthWriteError(
+          "the truth ledger predates derivation (1.1) and needs its one-time upgrade: open it with 'stenographer verify' or 'stenographer start' once"
+        );
+      }
+      this.tx(() => {
+        const columns = derivationMissing();
+        if (columns.length === 0) return;
+        for (const [table, column, type] of columns) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+        upgraded = true;
+      });
+    }
+
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_truth_type_status ON truth_entries(type, status);
       CREATE INDEX IF NOT EXISTS idx_truth_target_ref ON truth_entries(target_ref);
       CREATE INDEX IF NOT EXISTS idx_truth_links_to ON truth_links(to_id);
       CREATE INDEX IF NOT EXISTS idx_truth_links_from ON truth_links(from_id);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_truth_seq ON truth_entries(seq);
+      CREATE INDEX IF NOT EXISTS idx_truth_premises_premise ON truth_premises(premise_id);
     `);
     // intakeProposal runs on every intake line and REST submission. Created
     // by any writable open, so a ledger written without it gains it; the
@@ -399,7 +426,8 @@ export class TruthLedger {
       this.db.exec(`CREATE INDEX IF NOT EXISTS idx_truth_intake_id ON truth_entries(${INTAKE_ID_SQL}) WHERE type = 'PROPOSAL'`);
     }
 
-    this.chainExistingEntries();
+    // A pre-1.0 ledger is chained first: the backfill indexes chained rows
+    if (this.chainExistingEntries() || upgraded) this.tx(() => this.backfillDerivation());
   }
 
   /**
@@ -412,16 +440,16 @@ export class TruthLedger {
    * TB the 0.x contest bookkeeping had resurrected, STENO-T-06) are listed
    * in the marker.
    */
-  private chainExistingEntries(): void {
+  private chainExistingEntries(): boolean {
     const chained = () => Boolean(this.db.prepare(`SELECT 1 FROM truth_meta WHERE key = 'chain_version'`).get());
-    if (chained()) return;
+    if (chained()) return false;
 
-    this.tx(() => {
+    return this.tx(() => {
       // Checked again under the write lock: another process may have just migrated
-      if (chained()) return;
+      if (chained()) return false;
       // Chained rows without the version record aren't a pre-1.0 ledger: leave
       // them for verify to report rather than re-chain over whatever changed.
-      if (this.db.prepare('SELECT 1 FROM truth_entries WHERE hash IS NOT NULL LIMIT 1').get()) return;
+      if (this.db.prepare('SELECT 1 FROM truth_entries WHERE hash IS NOT NULL LIMIT 1').get()) return false;
 
       const rows = this.db.prepare('SELECT * FROM truth_entries ORDER BY rowid').all() as LedgerRow[];
       if (rows.length > 0) {
@@ -509,7 +537,25 @@ export class TruthLedger {
         this.refresh(rows.map((r) => r.id));
       }
       this.db.prepare(`INSERT INTO truth_meta (key, value) VALUES ('chain_version', ?)`).run(CHAIN_VERSION);
+      return true;
     });
+  }
+
+  /**
+   * The one-time 1.1 upgrade of a ledger's rows: every entry's premises are
+   * indexed from its stored body and links (entries written before
+   * derivation get propagation without being rewritten), and every TB and
+   * UV's standing is derived and cached. Nothing the chain covers changes.
+   */
+  private backfillDerivation(): void {
+    this.db.exec('DELETE FROM truth_premises');
+    const insert = this.db.prepare('INSERT OR IGNORE INTO truth_premises (entry_id, premise_id, kind) VALUES (?, ?, ?)');
+    const ids: string[] = [];
+    for (const record of this.getChainedRecords()) {
+      ids.push(record.id);
+      for (const premise of premisesOf(record)) insert.run(record.id, premise.id, premise.kind);
+    }
+    this.refreshStanding(ids);
   }
 
   // ─────────────────────────────────────────────────────────
@@ -618,7 +664,11 @@ export class TruthLedger {
     this.tx(() => {
       this.admit(entry, links, opts);
       this.writes++;
-      const unique = [...new Map(links.map((l) => [linkKey(l), { fromId: l.fromId, toId: l.toId, type: l.type }])).values()];
+      const unique = [
+        ...new Map(
+          links.map((l) => [linkKey(l), { fromId: l.fromId, toId: l.toId, type: l.type, ...(l.contentHash !== undefined ? { contentHash: l.contentHash } : {}) }])
+        ).values(),
+      ];
       const head = this.db
         .prepare('SELECT seq, hash FROM truth_entries WHERE seq IS NOT NULL ORDER BY seq DESC LIMIT 1')
         .get() as { seq: number; hash: string } | undefined;
@@ -664,8 +714,12 @@ export class TruthLedger {
           hash,
           row.appended_links
         );
-      const insertLink = this.db.prepare('INSERT OR IGNORE INTO truth_links (from_id, to_id, link_type) VALUES (?, ?, ?)');
-      for (const link of unique) insertLink.run(link.fromId, link.toId, link.type);
+      const insertLink = this.db.prepare('INSERT OR IGNORE INTO truth_links (from_id, to_id, link_type, content_hash) VALUES (?, ?, ?, ?)');
+      for (const link of unique) insertLink.run(link.fromId, link.toId, link.type, link.contentHash ?? null);
+      const insertPremise = this.db.prepare('INSERT OR IGNORE INTO truth_premises (entry_id, premise_id, kind) VALUES (?, ?, ?)');
+      for (const premise of premisesOf({ id: entry.id, type: entry.type, body: entry.body as Record<string, unknown>, links: unique })) {
+        insertPremise.run(entry.id, premise.id, premise.kind);
+      }
       this.refresh([entry.id, ...unique.flatMap((l) => [l.fromId, l.toId])]);
     });
   }
@@ -738,6 +792,10 @@ export class TruthLedger {
       ) {
         fail('malformed link');
       }
+      if (link.type === 'derives' && !(typeof link.contentHash === 'string' && HEX64.test(link.contentHash))) {
+        fail(`a derives link carries the premise's contentHash (64 lowercase hex digits), and ${link.fromId} -derives-> ${link.toId} does not`);
+      }
+      if (link.type !== 'derives' && link.contentHash !== undefined) fail(`only a derives link carries a contentHash`);
       // The migration marker carries links whose endpoints are both elsewhere
       if (entry.type === 'MARKER') continue;
       if (link.fromId === entry.id) {
@@ -760,6 +818,103 @@ export class TruthLedger {
       } else {
         fail(`link ${link.fromId} -${link.type}-> ${link.toId} is not this entry's to write`);
       }
+    }
+    this.admitDerivation(entry, links, opts, fail);
+  }
+
+  /**
+   * What an entry rests on (spec/truth-format, "Derivation"). Its derives
+   * links, one to 16, name premises once and never itself, and come with
+   * the inference. A premise this ledger holds must hash to the pin: a
+   * mismatch is not the premise the signer attested to. A live write names
+   * only premises this ledger holds, and signs on no dead premise: one
+   * overridden, refuted or struck, or resting on one (unsupported); an open
+   * UV or a TB under appeal is allowed, and the entry starts clouded. An
+   * imported line may name a premise this ledger doesn't hold (clouded,
+   * `premise-missing`) or one that died here (unsupported), but never one
+   * that rests on it: the graph stays acyclic.
+   *
+   * A caller-submitted `wiki` evidence ref gets the same check as a premise,
+   * on live writes: it must resolve to an entry this ledger holds, alive.
+   * The backfill's `legacy:` refs and imported lines are exempt.
+   */
+  private admitDerivation(entry: NewEntry, links: TruthLink[], opts: AppendOptions, fail: (message: string) => never): void {
+    const body = entry.body as { inference?: unknown; evidence?: unknown };
+    const derives = links.filter((l) => l.type === 'derives' && l.fromId === entry.id);
+    if (derives.length > MAX_PREMISES) fail(`an entry derives from at most ${MAX_PREMISES} premises, not ${derives.length}`);
+    if (new Set(derives.map((l) => l.toId)).size !== derives.length) fail('a premise is named once');
+    if (derives.some((l) => l.toId === entry.id)) fail('an entry cannot derive from itself');
+    if ((derives.length > 0) !== (body.inference !== undefined)) {
+      fail('premises and inference come together: a derived entry names its premises and states the inference');
+    }
+    for (const link of derives) {
+      const held = this.storedRecord(link.toId);
+      if (!held) continue; // a live write already failed on `no such entry`; an import lands clouded
+      const hash = contentHash(held.type, held.author, held.body);
+      if (hash !== link.contentHash) {
+        fail(`premise ${link.toId} hashes to ${hash}, not the ${link.contentHash} this entry pins it by: it is not the premise the signer attested to`);
+      }
+      if (this.restsOn(link.toId, entry.id)) fail(`premise ${link.toId} rests on ${entry.id}: a derivation is acyclic`);
+      if (!opts.imported) this.requireAlive(link.toId, 'premise', fail);
+    }
+    if (!opts.imported && !opts.backfill && (entry.type === 'TB' || entry.type === 'ADDENDUM')) {
+      this.checkCitedEvidence(body.evidence, fail, { mustResolve: !opts.signed });
+    }
+  }
+
+  /**
+   * The `wiki` evidence refs a live write cites must name entries this
+   * ledger holds, alive (R1: an entry can no longer cite a struck or
+   * overridden TB as settling evidence). Drafts and attestations run it
+   * when they are filed, so an agent hears it at once, not at settlement.
+   */
+  private checkCitedEvidence(evidence: unknown, fail: (message: string) => never, opts: { mustResolve: boolean } = { mustResolve: true }): void {
+    if (!Array.isArray(evidence)) return;
+    for (const item of evidence as Array<{ kind?: unknown; ref?: unknown }>) {
+      if (!item || item.kind !== 'wiki' || typeof item.ref !== 'string') continue;
+      if (!this.storedRecord(item.ref)) {
+        if (opts.mustResolve) fail(`wiki evidence ${item.ref} names no entry this ledger holds`);
+        continue;
+      }
+      this.requireAlive(item.ref, 'wiki evidence', fail);
+    }
+  }
+
+  /** The write-error form of checkCitedEvidence, for the paths that file before anything is appended. */
+  private requireCitedEvidence(evidence: unknown): void {
+    this.checkCitedEvidence(evidence, (message) => {
+      throw new TruthWriteError(message);
+    });
+  }
+
+  /** Whether `id` rests on `target`, through derives links, however far down. */
+  private restsOn(id: string, target: string): boolean {
+    const below = this.db.prepare(`SELECT to_id FROM truth_links WHERE from_id = ? AND link_type = 'derives'`);
+    const seen = new Set<string>();
+    const stack = [id];
+    while (stack.length > 0) {
+      const current = stack.pop()!;
+      if (current === target) return true;
+      if (seen.has(current)) continue;
+      seen.add(current);
+      for (const row of below.all(current) as Array<{ to_id: string }>) stack.push(row.to_id);
+    }
+    return false;
+  }
+
+  /** A live write signs on nothing dead, or resting on something dead. */
+  private requireAlive(id: string, what: string, fail: (message: string) => never): void {
+    const row = this.db.prepare('SELECT type, body, status, struck, standing FROM truth_entries WHERE id = ?').get(id) as
+      | { type: TruthEntryType; body: string; status: string | null; struck: number; standing: string | null }
+      | undefined;
+    if (!row) fail(`no such entry: ${id}`);
+    const state = { type: row!.type, body: { status: row!.status }, struck: Boolean(row!.struck) };
+    if (isDead(state)) {
+      fail(`${what} ${id} is ${state.struck ? 'struck' : row!.status}: nothing is signed on a dead premise`);
+    }
+    if (row!.standing === 'unsupported') {
+      const reason = this.standingOf(id).reasons[0];
+      fail(`${what} ${id} is unsupported (${reason ? `${reason.reason} ${reason.premise}` : 'a premise below it is dead'}): nothing is signed on a dead premise`);
     }
   }
 
@@ -881,6 +1036,73 @@ export class TruthLedger {
       const struck = deriveStruck(links) ? 1 : 0;
       if (status !== (row.status ?? null) || struck !== row.struck) update.run(status, struck, row.id);
     }
+    this.refreshStanding(pending);
+  }
+
+  /**
+   * Re-derives the cached standing of `ids` and of everything resting on
+   * them, however far up (truth_premises, reverse). The only writer of the
+   * standing column.
+   */
+  private refreshStanding(ids: Iterable<string>): void {
+    const affected = new Set(ids);
+    const above = this.db.prepare('SELECT entry_id FROM truth_premises WHERE premise_id = ?');
+    const stack = [...affected];
+    while (stack.length > 0) {
+      for (const r of above.all(stack.pop()!) as Array<{ entry_id: string }>) {
+        if (!affected.has(r.entry_id)) {
+          affected.add(r.entry_id);
+          stack.push(r.entry_id);
+        }
+      }
+    }
+    const select = this.db.prepare('SELECT type, standing FROM truth_entries WHERE id = ?');
+    const update = this.db.prepare('UPDATE truth_entries SET standing = ? WHERE id = ?');
+    const derived = deriveStanding(affected, this.standingNode);
+    for (const id of affected) {
+      const row = select.get(id) as { type: string; standing: string | null } | undefined;
+      if (!row || (row.type !== 'TB' && row.type !== 'UV')) continue;
+      const want = derived.get(id)?.standing ?? 'sound';
+      if (want !== row.standing) update.run(want, id);
+    }
+  }
+
+  /** What the standing fold reads of one entry, from the cached status and standing and the premise index. */
+  private standingNode = (id: string): StandingNode | undefined => {
+    this.standingStatements ??= {
+      entry: this.db.prepare('SELECT type, status, struck, standing FROM truth_entries WHERE id = ?'),
+      premises: this.db.prepare('SELECT premise_id, kind FROM truth_premises WHERE entry_id = ? ORDER BY rowid'),
+    };
+    const row = this.standingStatements.entry.get(id) as
+      | { type: TruthEntryType; status: string | null; struck: number; standing: Standing | null }
+      | undefined;
+    if (!row) return undefined;
+    const premises = this.standingStatements.premises.all(id) as Array<{ premise_id: string; kind: 'derives' | 'wiki' }>;
+    return {
+      type: row.type,
+      status: row.status,
+      struck: Boolean(row.struck),
+      standing: row.standing,
+      premises: premises.map((p) => ({ id: p.premise_id, kind: p.kind })),
+    };
+  };
+  private standingStatements: { entry: Database.Statement; premises: Database.Statement } | null = null;
+
+  /** The standing of an entry and the premises that set it, derived now (the cached column holds the same standing). */
+  standingOf(id: string, memo?: Map<string, DerivedStanding>): DerivedStanding {
+    return deriveStanding([id], this.standingNode, memo).get(id) ?? { standing: 'sound', reasons: [] };
+  }
+
+  /** The content hash a derived entry pins `id` by, or null when this ledger doesn't hold it. */
+  contentHashOf(id: string): string | null {
+    const held = this.storedRecord(id);
+    return held ? contentHash(held.type, held.author, held.body) : null;
+  }
+
+  /** What an entry rests on: its pinned premises in link order, then the entries its evidence cites. */
+  premisesOf(id: string): PremiseRef[] {
+    const held = this.storedRecord(id);
+    return held ? premisesOf(held) : [];
   }
 
   /** Validates the hash chain, the links, and every cached status (see chain.ts). */
@@ -995,16 +1217,37 @@ export class TruthLedger {
    * draft alone never does.
    */
   draftTombstone(
-    input: { claim: string; evidence: Evidence[]; literals?: TombstonedLiteral[]; rationale?: string; targetRef?: string },
+    input: {
+      claim: string;
+      evidence: Evidence[];
+      literals?: TombstonedLiteral[];
+      rationale?: string;
+      targetRef?: string;
+      premises?: Premise[];
+      inference?: string;
+    },
     ctx: WriteContext
   ): ProposalEntry {
     // Drafts come from agents and people, never from a reserved identity
     this.accountable(ctx.author, 'drafter');
-    const { claim, evidence, literals } = TombstoneDraftInputSchema.parse(input);
+    const { claim, evidence, literals, premises, inference } = TombstoneDraftInputSchema.parse(input);
+    this.requireCitedEvidence(evidence);
+    for (const premise of premises ?? []) {
+      const held = this.contentHashOf(premise.id);
+      if (held === null) throw new TruthWriteError(`no such entry: ${premise.id}`);
+      if (held !== premise.contentHash) {
+        throw new TruthWriteError(`premise ${premise.id} hashes to ${held}, not the ${premise.contentHash} this draft pins it by`);
+      }
+    }
     return this.addProposal(
       {
         kind: 'tombstone',
-        draft: { claim, evidence, ...(literals && literals.length > 0 ? { literals } : {}) },
+        draft: {
+          claim,
+          evidence,
+          ...(literals && literals.length > 0 ? { literals } : {}),
+          ...(premises ? { premises, inference } : {}),
+        },
         signal: { source: 'agent-draft', ...(input.rationale ? { detail: input.rationale } : {}) },
         targetRef: input.targetRef ?? null,
         requiresNotary: true,
@@ -1057,10 +1300,12 @@ export class TruthLedger {
 
     // The signs link closes the proposal: it derives as signed from here on
     const signs = [{ toId: proposalId, type: 'signs' as const }];
+    // What the notary changed is theirs to cite: a wiki ref an edit adds must resolve
+    if (edits?.evidence !== undefined) this.requireCitedEvidence(edits.evidence);
     if (proposal.body.kind === 'tombstone') {
-      return this.insertTb(TbInputSchema.parse({ ...draft, signedBy }), writeCtx, signs);
+      return this.insertTb(TbInputSchema.parse({ ...draft, signedBy }), writeCtx, signs, { signed: true });
     }
-    return this.insertUv(UvInputSchema.parse(draft), writeCtx, signs);
+    return this.insertUv(UvInputSchema.parse(draft), writeCtx, signs, { signed: true });
   }
 
   /**
@@ -1097,7 +1342,7 @@ export class TruthLedger {
   // ─────────────────────────────────────────────────────────
 
   assertTombstone(
-    input: { claim: string; evidence: Evidence[]; signedBy: string; literals?: TombstonedLiteral[] },
+    input: { claim: string; evidence: Evidence[]; signedBy: string; literals?: TombstonedLiteral[]; premises?: Premise[]; inference?: string },
     ctx: WriteContext
   ): TbEntry {
     const parsed = TbInputSchema.parse(input);
@@ -1106,7 +1351,7 @@ export class TruthLedger {
   }
 
   assertUv(
-    input: { assertion: string; basis: string; verifyBy: VerifyBy; contests?: string | null },
+    input: { assertion: string; basis: string; verifyBy: VerifyBy; contests?: string | null; premises?: Premise[]; inference?: string },
     ctx: WriteContext
   ): UvEntry {
     const parsed = UvInputSchema.parse(input);
@@ -1115,14 +1360,28 @@ export class TruthLedger {
   }
 
   /** Outbound links of a new entry, by target and type. */
-  private static outbound(fromId: string, links: Array<{ toId: string; type: LinkType }>): TruthLink[] {
-    return links.map((l) => ({ fromId, toId: l.toId, type: l.type }));
+  private static outbound(fromId: string, links: Array<{ toId: string; type: LinkType; contentHash?: string }>): TruthLink[] {
+    return links.map((l) => ({ fromId, toId: l.toId, type: l.type, ...(l.contentHash !== undefined ? { contentHash: l.contentHash } : {}) }));
+  }
+
+  /** The derives links a derived entry writes: one per premise, each pinned as the writer named it. */
+  private static derivesLinks(premises: Premise[] | undefined): Array<{ toId: string; type: LinkType; contentHash: string }> {
+    return (premises ?? []).map((p) => ({ toId: p.id, type: 'derives' as const, contentHash: p.contentHash }));
   }
 
   private insertTb(
-    input: { claim: string; evidence: Evidence[]; signedBy: string; literals?: TombstonedLiteral[]; quorum?: QuorumMember[] },
+    input: {
+      claim: string;
+      evidence: Evidence[];
+      signedBy: string;
+      literals?: TombstonedLiteral[];
+      quorum?: QuorumMember[];
+      premises?: Premise[];
+      inference?: string;
+    },
     ctx: WriteContext,
-    links: Array<{ toId: string; type: LinkType }> = []
+    links: Array<{ toId: string; type: LinkType }> = [],
+    opts: Pick<AppendOptions, 'signed'> = {}
   ): TbEntry {
     const id = ulid();
     this.append(
@@ -1142,18 +1401,20 @@ export class TruthLedger {
           // Only present when given, so literal-free TBs keep their exact shape
           ...(input.literals && input.literals.length > 0 ? { literals: input.literals } : {}),
           ...(input.quorum ? { quorum: input.quorum } : {}),
+          ...(input.premises ? { inference: input.inference } : {}),
         } satisfies Omit<TbBody, 'status'>,
       },
-      TruthLedger.outbound(id, links),
-      { embedding: ctx.embedding }
+      TruthLedger.outbound(id, [...links, ...TruthLedger.derivesLinks(input.premises)]),
+      { embedding: ctx.embedding, signed: opts.signed }
     );
     return this.getEntry(id) as TbEntry;
   }
 
   private insertUv(
-    input: { assertion: string; basis: string; verifyBy: VerifyBy; contests?: string | null },
+    input: { assertion: string; basis: string; verifyBy: VerifyBy; contests?: string | null; premises?: Premise[]; inference?: string },
     ctx: WriteContext,
-    links: Array<{ toId: string; type: LinkType }> = []
+    links: Array<{ toId: string; type: LinkType }> = [],
+    opts: Pick<AppendOptions, 'signed'> = {}
   ): UvEntry {
     const insert = (): string => {
       let contests: string | null = null;
@@ -1180,12 +1441,17 @@ export class TruthLedger {
             basis: input.basis,
             verifyBy: input.verifyBy,
             contests,
+            ...(input.premises ? { inference: input.inference } : {}),
           } satisfies Omit<UvBody, 'status'>,
         },
         // Override protocol path 1 (contest): the contests link makes the TB
         // contested while this UV is open; it remains active truth.
-        TruthLedger.outbound(id, [...(contests ? [{ toId: contests, type: 'contests' as const }] : []), ...links]),
-        { embedding: ctx.embedding }
+        TruthLedger.outbound(id, [
+          ...(contests ? [{ toId: contests, type: 'contests' as const }] : []),
+          ...links,
+          ...TruthLedger.derivesLinks(input.premises),
+        ]),
+        { embedding: ctx.embedding, signed: opts.signed }
       );
       return id;
     };
@@ -1214,6 +1480,7 @@ export class TruthLedger {
     if (parsedEvidence.length === 0) {
       throw new TruthWriteError('resolving a UV requires evidence');
     }
+    this.requireCitedEvidence(parsedEvidence);
     const uv = this.mustGetTyped<UvEntry>(uvId, 'UV');
     if (uv.body.status !== 'open') {
       throw new TruthWriteError(`UV ${uvId} is already ${uv.body.status}`);
@@ -1886,7 +2153,9 @@ export class TruthLedger {
     let where: string;
     switch (filter) {
       case 'current':
-        where = `struck = 0 AND ((type = 'TB' AND status IN ('active','contested')) OR (type = 'UV' AND status = 'open'))`;
+        where =
+          `struck = 0 AND COALESCE(standing, 'sound') != 'unsupported' AND ` +
+          `((type = 'TB' AND status IN ('active','contested')) OR (type = 'UV' AND status = 'open'))`;
         break;
       case 'contested':
         where = `struck = 0 AND ((type = 'TB' AND status = 'contested') OR (type = 'UV' AND status = 'open' AND json_extract(body, '$.contests') IS NOT NULL))`;
@@ -1900,8 +2169,9 @@ export class TruthLedger {
     const rows = this.db
       .prepare(`SELECT * FROM truth_entries WHERE ${where} ORDER BY (type = 'TB') DESC, created_at ASC`)
       .all() as any[];
+    const memo = new Map<string, DerivedStanding>();
     return rows.map((r) => ({
-      ...(this.rowToEntry(r) as TbEntry | UvEntry),
+      ...(this.rowToEntry(r, memo) as TbEntry | UvEntry),
       embedding: r.embedding
         ? Array.from(
             new Float32Array(r.embedding.buffer, r.embedding.byteOffset, r.embedding.byteLength / 4)
@@ -1919,9 +2189,19 @@ export class TruthLedger {
     return rows.map(toRecord);
   }
 
-  getStats(): { tombstones: number; uvs: number; openUvs: number; openProposals: number; contested: number; rulings: number } {
+  getStats(): {
+    tombstones: number;
+    uvs: number;
+    openUvs: number;
+    openProposals: number;
+    contested: number;
+    rulings: number;
+    /** Current TBs and UVs by standing (spec/truth-format, "Standing"). */
+    standing: { sound: number; clouded: number; unsupported: number };
+  } {
     const count = (sql: string): number =>
       (this.db.prepare(sql).get() as { c: number }).c;
+    const current = `struck = 0 AND ((type = 'TB' AND status IN ('active','contested')) OR (type = 'UV' AND status = 'open'))`;
     return {
       tombstones: count(`SELECT COUNT(*) c FROM truth_entries WHERE type = 'TB'`),
       uvs: count(`SELECT COUNT(*) c FROM truth_entries WHERE type = 'UV'`),
@@ -1929,6 +2209,11 @@ export class TruthLedger {
       openProposals: count(`SELECT COUNT(*) c FROM truth_entries WHERE type = 'PROPOSAL' AND status = 'open'`),
       contested: count(`SELECT COUNT(*) c FROM truth_entries WHERE type = 'TB' AND status = 'contested'`),
       rulings: count(`SELECT COUNT(*) c FROM truth_entries WHERE type = 'RULING'`),
+      standing: {
+        sound: count(`SELECT COUNT(*) c FROM truth_entries WHERE ${current} AND COALESCE(standing, 'sound') = 'sound'`),
+        clouded: count(`SELECT COUNT(*) c FROM truth_entries WHERE ${current} AND standing = 'clouded'`),
+        unsupported: count(`SELECT COUNT(*) c FROM truth_entries WHERE ${current} AND standing = 'unsupported'`),
+      },
     };
   }
 
@@ -1937,11 +2222,12 @@ export class TruthLedger {
    * and a dismissed proposal carries who dismissed it and why, read from the
    * dismissal ruling (0.x rows recorded both in the body itself).
    */
-  private rowToEntry(row: any): TruthEntry {
+  private rowToEntry(row: any, standingMemo?: Map<string, DerivedStanding>): TruthEntry {
     const links = this.db
       .prepare('SELECT * FROM truth_links WHERE from_id = ? OR to_id = ? ORDER BY rowid')
-      .all(row.id, row.id) as Array<{ from_id: string; to_id: string; link_type: string }>;
-    let body = JSON.parse(row.body);
+      .all(row.id, row.id) as Array<{ from_id: string; to_id: string; link_type: string; content_hash: string | null }>;
+    const stored = JSON.parse(row.body);
+    let body = stored;
     if (row.status !== null && row.status !== undefined) {
       if (row.type === 'TB' && !('status' in body) && 'literals' in body) {
         // Where a TB body has always carried it: before its literals
@@ -1963,6 +2249,10 @@ export class TruthLedger {
         body.dismissReason = (JSON.parse(ruling.body) as RulingEntry['body']).opinion;
       }
     }
+    const derivation =
+      row.type === 'TB' || row.type === 'UV'
+        ? { ...this.standingOf(row.id, standingMemo), contentHash: contentHash(row.type, row.author, stored) }
+        : {};
     return {
       id: row.id,
       type: row.type,
@@ -1972,7 +2262,13 @@ export class TruthLedger {
       agentSessionId: row.agent_session_id ?? null,
       origin: row.origin,
       body,
-      links: links.map((l) => ({ fromId: l.from_id, toId: l.to_id, type: l.link_type as LinkType })),
+      links: links.map((l) => ({
+        fromId: l.from_id,
+        toId: l.to_id,
+        type: l.link_type as LinkType,
+        ...(l.content_hash ? { contentHash: l.content_hash } : {}),
+      })),
+      ...derivation,
     };
   }
 }

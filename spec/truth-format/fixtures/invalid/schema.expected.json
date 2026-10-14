@@ -77,22 +77,30 @@
   },
   {
     "line": 20,
-    "reason": "a quorum of one member"
+    "reason": "a derived TB with an empty inference"
   },
   {
     "line": 21,
-    "reason": "a quorum ADDENDUM whose members carry no verdict"
+    "reason": "a derives link whose contentHash is not a hash"
   },
   {
     "line": 22,
-    "reason": "a quorum TB without literals: the agreement it certifies would name nothing (quorum rule 5)"
+    "reason": "a quorum of one member"
   },
   {
     "line": 23,
-    "reason": "a v1 line (no schemaVersion) carrying a quorum: agents settle together only on v2 lines"
+    "reason": "a quorum ADDENDUM whose members carry no verdict"
   },
   {
     "line": 24,
+    "reason": "a quorum TB without literals: the agreement it certifies would name nothing (quorum rule 5)"
+  },
+  {
+    "line": 25,
+    "reason": "a v1 line (no schemaVersion) carrying a quorum: agents settle together only on v2 lines"
+  },
+  {
+    "line": 26,
     "reason": "a quorum ADDENDUM member whose verdict is neither verified nor refuted (on a TB member, verdict is an unknown field; on an ADDENDUM member it is one of the two)"
   }
 ]

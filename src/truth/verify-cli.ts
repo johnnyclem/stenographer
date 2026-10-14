@@ -71,7 +71,7 @@ export function formatLedgerCheck(path: string, check: LedgerCheck): string[] {
         );
       }
       if (report.ok) {
-        lines.push(`OK: ${report.entries} entries, ${report.links} links; chain intact and every status matches its links.`);
+        lines.push(`OK: ${report.entries} entries, ${report.links} links; chain intact, every status matches its links and every standing its premises.`);
       } else {
         lines.push(`INTEGRITY FAILURE (${report.failure!.kind}): ${report.failure!.message}`);
       }

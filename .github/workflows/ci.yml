@@ -23,6 +23,11 @@ jobs:
       - run: npm run lint
       - run: npm test
       - run: npm run build
+      # The truth-format subpath loads where better-sqlite3 cannot (PRD R8):
+      # the hook refuses the driver, so a file in the subpath's import graph
+      # that loads it fails the step.
+      - name: The truth-format subpath loads without better-sqlite3
+        run: node --import ./test/helpers/forbid-sqlite.mjs -e "await import('./dist/truth-format.js')" --input-type=module
       # The OpenAPPA battery: `appa describe --check` against the built
       # server's tool list, then `appa replay`. The battery is written
       # against one OpenAPPA release; its installer verifies the archive
