@@ -20,6 +20,7 @@ import { canonicalize } from './jcs.js';
 import { deriveAll, deriveStanding, deriveStatus, deriveStruck, recordedStatus, type DerivedStanding, type InboundLink, type StandingNode } from './status.js';
 import { checkQuorum, hasAgentPrefix, literalSetKey, quorumEvidence, type AgentClassifier, type QuorumMember } from './quorum.js';
 import { contentHash, premisesOf, type PremiseRef } from './derivation.js';
+import { DEFAULT_UV_HORIZON_SECONDS, MAX_UV_HORIZON_SECONDS, freshness, type Freshness, type Reattestation } from './freshness.js';
 import { INBOUND_LINKS, LINE_BODY_FIELDS, LINE_ENVELOPE_FIELDS, OUTBOUND_LINKS } from './format.js';
 import { DERIVATION_DETECTOR, detectSuspects, triggersSuspicion, type SuspectPremise } from './suspicion.js';
 import { TruthWriteError } from './errors.js';
@@ -216,6 +217,8 @@ const STORED_BODY: Partial<Record<TruthEntryType, z.ZodTypeAny>> = {
       verifyBy: VerifyBySchema,
       contests: z.string().min(1).nullable().optional(),
       inference: InferenceSchema.optional(),
+      // A writer's horizon (freshness.ts): a positive whole number of seconds; the cap against the default is insertUv's
+      horizon: z.number().int().positive().max(MAX_UV_HORIZON_SECONDS).optional(),
       status: z.enum(UV_STATUSES).optional(),
       extra: extraFields('UV'),
     })
@@ -296,6 +299,12 @@ export interface TruthLedgerOptions {
    * reads its signer registry (identity.ts agentClassifier).
    */
   isAgent?: AgentClassifier;
+  /**
+   * The default UV horizon in seconds (freshness.ts): the team's sprint
+   * length, 21 days unless the team configures it (decision D7). A writer
+   * may set a UV's horizon shorter, never longer.
+   */
+  uvHorizonSeconds?: number;
 }
 
 export class TruthLedger {
@@ -303,11 +312,47 @@ export class TruthLedger {
   /** Bumped on every write through this instance — cheap cache invalidation. */
   private writes = 0;
   private classifyAgent: AgentClassifier;
+  private horizon: number;
 
   constructor(db: Database.Database, options: TruthLedgerOptions = {}) {
     this.db = db;
     this.classifyAgent = options.isAgent ?? hasAgentPrefix;
+    const horizon = options.uvHorizonSeconds ?? DEFAULT_UV_HORIZON_SECONDS;
+    if (!Number.isInteger(horizon) || horizon <= 0) throw new Error(`uvHorizonSeconds must be a positive whole number of seconds, got ${String(horizon)}`);
+    this.horizon = horizon;
     this.init();
+  }
+
+  /** The default UV horizon this ledger renders with, in seconds (freshness.ts). */
+  uvHorizonSeconds(): number {
+    return this.horizon;
+  }
+
+  /** The lines that re-attest a UV: entries that aren't struck with a `corroborates` or `derives` link into it, in ledger order. */
+  reattestationsOf(uvId: string): Reattestation[] {
+    return (
+      this.db
+        .prepare(
+          `SELECT e.id, e.created_at FROM truth_links l JOIN truth_entries e ON e.id = l.from_id
+           WHERE l.to_id = ? AND l.link_type IN ('corroborates', 'derives') AND e.struck = 0 ORDER BY e.seq`
+        )
+        .all(uvId) as Array<{ id: string; created_at: string }>
+    ).map((r) => ({ id: r.id, ts: r.created_at }));
+  }
+
+  /**
+   * A UV's freshness as of `now` (epoch ms), by this ledger's default
+   * horizon (freshness.ts). The ledger holds no clock: a reader that states
+   * a time passes the clock it read, so the answer carries its derivation.
+   * Null for an id that isn't a UV this ledger holds.
+   */
+  freshnessOf(uvId: string, now: number): Freshness | null {
+    const row = this.db.prepare('SELECT type, created_at, body FROM truth_entries WHERE id = ?').get(uvId) as
+      | { type: string; created_at: string; body: string }
+      | undefined;
+    if (!row || row.type !== 'UV') return null;
+    const body = JSON.parse(row.body) as { horizon?: unknown };
+    return freshness({ ts: row.created_at, horizon: body.horizon }, this.reattestationsOf(uvId), now, this.horizon);
   }
 
   /** Whether `identity` is an agent's, by this ledger's classifier. */
@@ -1451,7 +1496,7 @@ export class TruthLedger {
   }
 
   assertUv(
-    input: { assertion: string; basis: string; verifyBy: VerifyBy; contests?: string | null; premises?: Premise[]; inference?: string },
+    input: { assertion: string; basis: string; verifyBy: VerifyBy; contests?: string | null; premises?: Premise[]; inference?: string; horizon?: number },
     ctx: WriteContext
   ): UvEntry {
     const parsed = UvInputSchema.parse(input);
@@ -1517,11 +1562,15 @@ export class TruthLedger {
   }
 
   private insertUv(
-    input: { assertion: string; basis: string; verifyBy: VerifyBy; contests?: string | null; premises?: Premise[]; inference?: string },
+    input: { assertion: string; basis: string; verifyBy: VerifyBy; contests?: string | null; premises?: Premise[]; inference?: string; horizon?: number },
     ctx: WriteContext,
     links: Array<{ toId: string; type: LinkType }> = [],
     opts: Pick<AppendOptions, 'signed'> = {}
   ): UvEntry {
+    // A writer may shorten a UV's horizon, never lengthen it past the ledger's default (freshness.ts)
+    if (input.horizon !== undefined && input.horizon > this.horizon) {
+      throw new TruthWriteError(`a UV's horizon may be shorter than this ledger's default of ${this.horizon} seconds, not longer (${input.horizon})`);
+    }
     const insert = (): string => {
       let contests: string | null = null;
       if (input.contests) {
@@ -1548,6 +1597,7 @@ export class TruthLedger {
             verifyBy: input.verifyBy,
             contests,
             ...(input.premises ? { inference: input.inference } : {}),
+            ...(input.horizon !== undefined ? { horizon: input.horizon } : {}),
           } satisfies Omit<UvBody, 'status'>,
         },
         // Override protocol path 1 (contest): the contests link makes the TB
@@ -2604,6 +2654,7 @@ export class TruthLedger {
     // A nominated UV: a corroborates link into it from an ADDENDUM that isn't struck
     const corroborated =
       row.type === 'UV' && links.some((l) => l.to_id === row.id && l.link_type === 'corroborates') && this.isCorroborated(row.id) ? { corroborated: true as const } : {};
+
     return {
       id: row.id,
       type: row.type,

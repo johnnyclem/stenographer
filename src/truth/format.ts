@@ -23,7 +23,7 @@ export const LINE_ENVELOPE_FIELDS: readonly string[] = ['schemaVersion', 'seq', 
  */
 export const LINE_BODY_FIELDS: Readonly<Record<'TB' | 'UV' | 'ADDENDUM' | 'RULING', readonly string[]>> = {
   TB: ['claim', 'evidence', 'signedBy', 'literals', 'quorum', 'inference', 'answerableBy', 'approvals', 'status'],
-  UV: ['assertion', 'basis', 'verifyBy', 'contests', 'inference', 'status'],
+  UV: ['assertion', 'basis', 'verifyBy', 'contests', 'inference', 'horizon', 'status'],
   ADDENDUM: ['evidence', 'note', 'quorum'],
   RULING: ['kind', 'opinion', 'target', 'answerableBy', 'scope'],
 };
@@ -50,8 +50,10 @@ export const INBOUND_LINKS: Partial<Record<TruthEntryType, readonly LinkType[]>>
  * under appeal (status `contested`) carries its appeal and is never grounds
  * for a denial; a clouded TB (standing `clouded`) carries its weak premise;
  * an open UV is the dragon marker: flag, don't block, and a corroborated
- * one (nominated by three agent sessions) says so, with the same rule. An
- * unsupported entry is history and gets no marker.
+ * one (nominated by three agent sessions) says so, with the same rule, and
+ * a stale one (past its horizon by the reader's clock, freshness.ts) says
+ * that instead: still open, still a flag. An unsupported entry is history
+ * and gets no marker.
  */
 export const MARKERS = {
   TB: '[TB]',
@@ -59,6 +61,7 @@ export const MARKERS = {
   TB_CLOUDED: '[TB ⚠ CLOUDED]',
   UV: '[UV — UNVERIFIED]',
   UV_CORROBORATED: '[UV · CORROBORATED]',
+  UV_STALE: '[UV — STALE]',
 } as const;
 
 /**
@@ -72,10 +75,21 @@ export function displayStatus(status: string | null | undefined, struck = false)
   return status ?? 'unknown';
 }
 
-/** The marker for a current TB or UV, by status, standing and (a UV) nomination; null for one consumers don't cite. */
-export function markerFor(type: TruthEntryType, status: string | null | undefined, standing?: string | null, corroborated?: boolean): string | null {
+/**
+ * The marker for a current TB or UV, by status, standing and (a UV) nomination
+ * and staleness; null for one consumers don't cite. A nominated UV keeps its
+ * marker when stale: the nomination is the stronger signal, and the entry's
+ * freshness says the rest.
+ */
+export function markerFor(
+  type: TruthEntryType,
+  status: string | null | undefined,
+  standing?: string | null,
+  corroborated?: boolean,
+  stale?: boolean
+): string | null {
   if (standing === 'unsupported') return null;
-  if (type === 'UV') return status === 'open' ? (corroborated ? MARKERS.UV_CORROBORATED : MARKERS.UV) : null;
+  if (type === 'UV') return status === 'open' ? (corroborated ? MARKERS.UV_CORROBORATED : stale ? MARKERS.UV_STALE : MARKERS.UV) : null;
   if (type !== 'TB') return null;
   if (status === 'contested') return MARKERS.TB_UNDER_APPEAL;
   if (status === 'active') return standing === 'clouded' ? MARKERS.TB_CLOUDED : MARKERS.TB;

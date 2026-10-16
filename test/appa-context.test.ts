@@ -207,10 +207,11 @@ describe('OpenAPPA context provider (POST /appa/context)', () => {
   });
 
   it('is read-only: the ledger is unchanged by a consult', async () => {
-    // The docket's oldest age is read off the clock; everything else is the ledger's
+    // The docket's oldest age and its asOf are read off the clock; everything else is the ledger's
     const stats = async () => {
       const { docket, ...rest } = await engine.getTruthStats();
-      return { ...rest, docket: { ...docket, oldest: docket.oldest && { id: docket.oldest.id, createdAt: docket.oldest.createdAt } } };
+      const { asOf: _asOf, ...docketRest } = docket;
+      return { ...rest, docket: { ...docketRest, oldest: docket.oldest && { id: docket.oldest.id, createdAt: docket.oldest.createdAt } } };
     };
     const before = await stats();
     await replay(recorded('bash-asserts-dead-literal'));

@@ -63,6 +63,7 @@ Believed true, stated before anyone verified it. Flag it; don't block on it.
 | `verifyBy` | `{kind, value, detail?}`. Known kinds: `command`, `inspect`, `ask`, `observe`. |
 | `contests` | The TB this UV disputes, or `null`. **The UV's line is the contest.** No other line carries it. |
 | `inference` | Optional. On a derived UV, one sentence stating the inference from its premises to the assertion ([Derivation](#derivation)). |
+| `horizon` | Optional. A positive whole number of seconds, at most ten years: how long the UV stays fresh after it was asserted or last re-attested, when that is shorter than the reader's default ([Freshness](#freshness)). |
 | `status` | The UV's status when the line was written: `open`, `verified`, `refuted` or `struck`. |
 
 ### ADDENDUM and RULING: what changed a status
@@ -113,7 +114,7 @@ A reader's current status for an entry is **the `status` of the highest-`seq` TR
 - Consumers SHOULD treat an active TB as ground truth, a contested TB as ground truth with a visible asterisk (cite the contesting UV), and an open UV as a heads-up, never a demand. A refuted UV and an overridden or struck TB are history: never cite them as support.
 - Each file is one writer's view. A reader that merges several files folds each one on its own, then takes, per entry, the most advanced status on the lattice TB `active < contested < overridden < struck`, UV `open < verified < refuted < struck`.
 
-Renderers that put truth into a model's context use these markers, and escape them when they appear inside untrusted text: `[TB]`, `[TB ⚠ CONTESTED]`, `[UV — UNVERIFIED]`.
+Renderers that put truth into a model's context use these markers, and escape them when they appear inside untrusted text: `[TB]`, `[TB ⚠ UNDER APPEAL]` (a contested TB), `[TB ⚠ CLOUDED]`, `[UV — UNVERIFIED]`, `[UV · CORROBORATED]` and `[UV — STALE]` ([Freshness](#freshness)).
 
 ## Derivation
 
@@ -215,6 +216,18 @@ Three or more agent sessions approving a UV from different angles do not promote
 A nomination keeps the [agent quorum](#agent-quorum) rules with three differences, all read off the line: rule 1 asks for three members, not two; rule 4 (the 15-minute window) doesn't bind it, since it settles nothing, so approvals days apart nominate together; and rule 5 asks that every member's `verdict` is `verified` and that the line carries no `verifies`, `refutes` or `overrides` link beside its `corroborates` link. Rules 2, 3 and 6 are unchanged: the writer is a member, every member cites settling evidence of its own with no item shared and two kinds between them, and the line's `evidence` is the members'. Readers MUST refuse a line that breaks them. A nomination travels in a wiki stream and emits no TRANSITION. A 1.0 reader doesn't know `corroborates`, fails closed on it and holds the line; the UV stays open there too, which is all a nomination does for an upgraded reader.
 
 Agents' tombstone drafts nominate the same way, read off the open drafts of one set of literals from three sessions and different angles; no line is written, since a draft is not an entry, and the drafts go first on the person's docket.
+
+## Freshness
+
+A TB is an action: a fact someone settled, and it does not decay. A UV is an observation: a belief stated before anyone verified it, and it should not stay a dragon forever. So an open UV has a **horizon**, and a reader renders it **stale** once the clock has moved past that horizon since the UV was asserted or last re-attested. Stale is a rendering state, never a status: a stale UV is still `open`, still a flag and never a block, still promotable, and nothing on any line changes when it goes stale. A TB and a precedent never go stale.
+
+Freshness is a pure function of the lines and the reader's clock:
+
+- *anchor* is the newest of the UV line's own `ts` and the `ts` of every line that **re-attests** it: a line carrying a `corroborates` link into it (a [nomination](#nomination)) or a `derives` link into it (a derived entry, whose signer attested the premise was in good standing when it was signed, [Derivation](#derivation)), leaving out lines a ruling struck;
+- *horizon* is the UV line's `horizon` when it carries one shorter than the reader's default, else the reader's default. The default is the team's sprint length: **21 days** unless the team configures it (stenographer: `--uv-horizon <seconds>`). A writer MAY shorten a UV's horizon and MUST NOT lengthen it past the default it writes under (stenographer refuses the write); a reader clamps a longer one it finds in another team's stream rather than refusing the line;
+- the UV is *stale* when the clock reads more than *horizon* seconds past *anchor*, else *fresh*.
+
+A reader that states freshness MUST state its derivation beside it: the anchor it measured from (the chain timestamp, and which line set it), the clock reading it measured at, and the horizon that applied (stenographer's `freshness`: `{state, since, anchor, at, horizonSeconds, expiresAt, elapsedSeconds}`). No reader infers elapsed time from anything but a chain timestamp and a clock reading, and no line ever carries a freshness. Renderers use the marker `[UV — STALE]` for a stale open UV, keep `[UV · CORROBORATED]` for a nominated one whether or not it is stale, and apply the consumption rule for a UV either way: flag, don't block. A docket lists nominated UVs first, then stale ones, then the rest, oldest first. A UV whose anchor names no readable time is stale, failing closed.
 
 ## Precedents
 
@@ -354,6 +367,30 @@ A consumer's test SHOULD validate every valid line against the schema, parse it 
 
 The fixtures come from a real ledger with the clock and the random source pinned, so the same code always writes the same bytes. A change to the fixtures is a change to the format. `UPDATE_TRUTH_FORMAT_FIXTURES=1 npx vitest run test/truth-format.test.ts` regenerates them; review the diff.
 
+## Properties
+
+Every MUST above is a property a conforming reader or writer can be checked against. Stenographer numbers them here, in the order of the sections they come from, and `test/properties.test.ts` holds one property-based test (fast-check) named for each, run in CI on every commit. A reimplementation of the format is **conforming** when P1, P3, P4, P7, P8, P9, P10 and P13 to P15 hold for it and it passes the [fixtures](#fixtures); P2, P5, P6, P11, P12, P16 and P17 are stenographer's own guarantees about its ledger and its review, which a reader that only folds streams need not reproduce.
+
+| | Property | Section |
+|---|---|---|
+| **P1** | Every line hashes over its predecessor: a change to any line is refused by the codec (its hash no longer matches), and a line re-hashed after a change breaks the chain at the line after it, so the file is refused from that point on. | [Streams](#streams) |
+| **P2** | The ledger detects a change to any chained row at that row: `stenographer verify` names it. | [Streams](#streams) |
+| **P3** | The identity on a line is bound into its hash: a line never verifies under another `author` or `signedBy`. | [Identities](#identities) |
+| **P4** | A TB an agent signs alone is refused at write, and a line claiming one never lands as truth on import, whatever the name and with or without a registry. | [Importing](#importing-stenographers-rules), rule 3 |
+| **P5** | Attestations sharing a session, or sharing an evidence item, never count as independent: they nominate nothing and form no quorum. | [Agent quorum](#agent-quorum), [Nomination](#nomination) |
+| **P6** | N copies of one attestation corroborate exactly as much as one: a session approves once, and later approvals from it are refused. | [Nomination](#nomination) |
+| **P7** | The premise graph is acyclic by construction: a premise is an entry the ledger already holds, so every premise precedes what rests on it; an entry can't rest on itself or on an id the ledger doesn't hold. | [Derivation](#derivation) |
+| **P8** | A write citing a dead premise (struck, overridden or refuted) is refused. | [Derivation](#derivation) |
+| **P9** | A `contentHash` that is not the premise's is refused. | [Derivation](#derivation) |
+| **P10** | Striking a premise makes exactly its transitive dependents `unsupported`, and changes no other entry's standing. | [Derivation](#derivation), Standing |
+| **P11** | Refuting a derived entry on evidence that isn't a ledger entry files one review proposal per live TB premise and changes no premise's status. | The suspicion detector (stenographer README) |
+| **P12** | No sequence of agent or reporter approvals mints a TB; a person's approval with one more approver does, and the person answers for it. | [Approvals and promotion](#approvals-and-promotion) |
+| **P13** | For a fixed line, freshness is monotone in the clock: once stale, stale; elapsed time never decreases. | [Freshness](#freshness) |
+| **P14** | A TB's rendering is invariant under the clock: it has no freshness at any time. | [Freshness](#freshness) |
+| **P15** | A re-attestation resets freshness from its own timestamp, and the horizon applied never exceeds the reader's default. | [Freshness](#freshness) |
+| **P16** | The docket orders nominated UVs, then stale ones, then the rest, oldest first, states the clock it measured against, and a stale UV stays open: it blocks nothing. | [Freshness](#freshness) |
+| **P17** | No read changes the ledger: its bytes, its stream and its head hash are the same after any sequence of reads. | [Importing](#importing-stenographers-rules), [Exporting](#exporting-stenographers-rules) |
+
 ## Versioning
 
-`schemaVersion` changes when a rule changes or a field's meaning does. Readers MUST refuse a `schemaVersion` they don't know rather than guess. A new optional field or value that readers can ignore, failing closed, keeps version 2 and is listed in stenographer's CHANGELOG. A new settling evidence kind or resolution link type is such a value: an older reader keeps the quorum lines that use it, and they settle nothing for it. So are `derives` links, `contentHash` and `inference` ([Derivation](#derivation)), `approvals`, `answerableBy` and `corroborates` ([Approvals and promotion](#approvals-and-promotion), [Nomination](#nomination)), and the ruling kind `precedent` with `scope` and `supersedes` between precedents ([Precedents](#precedents)), all added in stenographer 1.1: a 1.0 reader keeps a derived line and files it as `unknown-value`, admits a promoted TB (a person signed it), and holds a nomination or a precedent, never as truth.
+`schemaVersion` changes when a rule changes or a field's meaning does. Readers MUST refuse a `schemaVersion` they don't know rather than guess. A new optional field or value that readers can ignore, failing closed, keeps version 2 and is listed in stenographer's CHANGELOG. A new settling evidence kind or resolution link type is such a value: an older reader keeps the quorum lines that use it, and they settle nothing for it. So are `derives` links, `contentHash` and `inference` ([Derivation](#derivation)), `approvals`, `answerableBy` and `corroborates` ([Approvals and promotion](#approvals-and-promotion), [Nomination](#nomination)), and the ruling kind `precedent` with `scope` and `supersedes` between precedents ([Precedents](#precedents)), all added in stenographer 1.1: a 1.0 reader keeps a derived line and files it as `unknown-value`, admits a promoted TB (a person signed it), and holds a nomination or a precedent, never as truth. So is a UV's `horizon` ([Freshness](#freshness)): a 1.0 reader keeps it as an unknown field and renders the UV as it always did, never stale.

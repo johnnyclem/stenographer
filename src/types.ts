@@ -328,6 +328,12 @@ export interface StenographerConfig {
    * file itself are refused.
    */
   wikiDir?: string;
+  /**
+   * The default UV horizon in seconds (truth/freshness.ts): the team's
+   * sprint length. 21 days unless the team sets it (decision D7); nothing
+   * guesses it from anything else.
+   */
+  uvHorizonSeconds?: number;
   /** Port for the REST API. Defaults to 8787 in daemon mode, off otherwise. */
   restPort?: number;
   /**

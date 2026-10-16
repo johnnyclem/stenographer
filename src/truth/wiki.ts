@@ -194,6 +194,7 @@ function buildStream(ledger: TruthLedger): { lines: WikiLine[]; skipped: Array<{
               verifyBy: b.verifyBy,
               contests: b.contests ?? null,
               ...(b.inference !== undefined ? { inference: b.inference } : {}),
+              ...(b.horizon !== undefined ? { horizon: b.horizon } : {}),
             };
       if (emit({ ...envelope, ...body, status, ...extra, 'x-steno': steno }, r.id)) {
         stated.set(r.id, status);
@@ -538,6 +539,7 @@ function entryOf(d: DecodedWikiLine): EntryOf {
           verifyBy: line.verifyBy,
           contests: line.contests,
           ...(line.inference !== undefined ? { inference: line.inference } : {}),
+          ...(line.horizon !== undefined ? { horizon: line.horizon } : {}),
           ...floor,
           ...extraOf(line, type),
         };
