@@ -186,6 +186,7 @@ export class Stenographer implements StenographerAPI {
     // `agent:` prefix, and always this server's own agent identity
     this.store = new StateStore(config.statePath || './stenographer.db', {
       isAgent: agentClassifier(this.signers, [config.agentIdentity]),
+      uvHorizonSeconds: config.uvHorizonSeconds,
     });
     try {
       this.applyAgentQuorum(config.agentQuorum, config.profile ?? 'agent');
@@ -1415,6 +1416,7 @@ export class Stenographer implements StenographerAPI {
     contests?: string | null;
     premises?: Premise[];
     inference?: string;
+    horizon?: number;
     author: string;
     agentSessionId?: string;
   }): Promise<UvEntry> {
@@ -1428,6 +1430,7 @@ export class Stenographer implements StenographerAPI {
         contests: input.contests,
         premises: input.premises,
         inference: input.inference,
+        horizon: input.horizon,
       },
       { author, agentSessionId: input.agentSessionId ?? null, embedding }
     );
@@ -1760,15 +1763,29 @@ export class Stenographer implements StenographerAPI {
         a.uv.createdAt.localeCompare(b.uv.createdAt)
     );
 
+    const now = this.now();
     return scored.slice(0, k).map(({ uv, suspect, contesting, relevance, deprioritized }) => {
       const { embedding: _drop, ...entry } = uv;
-      return { ...entry, queueRank: { suspect, contesting, relevance, deprioritized } };
+      return { ...this.withFreshness(entry, now), queueRank: { suspect, contesting, relevance, deprioritized } };
     });
   }
 
   /** All TB+UV disputes, for humans and dashboards. */
   async getContestedTruth(): Promise<Array<{ tombstone: TbEntry; contestedBy: UvEntry[] }>> {
-    return this.store.truth.getContested();
+    const now = this.now();
+    return this.store.truth.getContested().map((c) => ({ tombstone: c.tombstone, contestedBy: c.contestedBy.map((uv) => this.withFreshness(uv, now)) }));
+  }
+
+  /**
+   * A UV as a reader sees it: with its freshness by this engine's clock
+   * (truth/freshness.ts), computed on the read and stored nowhere. The same
+   * clock reading serves one whole read, so every entry in it carries the
+   * same `at`. Any other entry type passes through untouched.
+   */
+  private withFreshness<T extends { id: string; type: string }>(entry: T, now: number): T {
+    if (entry.type !== 'UV') return entry;
+    const fresh = this.store.truth.freshnessOf(entry.id, now);
+    return fresh ? { ...entry, freshness: fresh } : entry;
   }
 
   /**
@@ -1783,7 +1800,8 @@ export class Stenographer implements StenographerAPI {
 
   /** Truth entries by filter; ties between TB and UV break toward the TB. */
   async getTruth(filter: TruthFilter = 'current'): Promise<Array<TbEntry | UvEntry>> {
-    return this.store.truth.getTruth(filter).map(({ embedding: _drop, ...entry }) => entry);
+    const now = this.now();
+    return this.store.truth.getTruth(filter).map(({ embedding: _drop, ...entry }) => this.withFreshness(entry, now));
   }
 
   /**
@@ -1813,11 +1831,12 @@ export class Stenographer implements StenographerAPI {
       entries.push({ ...p, embedding });
     }
 
+    const now = this.now();
     return entries
       .map((entry) => {
         const { embedding, ...rest } = entry;
         const relevance = embedding ? cosineSimilarity(queryEmbedding, embedding) : 0;
-        return { ...rest, relevance };
+        return { ...this.withFreshness(rest, now), relevance };
       })
       .sort(
         (a, b) =>
@@ -1858,12 +1877,18 @@ export class Stenographer implements StenographerAPI {
     rulings: number;
     standing: { sound: number; clouded: number; unsupported: number };
     /** The review docket's size and the age of its oldest item (R9): a neglected docket is visible without being loud. */
-    docket: { size: number; nominated: number; oldest: { id: string; createdAt: string; ageMs: number } | null };
+    docket: { size: number; nominated: number; stale: number; asOf: string; oldest: { id: string; createdAt: string; ageMs: number } | null };
   }> {
     const docket = buildDocket({ ledger: this.store.truth, approvals: this.store.approvals, attestations: this.store.attestations }, this.now());
     return {
       ...this.store.truth.getStats(),
-      docket: { size: docket.size, nominated: docket.nominated, oldest: docket.oldest ? { id: docket.oldest.id, createdAt: docket.oldest.createdAt, ageMs: docket.oldest.ageMs } : null },
+      docket: {
+        size: docket.size,
+        nominated: docket.nominated,
+        stale: docket.stale,
+        asOf: docket.asOf,
+        oldest: docket.oldest ? { id: docket.oldest.id, createdAt: docket.oldest.createdAt, ageMs: docket.oldest.ageMs } : null,
+      },
     };
   }
 

@@ -500,7 +500,7 @@ describe('R9: the review docket and session', () => {
       const engine = agent.engine;
       const uv = await engine.assertUv({ assertion: 'LOG_BUDGET is 100 everywhere.', basis: 'the config change', verifyBy: { kind: 'inspect', value: 'config.ts' }, author: 'sam' });
       const status = await engine.getTruthStats();
-      expect(status.docket).toEqual({ size: 1, nominated: 0, oldest: { id: uv.id, createdAt: uv.createdAt, ageMs: expect.any(Number) } });
+      expect(status.docket).toEqual({ size: 1, nominated: 0, stale: 0, asOf: new Date(T0 + 30 * MIN).toISOString(), oldest: { id: uv.id, createdAt: uv.createdAt, ageMs: expect.any(Number) } });
       expect((await call(agent, 'get_status', {})).truth.docket.size).toBe(1);
 
       const approved = await call(agent, 'approve', { uvId: uv.id, evidence: [COMMIT], note: 'the commit says so' });

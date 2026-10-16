@@ -164,6 +164,11 @@ Options (start):
       --wiki-dir <dir>     directory wiki import/export read and write
                            (default: wiki/ next to the state file); files
                            are named relative to it, nothing outside it
+      --uv-horizon <seconds>
+                           the team's sprint length: how long an open UV
+                           stays fresh before reads render it STALE
+                           (default: 1814400, 21 days); a writer may set a
+                           UV's own horizon shorter, never longer
       --skip-verify        serve even if the truth ledger fails its integrity
                            check (by default start refuses; see
                            'stenographer verify')

@@ -12,6 +12,7 @@
  */
 
 import { z } from 'zod';
+import { MAX_UV_HORIZON_SECONDS, type Freshness } from './freshness.js';
 import type { QuorumMember } from './quorum.js';
 
 // ─────────────────────────────────────────────────────────────
@@ -391,6 +392,12 @@ export interface TruthEnvelope {
    * UV: flag, don't block.
    */
   corroborated?: true;
+  /**
+   * Read-side, on a UV: whether it is past its horizon by the reader's
+   * clock, with the chain timestamp and clock reading that says so
+   * (freshness.ts). Never stored, never on a wiki line.
+   */
+  freshness?: Freshness;
 }
 
 /**
@@ -439,6 +446,12 @@ export interface UvBody {
   contests?: string | null;
   /** The inference from its premises (the `derives` links) to the assertion, when it is derived. */
   inference?: string;
+  /**
+   * Seconds from the UV's chain timestamp (or its newest re-attestation's)
+   * past which readers render it stale (freshness.ts). A writer may set it
+   * shorter than the reader's default, never longer; absent means the default.
+   */
+  horizon?: number;
   status: UvStatus;
   extra?: ExtraFields;
 }
@@ -594,6 +607,8 @@ export const UvInputSchema = z
       .nullish()
       .transform((v) => v ?? undefined),
     ...DerivationInput,
+    /** Seconds until readers render the UV stale: shorter than the ledger's default, never longer (freshness.ts). */
+    horizon: z.number().int().positive().max(MAX_UV_HORIZON_SECONDS).optional(),
   })
   .refine(derivationTogether, DERIVATION_TOGETHER);
 
@@ -633,6 +648,7 @@ export const CONSUMPTION_RULES = `Consumption rules by confidence type and stand
 - Unsupported entry (standing unsupported): history. A premise below it is overridden, refuted or struck; never cite it as support, never deny on it.
 - Open UV: FLAG, DON'T BLOCK. A finding grounded only in a UV is phrased as a question or heads-up, never a demanded change. If your current task can check the UV, approve it with your evidence (approve): a UV becomes a TB only when a person approves it and one other approver agrees; three agent sessions agreeing nominate it for the person's review, and it stays a UV until then.
 - Corroborated UV (marker [UV · CORROBORATED]): three or more agent sessions found the same thing from different angles. Still a UV: flag, don't block. It is the cheapest context to hand another agent, with the receipts.
+- Stale UV (marker [UV — STALE]): an open UV past its horizon (21 days by default, or the shorter horizon its line set) since it was asserted or last re-attested, by the reader's clock. Still open, still a flag, never a block: it has sat unverified longer than a belief should. Prefer checking it (approve with your evidence) or deriving from it, which re-attests it, over repeating it. TBs and precedents never go stale.
 - Refuted UV / overridden TB: retrievable for history, excluded from current-truth by default, never citable as support for a claim.
 - Precedents (RULING kind precedent, with a scope such as ci.merge-on-red): a person's standing policy decision. Before asking a person to decide, search precedents (get_precedents, search_truth); if one applies, follow it and cite its id. A superseded precedent is history.`;
 

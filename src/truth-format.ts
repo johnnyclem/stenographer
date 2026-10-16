@@ -39,6 +39,19 @@ export {
 } from './truth/derivation.js';
 export { LINE_ENVELOPE_FIELDS, LINE_BODY_FIELDS, OUTBOUND_LINKS, INBOUND_LINKS, MARKERS, displayStatus, markerFor } from './truth/format.js';
 export {
+  DEFAULT_UV_HORIZON_SECONDS,
+  MAX_UV_HORIZON_SECONDS,
+  REATTESTING_LINKS,
+  horizonSeconds,
+  effectiveHorizon,
+  freshness,
+  reattestationsOf,
+  streamFreshness,
+  type Freshness,
+  type FreshnessState,
+  type Reattestation,
+} from './truth/freshness.js';
+export {
   DERIVATION_DETECTOR,
   INFERENCE_AT_FAULT,
   detectSuspects,

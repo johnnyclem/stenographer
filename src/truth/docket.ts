@@ -13,6 +13,11 @@
  * A person starts the session (`stenographer review`, get_docket, GET
  * /docket) or sets a cadence. Nothing notifies per item: get_status shows
  * the docket's size and the age of its oldest item instead.
+ *
+ * Order: nominated items first, then stale UVs (past their horizon by the
+ * clock the docket was built with, freshness.ts), then the rest, oldest
+ * first. Every age the docket states carries `asOf`, the clock reading it
+ * was measured against, so no reader infers elapsed time on its own.
  */
 
 import type { TruthLedger } from './ledger.js';
@@ -48,6 +53,10 @@ export interface DocketItem {
   nominated: boolean;
   /** A UV that is a premise of a refuted or overridden entry (R4): first in the verification queue. */
   suspect: boolean;
+  /** An open UV past its horizon by the docket's clock (freshness.ts): listed after the nominated, before the rest. */
+  stale: boolean;
+  /** A UV's freshness, with the chain timestamp and clock reading it was computed from. */
+  freshness?: UvEntry['freshness'];
   /** The assertion or claim. */
   text: string;
   author: string;
@@ -77,6 +86,10 @@ export interface Docket {
   groups: Array<{ subject: string; items: DocketItem[] }>;
   size: number;
   nominated: number;
+  /** Open UVs past their horizon as of `asOf`. */
+  stale: number;
+  /** The clock reading every `ageMs` and `stale` here was measured against. */
+  asOf: string;
   /** The oldest item: a neglected docket is visible without being loud. */
   oldest: { id: string; kind: DocketItemKind; createdAt: string; ageMs: number } | null;
 }
@@ -105,6 +118,7 @@ export function buildDocket(sources: DocketSources, now: number = Date.now()): D
 
   for (const uv of ledger.getOpenUvs()) {
     const contested = uv.body.contests ? (ledger.getEntry(uv.body.contests) as TbEntry | null) : null;
+    const fresh = ledger.freshnessOf(uv.id, now);
     const summary = approvals.summary(uv.id);
     items.push({
       kind: contested ? 'appeal' : 'uv',
@@ -114,6 +128,8 @@ export function buildDocket(sources: DocketSources, now: number = Date.now()): D
       ageMs: Math.max(0, now - Date.parse(uv.createdAt)),
       nominated: Boolean(uv.corroborated),
       suspect: suspects.has(uv.id),
+      stale: fresh?.state === 'stale',
+      freshness: fresh ?? undefined,
       text: uv.body.assertion,
       author: uv.author,
       agentSessionId: uv.agentSessionId ?? null,
@@ -145,6 +161,7 @@ export function buildDocket(sources: DocketSources, now: number = Date.now()): D
         ageMs: Math.max(0, now - Date.parse(p.createdAt)),
         nominated: false,
         suspect: false,
+        stale: false,
         text: draft.assertion,
         author: p.author,
         agentSessionId: null,
@@ -179,6 +196,7 @@ export function buildDocket(sources: DocketSources, now: number = Date.now()): D
         ageMs: Math.max(0, now - Date.parse(p.createdAt)),
         nominated: p.body.meta?.nominated === true || draftNominated(ledger, p),
         suspect: false,
+        stale: false,
         text: draft.claim,
         author: p.author,
         agentSessionId: p.agentSessionId ?? null,
@@ -190,8 +208,10 @@ export function buildDocket(sources: DocketSources, now: number = Date.now()): D
     }
   }
 
-  // Nominated first, then oldest first; groups keep the order their first item has
-  items.sort((a, b) => Number(b.nominated) - Number(a.nominated) || a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
+  // Nominated first, then stale, then oldest first; groups keep the order their first item has
+  items.sort(
+    (a, b) => Number(b.nominated) - Number(a.nominated) || Number(b.stale) - Number(a.stale) || a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id)
+  );
   const groups = new Map<string, DocketItem[]>();
   for (const item of items) {
     const group = groups.get(item.subject) ?? [];
@@ -203,6 +223,8 @@ export function buildDocket(sources: DocketSources, now: number = Date.now()): D
     groups: [...groups.entries()].map(([subject, items]) => ({ subject, items })),
     size: items.length,
     nominated: items.filter((i) => i.nominated).length,
+    stale: items.filter((i) => i.stale).length,
+    asOf: new Date(now).toISOString(),
     oldest: oldest ? { id: oldest.id, kind: oldest.kind, createdAt: oldest.createdAt, ageMs: oldest.ageMs } : null,
   };
 }
@@ -210,7 +232,7 @@ export function buildDocket(sources: DocketSources, now: number = Date.now()): D
 /** One line per item, for a terminal or a chat: what it is, how old, and who stands where. */
 export function formatDocketItem(item: DocketItem): string {
   const age = formatAge(item.ageMs);
-  const flags = [item.nominated ? 'NOMINATED' : '', item.suspect ? 'SUSPECT' : ''].filter(Boolean).join(' ');
+  const flags = [item.nominated ? 'NOMINATED' : '', item.suspect ? 'SUSPECT' : '', item.stale ? 'STALE' : ''].filter(Boolean).join(' ');
   const head = `${item.kind.toUpperCase()} ${item.id} (${age} old${flags ? `, ${flags}` : ''})`;
   const lines = [head, `  ${item.text}`];
   if (item.appeals) lines.push(`  appeals TB ${item.appeals.tombstone.id} (${item.appeals.status}): ${item.appeals.tombstone.body.claim}`);
@@ -231,6 +253,10 @@ export function formatDocketItem(item: DocketItem): string {
     lines.push(`  agents' verdicts: ${item.attestations.map((t) => `${t.author} ${t.resolution} (session ${t.agentSessionId})`).join(', ')}`);
   }
   if (item.standing && item.standing !== 'sound') lines.push(`  standing: ${item.standing}`);
+  if (item.freshness) {
+    const f = item.freshness;
+    lines.push(`  freshness: ${f.state}, ${f.anchor.kind === 'reattested' ? `re-attested by ${f.anchor.by} at` : 'asserted'} ${f.since}, horizon ${f.horizonSeconds}s, measured at ${f.at}`);
+  }
   if (item.precedents.length > 0) {
     lines.push('  precedents:');
     for (const p of item.precedents) lines.push(`    ${p.id} [${p.scope}] ${p.opinion.replace(/\s+/g, ' ').slice(0, 200)}`);

@@ -34,6 +34,7 @@
  */
 
 import { z } from 'zod';
+import { MAX_UV_HORIZON_SECONDS } from './freshness.js';
 import { canonicalize, sha256Hex } from './jcs.js';
 import { checkQuorum } from './quorum.js';
 import { INBOUND_LINKS, OUTBOUND_LINKS } from './format.js';
@@ -208,6 +209,7 @@ const UvLine = z
     verifyBy: VerifyBy,
     contests: ID.nullable(),
     inference: Blankless.optional(),
+    horizon: z.number().int().positive().max(MAX_UV_HORIZON_SECONDS, 'a horizon is at most ten years of seconds').optional(),
     status: Text.optional(),
   })
   .passthrough();

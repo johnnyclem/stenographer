@@ -188,6 +188,12 @@ const UvFields = {
   basis: Text('Why the author believes it'),
   verifyBy: VerifyBySchema.strict().describe('Machine-actionable verification hint: {kind: command|inspect|ask|observe, value, detail?}'),
   contests: Id('TB id this UV disputes (optional)').optional(),
+  horizon: z
+    .number()
+    .int()
+    .positive()
+    .describe('Seconds until readers render this UV stale, shorter than the ledger default (21 days unless the team set --uv-horizon), never longer (optional)')
+    .optional(),
 };
 
 const ResolveFields = {
@@ -1002,6 +1008,7 @@ export async function runCLI(args: string[]): Promise<void> {
       'signer-registry': { type: 'string' },
       'agent-quorum': { type: 'string' },
       'wiki-dir': { type: 'string' },
+      'uv-horizon': { type: 'string' },
       // Accepted for 0.x configs: notarization is now the agent-profile default
       'require-notary': { type: 'boolean' },
       'skip-verify': { type: 'boolean' },
@@ -1064,6 +1071,12 @@ export async function runCLI(args: string[]): Promise<void> {
     process.exit(1);
   }
 
+  const uvHorizon = values['uv-horizon'] !== undefined ? Number(values['uv-horizon']) : undefined;
+  if (uvHorizon !== undefined && !(Number.isInteger(uvHorizon) && uvHorizon > 0)) {
+    console.error(`--uv-horizon must be a positive whole number of seconds, got '${values['uv-horizon']}'`);
+    process.exit(1);
+  }
+
   const config: StenographerConfig = {
     logPath,
     statePath,
@@ -1087,6 +1100,7 @@ export async function runCLI(args: string[]): Promise<void> {
     signerRegistry: values['signer-registry'] as string | undefined,
     agentQuorum,
     wikiDir: values['wiki-dir'] as string | undefined,
+    uvHorizonSeconds: uvHorizon,
   };
 
   // Log to stderr — stdout carries the MCP stdio protocol

@@ -30,6 +30,8 @@ export interface StateStoreOptions {
   dimensions?: number;
   /** Who the truth ledger treats as an agent (TruthLedgerOptions.isAgent). Default: the `agent:` prefix. */
   isAgent?: AgentClassifier;
+  /** The default UV horizon in seconds (TruthLedgerOptions.uvHorizonSeconds). */
+  uvHorizonSeconds?: number;
 }
 
 /** Everything but the embedding blob, for reads that don't need vectors. */
@@ -88,6 +90,7 @@ export class StateStore {
   private vecEnabled: boolean = false;
   private truthLedger: TruthLedger | null = null;
   private isAgent: AgentClassifier | undefined;
+  private uvHorizonSeconds: number | undefined;
   private uvAttestations: UvAttestations | null = null;
   private uvApprovals: UvApprovals | null = null;
   private objectionLog: ObjectionLog | null = null;
@@ -98,6 +101,7 @@ export class StateStore {
     this.db = new Database(dbPath);
     this.dimensions = options.dimensions ?? 0;
     this.isAgent = options.isAgent;
+    this.uvHorizonSeconds = options.uvHorizonSeconds;
     try {
       sqliteVec.load(this.db);
       this.vecEnabled = true;
@@ -118,7 +122,7 @@ export class StateStore {
   /** The append-only asserted-truth ledger (TB/UV v2), on the same database. */
   get truth(): TruthLedger {
     if (!this.truthLedger) {
-      this.truthLedger = new TruthLedger(this.db, { isAgent: this.isAgent });
+      this.truthLedger = new TruthLedger(this.db, { isAgent: this.isAgent, uvHorizonSeconds: this.uvHorizonSeconds });
     }
     return this.truthLedger;
   }

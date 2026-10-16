@@ -507,6 +507,12 @@
           "description": "On a derived UV: one sentence stating the inference from its premises (the derives links in x-steno.links) to the assertion (README, Derivation).",
           "$ref": "#/$defs/text"
         },
+        "horizon": {
+          "description": "Seconds from the UV's chain timestamp, or its newest re-attestation's, past which a reader renders it stale (README, Freshness). Shorter than the reader's default, never longer; a reader clamps a longer one. Absent means the reader's default.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 315360000
+        },
         "status": {
           "$ref": "#/$defs/status"
         }
