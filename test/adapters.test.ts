@@ -4,6 +4,7 @@ import {
   AnthropicAdapter,
   ClaudeCodeAdapter,
   GenericAdapter,
+  TotalRecallAdapter,
   getAdapter,
   detectAdapterFromLines,
 } from '../src/indexer/adapters.js';
@@ -266,5 +267,68 @@ describe('Anthropic logs with string content (IDX-09)', () => {
     );
     expect(msg?.toolCalls).toEqual([{ name: 'get_weather', input: { city: 'tokyo' } }]);
     expect(msg?.timestamp).toBe(new Date(1760000000 * 1000).toISOString());
+  });
+});
+
+describe('TotalRecallAdapter', () => {
+  const adapter = new TotalRecallAdapter();
+  const event = (op: string, extra: Record<string, unknown> = {}) =>
+    JSON.stringify({
+      format: 'agentvault-total-recall/memory-v1',
+      seq: 1,
+      id: 'mem_0123456789abcdef0123456789abcdef',
+      ts: '2026-10-21T10:00:00.000Z',
+      op,
+      source: { provider: 'chatgpt', agent: 'gpt-5', session: 'conv-1' },
+      memory: { key: 'coffee', title: 'Coffee', content: 'Likes pour-over, no sugar', tags: ['pref'] },
+      contentHash: 'a'.repeat(64),
+      prevHash: null,
+      hash: 'b'.repeat(64),
+      ...extra,
+    });
+
+  it('reads a created memory as the assistant stating it, in a per-provider session', () => {
+    const msg = adapter.parseLine(event('created'));
+    expect(msg).toMatchObject({
+      id: 'mem_0123456789abcdef0123456789abcdef',
+      role: 'assistant',
+      content: 'Coffee\nLikes pour-over, no sugar',
+      timestamp: '2026-10-21T10:00:00.000Z',
+      sessionId: 'total-recall:chatgpt',
+      model: 'gpt-5',
+    });
+    expect(adapter.parseLine(event('updated'))?.content).toBe('Coffee\nLikes pour-over, no sugar');
+  });
+
+  it('does not repeat the title when it equals the content, and skips recalls and deletes', () => {
+    const same = event('created', { memory: { key: 'k', title: 'Same text', content: 'Same text', tags: [] } });
+    expect(adapter.parseLine(same)?.content).toBe('Same text');
+    expect(adapter.parseLine(event('recalled'))).toBeNull();
+    expect(adapter.parseLine(event('deleted'))).toBeNull();
+    expect(adapter.parseLine('{"role":"user","content":"not a memory event"}')).toBeNull();
+  });
+
+  it('is detected by its format tag ahead of every other adapter', () => {
+    expect(adapter.detect([event('recalled')])).toBe(true);
+    expect(adapter.detect(['{"role":"user","content":"hi"}'])).toBe(false);
+    expect(detectAdapterFromLines([event('created')])).toBeInstanceOf(TotalRecallAdapter);
+    expect(getAdapter('total-recall')).toBeInstanceOf(TotalRecallAdapter);
+  });
+
+  it('leaves a total-recall transcript line to the jsonl adapter', () => {
+    const transcriptLine = JSON.stringify({
+      format: 'agentvault-total-recall/transcript-v1',
+      seq: 1,
+      id: 'msg_1',
+      role: 'user',
+      content: 'hello',
+      timestamp: '2026-10-21T10:00:00.000Z',
+      sessionId: 'conv-1',
+      provider: 'chatgpt',
+      prevHash: null,
+      hash: 'c'.repeat(64),
+    });
+    expect(detectAdapterFromLines([transcriptLine])).toBeInstanceOf(JsonlAdapter);
+    expect(new JsonlAdapter().parseLine(transcriptLine)).toMatchObject({ id: 'msg_1', role: 'user', content: 'hello', sessionId: 'conv-1' });
   });
 });

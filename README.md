@@ -30,7 +30,7 @@ Upgrading from 0.1.0-alpha.x? Read [MIGRATION.md](./MIGRATION.md); every change 
 - **Importance Scoring** — a three-signal model (state delta, reference frequency, trajectory discontinuity) scores each message; GraphRAG search uses it as a ranking prior and context frames use it to choose which recent messages get room
 - **Decision Supersession (Tombstones)** — decisions are append-only; a newer decision or an "actually, …" correction closes the old record onto its successor, keeping full provenance. Only what people and the assistant said is mined: tool output, harness records, subagent transcripts and compaction summaries are indexed and searchable, but never read as decisions
 - **Four Modes** — `live`, `catchup`, `watch` (a directory of session logs), `daemon` (live + REST API)
-- **Provider Adapters** — `jsonl`, `claude-code`, `anthropic`, `openai`, `generic`, auto-detected from the first lines written (a log created empty waits for its first line)
+- **Provider Adapters** — `jsonl`, `claude-code`, `anthropic`, `openai`, `total-recall` (AgentVault's memory archive), `generic`, auto-detected from the first lines written (a log created empty waits for its first line)
 - **Resumable Ingestion** — a per-log checkpoint commits with each message, so a restart picks up where the last run stopped instead of re-reading the log (see [Restarts and log rotation](#restarts-and-log-rotation))
 - **Two Query Surfaces** — MCP over stdio, REST over HTTP (GraphQL: roadmap)
 - **Asserted truth ledger** — signed tombstones (TBs) and unverified assertions (UVs) with evidence, in an append-only, hash-chained ledger whose statuses are derived from links. An entry may derive from other entries, each pinned by content hash, and every entry carries its standing: whether what it rests on still holds (see [Asserted Truth Layer](#asserted-truth-layer-tbuv-v2))
@@ -115,7 +115,7 @@ In an MCP client config (Claude Code's `.mcp.json`, for example):
 | Flag | Values | Default | Description |
 |------|--------|---------|-------------|
 | `-m, --mode` | `live` \| `catchup` \| `watch` \| `daemon` | `live` | `live`: tail a file and serve MCP. `catchup`: index a completed file, then serve. `watch`: watch a directory for `*.jsonl` session logs. `daemon`: live + REST API |
-| `-a, --adapter` | `jsonl` \| `claude-code` \| `anthropic` \| `openai` \| `generic` | auto-detect | Log format adapter |
+| `-a, --adapter` | `jsonl` \| `claude-code` \| `anthropic` \| `openai` \| `total-recall` \| `generic` | auto-detect | Log format adapter. `total-recall` reads an AgentVault total-recall `memories.jsonl` (see [AgentVault total recall](#agentvault-total-recall)) |
 | `-e, --embeddings` | model name \| `hashed` \| `auto` | `Xenova/all-MiniLM-L6-v2` | Transformer model (fails to start if it can't load), the offline lexical embedder, or `auto`: the embedder the state database is pinned to, else the default model with a loud fallback to hashed (see [Offline mode](#offline-mode)) |
 | `--reembed` | — | off | Re-embed every stored message and truth entry under the chosen embedder before starting. Needed to switch a state database to another embedder |
 | `--supersede-threshold` | number in (0, 1] | per embedder: MiniLM `0.45`, hashed `0.75` | Cosine similarity at which a new decision supersedes an active one (see [Decision Supersession](#decision-supersession)) |
@@ -267,6 +267,23 @@ token_env = "APPA_STENOGRAPHER_TOKEN"   # the contents of <state dir>/rest-token
 ```
 
 OpenAPPA asks context providers only for calls that need a new annotation, and only annotators read the answer, so this informs labeling. It doesn't block a call by itself; `stenographer gate` does. Bind it to a battery or annotator rule, never to a bare root rule for a built-in tool (see [`integrations/openappa/`](./integrations/openappa/README.md#do-not-bind-stenographer-annotators-to-broad-root-rules)).
+
+### AgentVault total recall
+
+[AgentVault](https://github.com/johnnyclem/agentvault)'s `total-recall` volume is a write-once, read-many archive of what several assistants remembered about one person (ChatGPT and Claude writing to the same volume through MCP while the person migrates), with an optional append-only full transcript. Stenographer indexes both halves:
+
+- `transcript.jsonl` is stenographer `jsonl`: each line has `id`, `role`, `content`, `timestamp` and `sessionId` (one session per conversation), plus hash-chain fields stenographer ignores. `stenographer start <volume>/transcript.jsonl` needs no flag.
+- `memories.jsonl` is the memory ledger, one event per line, tagged `format: "agentvault-total-recall/memory-v1"`. The `total-recall` adapter (auto-detected) reads each `created` or `updated` event as the assistant stating the memory (title, then content) at the event's time, in a session per provider (`total-recall:chatgpt`, `total-recall:claude`), so memories get entities, decisions, supersession and GraphRAG search like any other turn. `recalled` and `deleted` events repeat or retract text already indexed and are skipped.
+
+```bash
+# Index the transcript and serve MCP (what `agentvault total-recall stenographer --run` launches)
+npx -y @stenographer/core start ./.agentvault/total-recall/transcript.jsonl ./.agentvault/total-recall/stenographer.db
+
+# Index the memory ledger instead, or as well (watch mode takes the whole directory)
+npx -y @stenographer/core start ./.agentvault/total-recall/memories.jsonl ./tr-memories.db
+```
+
+Stenographer never writes to a volume; the chain and `agentvault total-recall verify` stay AgentVault's.
 
 ## Importance Scoring
 

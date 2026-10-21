@@ -30,6 +30,8 @@ export {
   AnthropicAdapter,
   ClaudeCodeAdapter,
   GenericAdapter,
+  TotalRecallAdapter,
+  TOTAL_RECALL_MEMORY_FORMAT,
   adapters,
   getAdapter,
   detectAdapter,

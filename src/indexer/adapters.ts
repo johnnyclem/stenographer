@@ -342,18 +342,71 @@ function detectBy(lines: string[], predicate: (obj: any) => boolean): boolean {
 }
 
 // ─────────────────────────────────────────────────────────────
+// AgentVault total-recall memory ledger: one memory event per line
+// ─────────────────────────────────────────────────────────────
+
+/** The `format` tag every line of an AgentVault total-recall memories.jsonl carries. */
+export const TOTAL_RECALL_MEMORY_FORMAT = 'agentvault-total-recall/memory-v1';
+
+/**
+ * Reads AgentVault's total-recall memory archive (`memories.jsonl`): a
+ * hash-chained, append-only log of what assistants remembered about a
+ * person, one event per line (`op` created, updated, recalled or deleted).
+ * A `created` or `updated` event is the assistant stating the memory, so it
+ * becomes an `assistant` message whose text is the memory (title first),
+ * with the event's own id and time, in a session per provider
+ * (`total-recall:<provider>`). A `recalled` event repeats text already
+ * indexed and a `deleted` one retracts it; neither is a new statement, so
+ * both are skipped. The volume's transcript.jsonl needs no adapter: its
+ * lines are stenographer `jsonl` messages.
+ */
+export class TotalRecallAdapter implements LogAdapter {
+  parseLine(line: string, context?: LineContext): ConversationMessage | null {
+    try {
+      const obj = JSON.parse(line);
+      if (!obj || obj.format !== TOTAL_RECALL_MEMORY_FORMAT) return null;
+      if (obj.op !== 'created' && obj.op !== 'updated') return null;
+      const memory = obj.memory;
+      if (!memory || typeof memory !== 'object' || typeof memory.content !== 'string') return null;
+      const title = typeof memory.title === 'string' ? memory.title.trim() : '';
+      const content = title && title !== memory.content.trim() ? `${title}\n${memory.content}` : memory.content;
+      const provider = typeof obj.source?.provider === 'string' ? obj.source.provider : 'unknown';
+      return build(
+        line,
+        'assistant',
+        content,
+        {
+          id: typeof obj.id === 'string' ? obj.id : undefined,
+          timestamp: typeof obj.ts === 'string' ? obj.ts : undefined,
+          model: typeof obj.source?.agent === 'string' ? obj.source.agent : undefined,
+          sessionId: `total-recall:${provider}`,
+        },
+        context
+      );
+    } catch {
+      return null;
+    }
+  }
+
+  detect(lines: string[]): boolean {
+    return detectBy(lines, (obj) => obj?.format === TOTAL_RECALL_MEMORY_FORMAT);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
 // Registry & detection — most specific format first
 // ─────────────────────────────────────────────────────────────
 
 export const adapters: Map<string, LogAdapter> = new Map<string, LogAdapter>([
   ['jsonl', new JsonlAdapter()],
+  ['total-recall', new TotalRecallAdapter()],
   ['claude-code', new ClaudeCodeAdapter()],
   ['anthropic', new AnthropicAdapter()],
   ['openai', new OpenAIAdapter()],
   ['generic', new GenericAdapter()],
 ]);
 
-const DETECTION_ORDER = ['jsonl', 'claude-code', 'anthropic', 'openai', 'generic'];
+const DETECTION_ORDER = ['total-recall', 'jsonl', 'claude-code', 'anthropic', 'openai', 'generic'];
 
 export function getAdapter(name: string): LogAdapter {
   const adapter = adapters.get(name);
