@@ -215,6 +215,8 @@ GET /search?q=...&k=5        GET /graphrag?q=...&k=5&depth=2
 GET /context-frame?budget=2000
 GET /flags?since=<id>&status=pending&include=shadow
 GET /proposals?status=open&kind=tombstone
+GET /truth?filter=current|all|contested
+GET /truth/search?q=...&k=5&filter=current
 GET /truth/:id/derivation?direction=down|up
 GET /docket
 GET /precedents?scope=ci&all=true

@@ -84,6 +84,32 @@ describe('REST API', () => {
     expect((await getJson('/search')).status).toBe(400);
   });
 
+  it('serves the truth ledger and ranks it by relevance, as get_truth and search_truth', async () => {
+    const tb = await engine.assertTombstone({
+      claim: 'the database is sqlite, postgres is dead',
+      evidence: [{ kind: 'command', ref: 'grep -r postgres src/ | wc -l', detail: '0' }],
+      signedBy: 'alice',
+      literals: [{ subject: 'database', dead: 'postgres', current: 'sqlite' }],
+    });
+    const truth = await getJson('/truth');
+    expect(truth.status).toBe(200);
+    const entry = truth.body.find((e: any) => e.id === tb.id);
+    expect(entry).toBeTruthy();
+    expect(entry.type).toBe('TB');
+    expect(entry.body.status).toBe('active');
+    expect(entry.embedding).toBeUndefined();
+    expect((await getJson('/truth?filter=all')).status).toBe(200);
+    expect((await getJson('/truth?filter=open')).status).toBe(400);
+
+    const found = await getJson('/truth/search?q=which+database+do+we+use&k=1');
+    expect(found.status).toBe(200);
+    expect(found.body).toHaveLength(1);
+    expect(found.body[0].id).toBe(tb.id);
+    expect(typeof found.body[0].relevance).toBe('number');
+    expect((await getJson('/truth/search')).status).toBe(400);
+    expect((await getJson('/truth/search?q=x&k=0')).status).toBe(400);
+  });
+
   it('serves a context frame as markdown', async () => {
     const res = await fetch(`${base}/context-frame?budget=500`);
     expect(res.status).toBe(200);

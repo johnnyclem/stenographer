@@ -24,6 +24,8 @@
  *   GET /graphrag?q=...&k=5&depth=2  (hybrid vector + graph search)
  *   GET /context-frame?budget=2000
  *   GET /proposals?status=open&kind=tombstone  (the review inbox)
+ *   GET /truth?filter=current  (the truth ledger: TBs and UVs by filter, as get_truth)
+ *   GET /truth/search?q=...&k=5&filter=current  (truth entries by embedding relevance, as search_truth)
  *   GET /advice?kind=objection&graded=true&since=<id>&limit=100  (the decision model's verdicts)
  *   GET /advice/stats         (how the model does against the judge; 404 without a model)
  *   POST /advice/consult      {assertion, k?}  (the model's advice on an assertion)
@@ -93,6 +95,8 @@ const QUERIES = {
   contextFrame: z.object({ budget: count(2000, MAX_BUDGET) }),
   precedents: z.object({ scope: z.string().min(1).max(200).optional(), all: z.literal('true').optional() }),
   derivation: z.object({ direction: z.enum(['down', 'up']).default('down') }),
+  truth: z.object({ filter: z.enum(['current', 'all', 'contested']).default('current') }),
+  truthSearch: z.object({ q: query, k: count(5, MAX_K), filter: z.enum(['current', 'all', 'contested']).default('current') }),
   advice: z.object({
     kind: z.enum(['objection', 'consult']).optional(),
     graded: z.enum(['true', 'false']).optional(),
@@ -270,6 +274,16 @@ export class RestServer {
       return;
     }
 
+    if (path === '/truth') {
+      const { filter } = parseQuery(QUERIES.truth, url);
+      sendJson(res, 200, await this.engine.getTruth(filter));
+      return;
+    }
+    if (path === '/truth/search') {
+      const { q, k, filter } = parseQuery(QUERIES.truthSearch, url);
+      sendJson(res, 200, await this.engine.searchTruth(q, k, filter));
+      return;
+    }
     if (path === '/advice') {
       const { kind, graded, since, limit } = parseQuery(QUERIES.advice, url);
       sendJson(res, 200, await this.engine.listDecisionAdvice({ kind, graded: graded === undefined ? undefined : graded === 'true', since, limit }));
