@@ -17,6 +17,8 @@ import { UvAttestations } from '../truth/attestations.js';
 import { UvApprovals } from '../truth/approvals.js';
 import type { AgentClassifier } from '../truth/quorum.js';
 import { ObjectionLog } from '../truth/objections.js';
+import { DecisionAdviser } from '../decision/advisor.js';
+import type { DecisionModelClient } from '../decision/model.js';
 import { ObjectionDispatcher } from '../truth/delivery.js';
 import type {
   IndexedMessage,
@@ -95,6 +97,7 @@ export class StateStore {
   private uvApprovals: UvApprovals | null = null;
   private objectionLog: ObjectionLog | null = null;
   private dispatcher: ObjectionDispatcher | null = null;
+  private decisionAdviser: DecisionAdviser | null = null;
   private statements: Map<string, Database.Statement> = new Map();
 
   constructor(dbPath: string, options: StateStoreOptions = {}) {
@@ -149,6 +152,17 @@ export class StateStore {
       this.objectionLog = new ObjectionLog(this.db, this.truth);
     }
     return this.objectionLog;
+  }
+
+  /**
+   * The decision model's verdicts (decision/advisor.ts): operational state
+   * beside the ledger, opened for one client per store.
+   */
+  adviser(client: DecisionModelClient): DecisionAdviser {
+    if (!this.decisionAdviser) {
+      this.decisionAdviser = new DecisionAdviser(this.db, client);
+    }
+    return this.decisionAdviser;
   }
 
   /** Webhook/channel delivery of objections, with durable per-sink state. */

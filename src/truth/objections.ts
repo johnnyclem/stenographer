@@ -65,6 +65,12 @@ export interface Objection {
   weakness?: TombstoneWeakness;
   /** Set when the pre-dispatch gate raised it, before the call ran. */
   gate?: GateCall;
+  /**
+   * The decision model's second opinion, when one is configured
+   * (decision/advisor.ts): P(the dead value is asserted as current truth),
+   * graded against the ruling once a person rules. Advice, never a ruling.
+   */
+  advice?: import('../decision/advisor.js').DecisionAdvice;
 }
 
 /** Why a TB raises only a shadow objection: it is under appeal, or clouded. */
