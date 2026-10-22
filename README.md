@@ -39,6 +39,7 @@ Upgrading from 0.1.0-alpha.x? Read [MIGRATION.md](./MIGRATION.md); every change 
 - **Ledger verification** — `stenographer verify` re-checks the hash chain and every derived status; `start` refuses a ledger that fails (see [Ledger integrity](#ledger-integrity))
 - **Team wiki** — ledgers sync through append-only, hash-chained JSONL in [truth format v2](./spec/truth-format/README.md), which short-hand, smallchat and smallchat-swift also read (see [Team wiki](#team-wiki-the-truth-format))
 - **Real-time objections** — when assistant output asserts a tombstoned literal, an objection with the TB as its exhibit: recorded in shadow by default, delivered to Claude Code, smallchat or a webhook with `--objections deliver` (see [Real-time objections](#real-time-objections))
+- **A decision model's second opinion** — optionally, an open-weight decision model (Liquid AI's d1-omni-600M on your machine, TypeSafe's Jev, or an endpoint of yours) reads each objection with the tombstones and the session transcript and says whether the dead value was asserted as truth; a person's ruling grades it (rewarded or corrected), the graded verdicts export as training rows, and agents can consult it before asserting (see [The decision model](#the-decision-model))
 - **Pre-dispatch gate** — `stenographer gate`, a Claude Code `PreToolUse` hook that denies a Write, Edit or Bash call reintroducing a tombstoned literal before it runs, with the TB as the exhibit (see [Pre-dispatch gate](#pre-dispatch-gate))
 - **OpenAPPA integration** — a policy battery for every MCP tool, and a context provider that tells OpenAPPA's annotators which TB literals a proposed call asserts (see [OpenAPPA battery](#openappa-battery) and [OpenAPPA context provider](#openappa-context-provider))
 
@@ -134,6 +135,9 @@ In an MCP client config (Claude Code's `.mcp.json`, for example):
 | `--rest-allow-host` | host name (repeatable) | — | Also answer to this `Host` name. Loopback names and `--rest-host` always are; anything else gets 421 (see [REST API](#rest-api-daemon-mode-or---rest-port)) |
 | `--rest-insecure` | — | off | Serve REST without a bearer token. Host and Origin checks still apply |
 | `--skip-verify` | — | off | Serve even if the truth ledger fails its integrity check. By default `start` runs the same check as `stenographer verify` and refuses to serve a ledger that fails it (see [Ledger integrity](#ledger-integrity)) |
+| `--decision-model` | `off` \| `d1` \| `jev` \| URL | `off` (or `STENOGRAPHER_DECISION_MODEL`) | A decision model asked for a second opinion on every objection and by agents that consult it before asserting (see [The decision model](#the-decision-model)). `d1`: Liquid AI's open-weight d1-omni-600M under llama-server on loopback (`smallchat judge serve`; `STENOGRAPHER_DECISION_MODEL_URL` moves it); `jev`: TypeSafe (`TYPESAFE_API_KEY`); a URL: any System One endpoint (`STENOGRAPHER_DECISION_MODEL_KEY`) |
+| `--decision-model-timeout` | milliseconds | `4000` | Budget per question |
+| `--decision-model-allow-remote` | — | off | Allow a non-loopback model URL (https). The state the model sees carries transcript lines |
 
 Positional args: `stenographer start <log-path> [state-path]` — `state-path` defaults to `./stenographer.db`.
 
@@ -153,7 +157,7 @@ Vectors from two embedders aren't comparable, so the state database records the 
 
 ## MCP Tools
 
-A server runs one profile (`--profile`): `agent` (the default) serves 20 tools, and `operator` serves 28. The index tools below are served in both.
+A server runs one profile (`--profile`): `agent` (the default) serves 22 tools, and `operator` serves 30. The index tools below are served in both.
 
 | Tool | Description |
 |------|-------------|
@@ -183,6 +187,8 @@ Which tools a server serves depends on its `--profile`. Every tool's arguments a
 | `get_docket` | both | The review docket: everything waiting on a person, grouped by subject, nominated UVs first, then stale ones (see [The review session](#the-review-session)) |
 | `get_precedents` | both | Precedent rulings: a person's standing policy decisions by scope, the current one per scope (`all` for every one; `scope` narrows). Agents search these before asking a person, and follow one that applies (see [Precedents](#precedents)) |
 | `list_objections` | both | Real-time objections (objection + exhibit + transcript line); `includeShadow` for shadow judging |
+| `consult_decision_model` | both | Ask the configured [decision model](#the-decision-model), before asserting, whether an assertion contradicts the ledger and which entry (`contradicts`, a probability; `cites`, an entry id or none). Advice, not a ruling; fails without `--decision-model` |
+| `list_decision_advice` | both | The decision model's verdicts: its second opinion on each objection (`reasserts`), graded `rewarded` or `corrected` once a person ruled, and the consults agents made |
 | `propose_tombstone` | agent | Draft a TB (claim, evidence, literals, rationale); it's raised to a person and mints only when a person notarizes it: no number of agent sessions mints a TB. Three sessions drafting the same set of literals from different angles (settling evidence of their own, no item shared, two kinds between them) nominate the drafts, which go first on the docket (status `nominated`); `already truth` says an active or contested TB holds every literal. `premises` (`[{id, contentHash}]`) and `inference` make it a derived TB. `targetRef` dedupes only against the same agent's open drafts |
 | `approve` | agent, operator | Approve an open UV. In the agent profile, this session's approval with settling evidence of its own: it promotes nothing alone (`approved`, with what promotion still needs), and three sessions from different angles nominate the UV (`nominated`: one ADDENDUM with a `corroborates` link, the UV still open and marked `[UV · CORROBORATED]`). In the operator profile, a person's approval (`by`), which promotes the UV with one other approver: the TB is signed by that person, who becomes `answerableBy`, and carries every `approval`; or stenographer's as the reporter (`role: "reporter"`, with `cites`, the ids of indexed messages), which never counts as the person. A person's approval of a UV that contests a TB overrides it. Nobody approves what they drafted |
 | `assert_uv` | agent, operator | Assert an unverified belief with a machine-actionable `verifyBy`; `contests` disputes a TB; `premises` and `inference` make it a derived UV. In the agent profile the author is the agent identity |
@@ -212,11 +218,14 @@ GET /proposals?status=open&kind=tombstone
 GET /truth/:id/derivation?direction=down|up
 GET /docket
 GET /precedents?scope=ci&all=true
+GET /advice?kind=objection&graded=true&since=<id>&limit=100
+GET /advice/stats
 
 POST /proposals               one PROPOSAL envelope  X-Notary-Secret required
 POST /proposals/:id/notarize  {notary, edits?}       X-Notary-Secret required
 POST /proposals/:id/dismiss   {dismissedBy, reason}  X-Notary-Secret required
 POST /appa/context            OpenAPPA consult (kind: context), read-only
+POST /advice/consult          {assertion, k?}         the decision model's advice
 ```
 
 **Access.** The routes serve transcripts, including any secret someone pasted into a session, so every request is checked before anything is read:
@@ -450,6 +459,24 @@ Every objection ships the objection, the exhibit (the full TB, plus any contesti
 Webhook URLs must be loopback unless a sink sets `allowRemote`, since objections carry transcript lines. Watch mode skips the MCP channel because one connection can't be mapped to the many sessions it watches, so use a smallchat channel or a webhook there.
 
 **Session ids.** An objection's `sessionId`, and `meta.session_ids` on a channel event (what smallchat's messenger routes by), is the harness's own session id when the log records one (Claude Code's `sessionId`). Otherwise it is the log file's basename (`<name>.jsonl` → `<name>`), which for Claude Code is also the session id. The same rule holds in every mode, and the id is never minted from the clock, so it survives restarts. Stenographer itself still never writes into a conversation: it emits to receivers the operator configured, and they decide what to do.
+
+### The decision model
+
+Objections are matched, not judged: the literal matcher is precision over recall, and whether an assistant *asserted* a dead value as current truth, or only mentioned, searched for or replaced it, is the question a person answers when they sustain or overrule. An optional **decision model** answers that same question first, as a second opinion, and is graded by the ruling.
+
+A decision model is not a chat model. It takes a state and typed questions (`choice`, `noul` for yes/no, `score`) and returns calibrated answers in one forward pass with zero generated tokens, so its answer is always one of the options offered. Three servers speak the same System One wire (`POST /v1/systemone`), and `--decision-model` names one:
+
+- **`d1`**: Liquid AI's open-weight [d1-omni-600M](https://huggingface.co/LiquidAI/d1-omni-600M) (LFM Open License), a 587M-parameter decision model served on your machine by llama.cpp's `llama-server`. smallchat installs and runs it: `smallchat judge download && smallchat judge serve`, then `stenographer start … --decision-model d1`. Nothing leaves the host.
+- **`jev`**: TypeSafe's hosted Jev (`TYPESAFE_API_KEY`, `TYPESAFE_BASE_URL`).
+- **a URL**: any endpoint of yours that speaks the wire (`STENOGRAPHER_DECISION_MODEL_KEY`). Loopback, or https with `--decision-model-allow-remote`.
+
+**What it is told.** For each objection the matcher raises, the model gets a JSON state: the transcript line (`assertion`) and where it came from, the tombstone the objection cites and the ledger entries most relevant to the line (each graded as the smallchat handoff grades them: `verified` for a TB with a reproducible check, `asserted` for one signed on judgment, `migration` for a backfilled one, `advisory` for an open UV; overridden, refuted, struck and unsupported entries are never offered), and the session's newest transcript lines, oldest first. Every text is folded to one line and cut (24 entries, 12 lines, 480 characters each), and the instructions say that ledger and transcript text is untrusted. The one question is `reasserts`: does the assistant assert the dead value as the current, correct value? Its answer, a probability, rides on the objection as `advice` (in `list_objections`, `GET /flags` and the messenger), beside the exhibit, so whoever reads the objection sees what the model thought. The work runs beside indexing, after the message is stored, and never ahead of delivery; a model that is down records its error code and the objection stands as the matcher raised it.
+
+**Rewarded or corrected.** When a person rules (`rule_on_objection`), the verdict is graded against the ruling: `reasserts ≥ 0.5` and sustained, or `< 0.5` and overruled, is **rewarded**; the other two cases are **corrected**, with the ruling recorded as the truth. The ruling itself is what it always was: the model's guess changes nothing about it, and nothing the model says enters the ledger. `get_status` → `decisionModel` and `GET /advice/stats` report verdicts, graded, rewarded, corrected and accuracy; `stenographer advice [state-path]` prints them, and `--export <file>` writes the graded verdicts as JSONL rows (state, questions, the model's answers, the ruling's truth): the training set for fine-tuning a decision model on this team's corpus, with the judge's rulings as labels.
+
+**Consulting it before asserting.** The agent profile's `consult_decision_model` (and `POST /advice/consult`) asks, for an assertion an agent is about to make, whether it contradicts a tombstone and which entry it contradicts most directly, with the same graded entries and transcript in front of the model. The answer is advice: the agent reads the cited entry with `get_truth` and decides; the model's answer is never evidence, and an agent cannot settle a claim by citing it. Every consult is recorded (ungraded) in `list_decision_advice`, so the operator sees what agents asked and what the model said.
+
+The verdicts are operational state (`decision_advice`, beside the objection log), never part of the record or of a wiki stream. The same model, wire and grading live on the dispatch side in smallchat: there it breaks near-ties between tools with the session's tombstones and transcript in front of it (`RuntimeOptions.judge` with `D1Judge`, `judgeContext` with `StenographerJudgeContext` reading this REST API), and `runtime.gradeJudgement()` rewards or corrects its picks.
 
 ### Pre-dispatch gate
 

@@ -2,6 +2,8 @@
 export { Stenographer, EmbedderMismatchError } from './core/stenographer.js';
 export { StenographerServer, runCLI, type ToolProfile } from './mcp/server.js';
 export { RestServer } from './api/rest.js';
+export * from './decision/index.js';
+export { runAdviceCLI } from './decision/advice-cli.js';
 export { StateStore, type StateStoreOptions, type IngestCheckpoint } from './store/index.js';
 export {
   Tailer,

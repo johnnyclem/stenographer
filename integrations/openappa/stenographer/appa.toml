@@ -143,6 +143,17 @@ delta = { audience = ["self"], trust = "suspicious" }
 name = "mcp/stenographer/list_objections"
 delta = { audience = ["self"], trust = "suspicious" }
 
+# The decision model's verdicts quote transcript lines and ledger text,
+# and a consult's answer cites agent-written entries: both are text from
+# outside the trajectory, and this person's own.
+[[policy.tool]]
+name = "mcp/stenographer/consult_decision_model"
+delta = { audience = ["self"], trust = "suspicious" }
+
+[[policy.tool]]
+name = "mcp/stenographer/list_decision_advice"
+delta = { audience = ["self"], trust = "suspicious" }
+
 # --- truth writes: trusted data only ---
 
 # Agent profile. Files a draft and raises it to a person; the draft that

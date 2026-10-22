@@ -31,6 +31,10 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
     const { runTraceCLI } = await import('../dist/truth/trace.js');
     process.exitCode = await runTraceCLI(args);
   },
+  advice: async (args) => {
+    const { runAdviceCLI } = await import('../dist/index.js');
+    process.exitCode = await runAdviceCLI(args);
+  },
   review: async (args) => {
     const { runReviewCLI } = await import('../dist/truth/review-cli.js');
     process.exitCode = await runReviewCLI(args);
@@ -53,6 +57,10 @@ Usage:
   stenographer notarize <id> --as <name> [--state <path>] [--signer-registry <path>]
                        [--decline <reason>]             Approve (or decline) an agent-drafted
                                                         tombstone — interactive terminal only
+  stenographer advice [state-path] [--json] [--export <file> [--all]]
+                                                        The decision model's verdicts and how they
+                                                        scored against the judge; --export writes
+                                                        graded verdicts as JSONL training rows
   stenographer verify [state-path] [--json]             Check the truth ledger: hash chain, links,
                                                         and every status re-derived from links
                                                         (exit 0 intact, 1 integrity failure,
@@ -172,6 +180,24 @@ Options (start):
       --skip-verify        serve even if the truth ledger fails its integrity
                            check (by default start refuses; see
                            'stenographer verify')
+      --decision-model <spec>
+                           off | d1 | jev | <url>  (default: off, or
+                           STENOGRAPHER_DECISION_MODEL): a decision model
+                           asked for a second opinion on every objection and
+                           by agents that consult it before asserting.
+                           d1: Liquid AI's open-weight d1-omni-600M under
+                           llama-server on loopback (smallchat judge serve;
+                           STENOGRAPHER_DECISION_MODEL_URL to move it);
+                           jev: TypeSafe (TYPESAFE_API_KEY); a URL: any
+                           System One endpoint (key from
+                           STENOGRAPHER_DECISION_MODEL_KEY). Its verdicts
+                           are advice, graded against your rulings; see
+                           'stenographer advice'
+      --decision-model-timeout <ms>
+                           budget per question (default: 4000)
+      --decision-model-allow-remote
+                           allow a non-loopback model URL (https); the state
+                           it sees carries transcript lines
 
 Options (gate):
       --state <path>       state file to read TBs from (read-only) and file

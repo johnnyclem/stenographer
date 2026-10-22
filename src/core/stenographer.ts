@@ -35,6 +35,9 @@ import { appendWikiFile, defaultWikiDir, readWikiFile, type WikiFileTarget } fro
 import type { TruthFilter } from '../truth/ledger.js';
 import { buildDerivation, type DerivationNode, type TraceDirection } from '../truth/trace.js';
 import type { Objection, ObjectionMode, ObjectionStatus, ObjectionStats } from '../truth/objections.js';
+import { DecisionModelClient, decisionModelFromConfig } from '../decision/model.js';
+import type { DecisionAdviser, DecisionAdvice, AdviceKind, AdviceStats } from '../decision/advisor.js';
+import { buildDecisionState, consultQuestions, type DecisionTruthEntry } from '../decision/state.js';
 import { createSinkTransport, type ObjectionTransport } from '../truth/delivery.js';
 import {
   callOnAgent,
@@ -163,6 +166,9 @@ export class Stenographer implements StenographerAPI {
   private sinkTransports: ObjectionTransport[];
   private signers: SignerRegistry | null;
   private clock: () => number;
+  /** The decision model's adviser, when one is configured; its work runs beside indexing (`advising`). */
+  private adviser: DecisionAdviser | null = null;
+  private advising: Promise<void> = Promise.resolve();
 
   constructor(config: StenographerConfig) {
     // A 1.0-dev config that still asks for agents to assert alone is refused, not ignored
@@ -206,6 +212,9 @@ export class Stenographer implements StenographerAPI {
     // Validate sinks up front: a bad or non-loopback URL fails at startup,
     // not at the first objection
     this.sinkTransports = (config.objectionSinks ?? []).map(createSinkTransport);
+    // The decision model, when configured: a bad spec or URL fails at startup too
+    const client = config.decisionModel instanceof DecisionModelClient ? config.decisionModel : decisionModelFromConfig(config.decisionModel);
+    if (client) this.adviser = this.store.adviser(client);
   }
 
   /**
@@ -347,6 +356,7 @@ export class Stenographer implements StenographerAPI {
   /** Waits until every message received so far has been indexed. */
   async flush(): Promise<void> {
     await this.indexing;
+    await this.advising;
   }
 
   get restPort(): number | null {
@@ -724,6 +734,111 @@ export class Stenographer implements StenographerAPI {
 
     // Push as discovered — don't hold up indexing on a receiver
     if (raised.some((o) => o.delivered)) void this.store.objectionDelivery.pump();
+    // The decision model's second opinion, beside indexing, never ahead of delivery
+    if (this.adviser && raised.length > 0) this.adviseObjections(raised, sessionId);
+  }
+
+  // ─────────────────────────────────────────────────────────
+  // The decision model (decision/)
+  // ─────────────────────────────────────────────────────────
+
+  /** The decision model's adviser, or null when none is configured. */
+  getDecisionAdviser(): DecisionAdviser | null {
+    return this.adviser;
+  }
+
+  /**
+   * Ask the model about each objection raised, with the ledger entries that
+   * bear on the line and the session's recent transcript. Runs after the
+   * message is indexed; a model that is down records an error and the
+   * objection stands as the matcher raised it.
+   */
+  private adviseObjections(raised: Objection[], sessionId: string): void {
+    const adviser = this.adviser;
+    if (!adviser) return;
+    this.advising = this.advising
+      .then(async () => {
+        for (const objection of raised) {
+          try {
+            const entries = await this.entriesBearingOn(objection.transcriptLine, objection.tbId);
+            const messages = this.store.getRecentMessages(sessionId, 12);
+            await adviser.adviseObjection({ objection, entries, messages });
+          } catch (err) {
+            console.error(`Decision model advice failed for objection ${objection.id}:`, err instanceof Error ? err.message : err);
+          }
+        }
+      })
+      .catch(() => {});
+  }
+
+  /** The truth entries most relevant to `text` (by embedding), plus `about` when it is current. */
+  private async entriesBearingOn(text: string, about?: string): Promise<Array<TbEntry | UvEntry>> {
+    const found = (await this.searchTruth(text, 8)).filter((e): e is (TbEntry | UvEntry) & { relevance: number } => e.type === 'TB' || e.type === 'UV');
+    const entries: Array<TbEntry | UvEntry> = found.map(({ relevance: _r, ...entry }) => entry as TbEntry | UvEntry);
+    if (about && !entries.some((e) => e.id === about)) {
+      const entry = this.store.truth.getEntry(about);
+      if (entry && (entry.type === 'TB' || entry.type === 'UV')) entries.unshift(entry as TbEntry | UvEntry);
+    }
+    return entries;
+  }
+
+  /**
+   * An agent (or a person) asks before asserting: does `assertion`
+   * contradict the ledger, and which entry? The model's answer is advice:
+   * it cites entries, it settles nothing, and the agent still consults the
+   * cited entry itself. Throws when no model is configured; a model that is
+   * down answers with its error code and no verdict.
+   */
+  async consultDecisionModel(input: {
+    assertion: string;
+    k?: number;
+    /** The session asking, for the transcript it sees and the record */
+    sessionId?: string | null;
+    /** A key the verdict is recorded under (default: a new id) */
+    subjectId?: string;
+  }): Promise<{
+    adviser: string;
+    model: string;
+    contradicts: number | null;
+    cites: string | null;
+    entries: DecisionTruthEntry[];
+    error: string | null;
+    adviceId: string;
+  }> {
+    const adviser = this.adviser;
+    if (!adviser) throw new Error('no decision model is configured (start with --decision-model d1, jev or <url>)');
+    const assertion = input.assertion.trim();
+    if (!assertion) throw new Error('assertion is required');
+    const entries = (await this.entriesBearingOn(assertion)).slice(0, Math.min(Math.max(input.k ?? 8, 1), 24));
+    const sessionId = input.sessionId === undefined ? this.sessionId : input.sessionId;
+    const state = buildDecisionState({ assertion, session: sessionId ?? undefined, entries, messages: sessionId ? this.store.getRecentMessages(sessionId, 12) : [] });
+    const advice = await adviser.consult({
+      subjectId: input.subjectId ?? `consult:${Date.now().toString(36)}:${Math.random().toString(36).slice(2, 8)}`,
+      sessionId: sessionId ?? null,
+      state,
+      questions: consultQuestions(state.truth),
+    });
+    return {
+      adviser: advice.adviser,
+      model: advice.model,
+      contradicts: advice.contradicts,
+      cites: advice.cites,
+      entries: state.truth,
+      error: advice.error,
+      adviceId: advice.id,
+    };
+  }
+
+  /** The model's verdicts, newest last. */
+  async listDecisionAdvice(options: { kind?: AdviceKind; graded?: boolean; since?: string; limit?: number } = {}): Promise<DecisionAdvice[]> {
+    return this.adviser ? this.adviser.list(options) : [];
+  }
+
+  /** How the model is doing against the judge: null when none is configured. */
+  async getDecisionModelStats(): Promise<(AdviceStats & { adviser: string; model: string; baseURL: string }) | null> {
+    if (!this.adviser) return null;
+    const { client } = this.adviser;
+    return { adviser: client.name, model: client.model, baseURL: client.baseURL, ...this.adviser.stats() };
   }
 
   /**
@@ -1904,7 +2019,10 @@ export class Stenographer implements StenographerAPI {
   async getObjections(
     options: { since?: string; status?: ObjectionStatus; includeShadow?: boolean; limit?: number } = {}
   ): Promise<Objection[]> {
-    return this.store.objections.list(options);
+    const objections = this.store.objections.list(options);
+    if (!this.adviser || objections.length === 0) return objections;
+    const advice = this.adviser.forObjections(objections.map((o) => o.id));
+    return objections.map((o) => (advice.has(o.id) ? { ...o, advice: advice.get(o.id)! } : o));
   }
 
   /**
@@ -1939,7 +2057,10 @@ export class Stenographer implements StenographerAPI {
       }
     );
     this.store.objections.markRuled(objectionId, outcome, ruling.id);
-    return { objection: this.store.objections.get(objectionId)!, ruling };
+    // The ruling grades the model's guess (rewarded or corrected); it never changes the ruling
+    const advice = this.adviser?.grade(objectionId, outcome, ruling.id) ?? null;
+    const ruled = this.store.objections.get(objectionId)!;
+    return { objection: advice ? { ...ruled, advice } : ruled, ruling };
   }
 
   /**
