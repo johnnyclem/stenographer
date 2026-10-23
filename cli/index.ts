@@ -97,7 +97,7 @@ Options (start):
                            catchup: index a completed file, then serve
                            watch:   watch a directory for *.jsonl session logs
                            daemon:  live + REST API (default port 8787)
-  -a, --adapter <name>     jsonl | anthropic | openai | claude-code | generic
+  -a, --adapter <name>     jsonl | anthropic | openai | claude-code | total-recall | generic
                            (default: auto-detect from file content)
   -e, --embeddings <name>  Transformer model name (default all-MiniLM-L6-v2;
                            fails to start if it can't load), 'hashed' for
