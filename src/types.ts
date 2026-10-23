@@ -288,6 +288,17 @@ export interface StenographerConfig {
    */
   profile?: 'agent' | 'operator';
   /**
+   * The optional decision model (`--decision-model`): a System One
+   * endpoint — `d1` (Liquid AI's open-weight d1 under llama-server on
+   * loopback, what `smallchat judge serve` runs), `jev` (TypeSafe), or a
+   * URL — asked for a second opinion on every objection the literal
+   * matcher raises and by agents that consult it before asserting
+   * (`consult_decision_model`). Its verdicts are operational state beside
+   * the ledger, graded against a person's rulings; nothing it says enters
+   * the record. Unset or `off`: no model, nothing sent anywhere.
+   */
+  decisionModel?: import('./decision/model.js').DecisionModelConfig | import('./decision/model.js').DecisionModelClient;
+  /**
    * Whether agent quorums may settle claims on this ledger (`--agent-quorum`).
    * The setting is kept in the state file, so every process on it obeys it.
    * - 'off': nothing an agent files settles. Agreeing drafts stay open and

@@ -34,7 +34,7 @@ mode those are every session's logs, quoting whatever those sessions read
 restricted to `self`: the index is the person's own state file.
 
 *Ledger reads* — `get_truth`, `search_truth`, `get_derivation`, `get_contested`,
-`get_verification_queue`, `list_proposals`, `list_objections`, and
+`get_verification_queue`, `list_proposals`, `list_objections`, `consult_decision_model`, `list_decision_advice`, and
 `export_wiki_entries` without `file` (the inline export). UVs and drafts
 are written by agents, some in sessions no policy protected; detector
 drafts come from transcripts; objections quote transcript lines; no

@@ -512,6 +512,7 @@ export class StenographerServer {
           truth: await e.getTruthStats(),
           truthMode: e.getTruthMode(),
           objections: await e.getObjectionStats(),
+          decisionModel: await e.getDecisionModelStats(),
           retriever: e.retriever.getStats(),
           vectorBackend: e.store.vectorSearchBackend,
           embedder: e.embedderIdentity,
@@ -617,6 +618,38 @@ export class StenographerServer {
         input: args({ query: Text('Search query'), k: limit('Number of results', 5, 50), truthFilter: TruthFilterArg }),
         annotations: READ_ONLY,
         run: ({ query, k, truthFilter }) => e.searchTruth(query, k, truthFilter),
+      }),
+      // ── The decision model (decision/) ─────────────────
+      tool({
+        name: 'consult_decision_model',
+        description:
+          'Ask the configured decision model, before asserting something, whether an assertion contradicts the truth ' +
+          'ledger and which entry it contradicts. The model reads the assertion, the ledger entries that bear on it ' +
+          '(each graded: verified, asserted, migration, or advisory for an open UV) and this session\'s recent ' +
+          'transcript, and answers in one pass: contradicts (a probability) and cites (an entry id, or none). ' +
+          'This is advice, not a ruling: read the cited entry with get_truth before you rely on it, and never treat ' +
+          'the model\'s answer as evidence. Fails when no decision model is configured (--decision-model).',
+        input: args({
+          assertion: Text('What you are about to assert, as you would write it'),
+          k: limit('How many ledger entries to offer the model', 8, 24),
+        }),
+        annotations: READ_ONLY,
+        run: ({ assertion, k }) => e.consultDecisionModel({ assertion, k }),
+      }),
+      tool({
+        name: 'list_decision_advice',
+        description:
+          'The decision model\'s verdicts: its second opinion on each objection (reasserts: P(the dead value was ' +
+          'asserted as current truth)), graded rewarded or corrected once a person ruled, and the consults agents made. ' +
+          'Advice is operational state beside the ledger, never part of the record. Empty without a decision model.',
+        input: args({
+          kind: z.enum(['objection', 'consult']).optional(),
+          graded: z.boolean().optional(),
+          since: z.string().describe('Exclusive advice-id cursor').optional(),
+          limit: limit('Maximum verdicts', 100, 1000),
+        }),
+        annotations: READ_ONLY,
+        run: ({ kind, graded, since, limit }) => e.listDecisionAdvice({ kind, graded, since, limit }),
       }),
       // ── Real-time objections (§12) ──────────────────────
       tool({
@@ -1009,6 +1042,9 @@ export async function runCLI(args: string[]): Promise<void> {
       'agent-quorum': { type: 'string' },
       'wiki-dir': { type: 'string' },
       'uv-horizon': { type: 'string' },
+      'decision-model': { type: 'string' },
+      'decision-model-timeout': { type: 'string' },
+      'decision-model-allow-remote': { type: 'boolean' },
       // Accepted for 0.x configs: notarization is now the agent-profile default
       'require-notary': { type: 'boolean' },
       'skip-verify': { type: 'boolean' },
@@ -1077,10 +1113,22 @@ export async function runCLI(args: string[]): Promise<void> {
     process.exit(1);
   }
 
+  const decisionTimeout = values['decision-model-timeout'] !== undefined ? Number(values['decision-model-timeout']) : undefined;
+  if (decisionTimeout !== undefined && !(decisionTimeout > 0)) {
+    console.error(`--decision-model-timeout must be a positive number of milliseconds, got '${values['decision-model-timeout']}'`);
+    process.exit(1);
+  }
+  const decisionSpec = (values['decision-model'] as string | undefined) ?? process.env.STENOGRAPHER_DECISION_MODEL;
+  // The model's key, like every secret, comes from the environment
+  const decisionModel: StenographerConfig['decisionModel'] = decisionSpec
+    ? { spec: decisionSpec, timeoutMs: decisionTimeout, allowRemote: Boolean(values['decision-model-allow-remote']) }
+    : undefined;
+
   const config: StenographerConfig = {
     logPath,
     statePath,
     mode,
+    decisionModel,
     adapter: values.adapter as StenographerConfig['adapter'],
     embeddingModel: values.embeddings,
     reembed: Boolean(values.reembed),
@@ -1108,6 +1156,7 @@ export async function runCLI(args: string[]): Promise<void> {
   console.error(`📄 ${mode === 'watch' ? 'Watching directory' : 'Watching'}: ${logPath}`);
   console.error(`💾 State: ${statePath}`);
   console.error(`🎛  Mode: ${mode}${config.adapter ? `, adapter: ${config.adapter}` : ' (adapter auto-detect)'}`);
+  if (decisionModel) console.error(`🧠 Decision model: ${decisionSpec} (a second opinion on objections; consult_decision_model for agents)`);
   console.error(
     `🔏 Profile: ${profile}` +
       (profile === 'agent'

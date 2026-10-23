@@ -24,6 +24,11 @@
  *   GET /graphrag?q=...&k=5&depth=2  (hybrid vector + graph search)
  *   GET /context-frame?budget=2000
  *   GET /proposals?status=open&kind=tombstone  (the review inbox)
+ *   GET /truth?filter=current  (the truth ledger: TBs and UVs by filter, as get_truth)
+ *   GET /truth/search?q=...&k=5&filter=current  (truth entries by embedding relevance, as search_truth)
+ *   GET /advice?kind=objection&graded=true&since=<id>&limit=100  (the decision model's verdicts)
+ *   GET /advice/stats         (how the model does against the judge; 404 without a model)
+ *   POST /advice/consult      {assertion, k?}  (the model's advice on an assertion)
  *
  * Notary routes (§15) — require X-Notary-Secret; disabled when no secret is set.
  * The notary/dismisser name is checked against the signer registry when one
@@ -90,7 +95,18 @@ const QUERIES = {
   contextFrame: z.object({ budget: count(2000, MAX_BUDGET) }),
   precedents: z.object({ scope: z.string().min(1).max(200).optional(), all: z.literal('true').optional() }),
   derivation: z.object({ direction: z.enum(['down', 'up']).default('down') }),
+  truth: z.object({ filter: z.enum(['current', 'all', 'contested']).default('current') }),
+  truthSearch: z.object({ q: query, k: count(5, MAX_K), filter: z.enum(['current', 'all', 'contested']).default('current') }),
+  advice: z.object({
+    kind: z.enum(['objection', 'consult']).optional(),
+    graded: z.enum(['true', 'false']).optional(),
+    since: z.string().max(64).optional(),
+    limit: count(100, MAX_FLAGS),
+  }),
 };
+
+/** A consult: what the agent means to assert, and how many entries to offer the model. */
+const CONSULT_BODY = z.object({ assertion: z.string().min(1).max(MAX_QUERY_CHARS * 4), k: z.number().int().min(1).max(24).optional() }).strict();
 
 const nonBlank = (what: string) => z.string().refine((v) => v.trim().length > 0, `${what} is required`);
 
@@ -231,6 +247,10 @@ export class RestServer {
       await this.handleContextConsult(req, res);
       return;
     }
+    if (req.method === 'POST' && path === '/advice/consult') {
+      await this.handleAdviceConsult(req, res);
+      return;
+    }
     if (req.method === 'POST') {
       await this.handleNotary(req, res, path);
       return;
@@ -251,6 +271,28 @@ export class RestServer {
 
     if (path === '/docket') {
       sendJson(res, 200, await this.engine.getDocket());
+      return;
+    }
+
+    if (path === '/truth') {
+      const { filter } = parseQuery(QUERIES.truth, url);
+      sendJson(res, 200, await this.engine.getTruth(filter));
+      return;
+    }
+    if (path === '/truth/search') {
+      const { q, k, filter } = parseQuery(QUERIES.truthSearch, url);
+      sendJson(res, 200, await this.engine.searchTruth(q, k, filter));
+      return;
+    }
+    if (path === '/advice') {
+      const { kind, graded, since, limit } = parseQuery(QUERIES.advice, url);
+      sendJson(res, 200, await this.engine.listDecisionAdvice({ kind, graded: graded === undefined ? undefined : graded === 'true', since, limit }));
+      return;
+    }
+    if (path === '/advice/stats') {
+      const stats = await this.engine.getDecisionModelStats();
+      if (!stats) sendJson(res, 404, { error: 'no decision model is configured (--decision-model)' });
+      else sendJson(res, 200, stats);
       return;
     }
 
@@ -360,6 +402,20 @@ export class RestServer {
     // The objection log's matcher: compiled once per ledger generation, not per consult
     const { truth, objections } = this.engine.store;
     sendJson(res, 200, { version: 1, answer: answerContextConsult(truth, consult.data.artifact, objections.compiled()) });
+  }
+
+  /** `POST /advice/consult {assertion, k?}`: the decision model's advice on an assertion (bearer token like every route). */
+  private async handleAdviceConsult(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const body = CONSULT_BODY.safeParse(await readJson(req));
+    if (!body.success) {
+      const issues = body.error.issues.map((i) => `${i.path.join('.') || 'body'}: ${i.message}`);
+      throw new RequestError(400, `Not a consult — ${issues.join('; ')}`);
+    }
+    if (!this.engine.getDecisionAdviser()) {
+      sendJson(res, 404, { error: 'no decision model is configured (--decision-model)' });
+      return;
+    }
+    sendJson(res, 200, await this.engine.consultDecisionModel({ assertion: body.data.assertion, k: body.data.k }));
   }
 
   /**
