@@ -284,6 +284,41 @@ describe('standing (R2)', () => {
     expect(ledger.verify().ok).toBe(true);
   });
 
+  it('a dead root beneath a weak premise still makes the entry unsupported (P10 through an open UV)', () => {
+    // A ← B (open UV, derives A) ← C (derives B): B clouds C on its own, and
+    // striking A must reach C through B rather than stop at the cloud.
+    const a = uv('A');
+    const b = uv('B', [a.id]);
+    const c = uv('C', [b.id]);
+    // Before the strike, both open UVs beneath C are reasons, and the worst of them only clouds
+    expect(ledger.getEntry(c.id)).toMatchObject({
+      standing: 'clouded',
+      reasons: [
+        { premise: b.id, reason: 'premise-open' },
+        { premise: a.id, reason: 'premise-open', via: b.id },
+      ],
+    });
+    ledger.fileRuling({ kind: 'strike', opinion: 'abandoned', target: a.id }, { author: 'johnny' });
+    expect(ledger.getEntry(b.id)).toMatchObject({ standing: 'unsupported', reasons: [{ premise: a.id, reason: 'premise-struck' }] });
+    expect(ledger.getEntry(c.id)).toMatchObject({
+      standing: 'unsupported',
+      reasons: [
+        { premise: b.id, reason: 'premise-open' },
+        { premise: a.id, reason: 'premise-struck', via: b.id },
+      ],
+    });
+    // A is struck and B and C are unsupported: nothing is current
+    expect(ledger.getTruth('current')).toEqual([]);
+    expect(ledger.verify().ok).toBe(true);
+    // The same fold, read cold (no cached standing): stenographer verify and stream readers see the same
+    const cold = new Map<string, StandingNode>([
+      ['a', { type: 'UV', status: 'open', struck: true, standing: null, premises: [] }],
+      ['b', { type: 'UV', status: 'open', struck: false, standing: null, premises: [{ id: 'a', kind: 'derives' }] }],
+      ['c', { type: 'UV', status: 'open', struck: false, standing: null, premises: [{ id: 'b', kind: 'derives' }] }],
+    ]);
+    expect(deriveStanding(['c'], (id) => cold.get(id)).get('c')!.standing).toBe('unsupported');
+  });
+
   it('the current filter leaves unsupported entries out; all and the stats still count them', () => {
     const a = tb('A');
     const c = tb('C', [a.id]);

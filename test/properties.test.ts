@@ -35,7 +35,8 @@ const REGISTRY = SignerRegistry.load({ signers: [{ id: 'johnny', role: 'human' }
 /** Short sentences that pass every text rule (letters, four or more characters). */
 const sentence = fc.array(fc.constantFrom('the', 'budget', 'retries', 'cache', 'cluster', 'region', 'cap', 'queue', 'is', 'reads', 'once', 'twice', 'small', 'large'), { minLength: 2, maxLength: 6 }).map((w) => `${w.join(' ')}.`);
 const agentId = fc.stringMatching(/^[a-z][a-z0-9]{1,8}$/).map((s) => `agent:${s}`);
-const session = fc.stringMatching(/^sess-[a-z0-9]{1,6}$/);
+/** Approver sessions; never `sess-u`, the session the `uv` helper writes an agent's target under (an approval from it is contempt, not a witness). */
+const session = fc.stringMatching(/^sess-[a-z0-9]{1,6}$/).filter((s) => s !== 'sess-u');
 
 /** A ledger on its own in-memory database. */
 const fresh = () => {
