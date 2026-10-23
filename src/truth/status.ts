@@ -264,7 +264,11 @@ export function deriveStanding(
       const own = premiseFailure(below);
       if (own) {
         add({ premise: premise.id, reason: own });
-        continue;
+        // A dead premise ends the path: nothing beneath it can make the
+        // entry worse. A weak one (an open UV, a TB under appeal) only clouds,
+        // so what fails beneath it still counts: a struck root under an open
+        // UV leaves the entry unsupported, not clouded (P10).
+        if (UNSUPPORTING.includes(own)) continue;
       }
       if (!dirty.has(premise.id) && !memo.has(premise.id) && below.standing === 'sound') continue;
       for (const r of walk(premise.id, below).reasons) add({ premise: r.premise, reason: r.reason, via: premise.id });
