@@ -32,8 +32,8 @@
     "lint": "tsc --noEmit"
   },
   "dependencies": {
-    "@huggingface/transformers": "^4.2.0",
-    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@huggingface/transformers": "^4.3.2",
+    "@modelcontextprotocol/sdk": "^1.32.0",
     "better-sqlite3": "^13.0.3",
     "sqlite-vec": "^0.1.9",
     "zod": "^3.25.28",
@@ -46,7 +46,7 @@
     "ajv-formats": "^3.0.1",
     "fast-check": "^4.5.3",
     "typescript": "^5.3.0",
-    "vitest": "^4.1.10"
+    "vitest": "^5.0.5"
   },
   "engines": {
     "node": ">=22"
@@ -54,9 +54,9 @@
   "license": "MIT",
   "overrides": {
     "@hono/node-server": "^2.1.1",
-    "hono": "^4.13.2",
-    "ip-address": "^10.5.0",
+    "hono": "^4.13.14",
+    "ip-address": "^10.7.5",
     "body-parser": "^2.3.0",
-    "fast-uri": "^3.1.5"
+    "fast-uri": "^3.1.9"
   }
 }
